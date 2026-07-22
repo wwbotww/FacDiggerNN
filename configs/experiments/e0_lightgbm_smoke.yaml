@@ -1,0 +1,36 @@
+experiment_id: e0a_lightgbm_smoke
+model_type: lightgbm
+seed: 42
+output_root: artifacts/e0
+evaluation_split: valid
+unlock_test: false
+minimum_coverage: 0.98
+
+channels:
+  - r_close
+  - r_gap
+  - r_intraday
+  - range
+  - dlog_volume
+  - vol20
+  - dollar_volume_z20
+windows: [5, 20, 60, 120, 252]
+costs_bps: [0, 10, 20, 50]
+
+mlp:
+  hidden_dims: [128, 64]
+  dropout: 0.2
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  batch_size: 256
+  max_epochs: 100
+  patience: 15
+  device: auto
+
+lightgbm:
+  n_estimators: 500
+  learning_rate: 0.03
+  num_leaves: 31
+  min_child_samples: 20
+  reg_lambda: 1.0
+  early_stopping_rounds: 30

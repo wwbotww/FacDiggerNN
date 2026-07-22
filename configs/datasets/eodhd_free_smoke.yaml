@@ -1,0 +1,38 @@
+dataset_name: eodhd_free_smoke
+
+sources:
+  bars: data/bronze/bars_daily.parquet
+  universe: data/bronze/universe_daily.parquet
+  corporate_actions: null
+  delistings: null
+
+output_root: data/snapshots
+
+# One free-plan year is insufficient for the target 512-session PatchTST
+# window. This shorter window is only an ingestion/pipeline smoke test.
+features:
+  name: price_volume_v1
+  context_length: 60
+  scaler: train_global_robust
+  winsor_lower: 0.005
+  winsor_upper: 0.995
+  channels:
+    - r_close
+    - r_gap
+    - r_intraday
+    - range
+    - dlog_volume
+    - vol20
+    - dollar_volume_z20
+
+label:
+  name: next_open_to_fifth_close_excess_return
+  execution_lag: 1
+  horizon: 5
+  benchmark: eligible_equal_weight
+
+split:
+  train_end: 2026-01-30
+  valid_end: 2026-03-31
+  test_end: 2026-06-30
+  embargo_sessions: 5

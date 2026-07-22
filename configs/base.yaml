@@ -1,0 +1,29 @@
+project_name: facdigger
+seed: 42
+
+market:
+  name: us_equities_daily
+  timezone: America/New_York
+  exchanges:
+    - XNYS
+    - XNAS
+    - XASE
+  security_types:
+    - common_stock
+  minimum_close_usd: 5.0
+  minimum_adv20_usd: 1000000.0
+
+model:
+  context_length: 512
+  input_channels: 7
+  patch_length: 12
+  patch_stride: 12
+  source:
+    model_id: ibm-research/patchtst-etth1-pretrain
+    revision: 1212736a0decf12b5cea5a605302421e110a3614
+    minimum_loaded_numel_ratio: 0.80
+
+runtime:
+  preferred_device: auto
+  cuda_precision: fp16
+  output_root: artifacts

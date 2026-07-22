@@ -1,0 +1,36 @@
+dataset_name: us_equities_daily_v1
+
+sources:
+  bars: data/bronze/bars_daily.parquet
+  universe: data/bronze/universe_daily.parquet
+  corporate_actions: null
+  delistings: null
+
+output_root: data/snapshots
+
+features:
+  name: price_volume_v1
+  context_length: 512
+  scaler: train_global_robust
+  winsor_lower: 0.005
+  winsor_upper: 0.995
+  channels:
+    - r_close
+    - r_gap
+    - r_intraday
+    - range
+    - dlog_volume
+    - vol20
+    - dollar_volume_z20
+
+label:
+  name: next_open_to_fifth_close_excess_return
+  execution_lag: 1
+  horizon: 5
+  benchmark: eligible_equal_weight
+
+split:
+  train_end: 2018-12-31
+  valid_end: 2020-12-31
+  test_end: 2022-12-31
+  embargo_sessions: 5

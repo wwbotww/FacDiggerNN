@@ -1,0 +1,22 @@
+.DS_Store
+.idea/
+.vscode/
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+!.env.example
+
+# Local research data and generated artifacts (root-only: do not hide src/*/data)
+/data/
+/artifacts/
+*.parquet
+*.pt
+*.pth

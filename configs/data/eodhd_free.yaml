@@ -1,0 +1,47 @@
+provider: eodhd
+
+# Token is read only from this environment variable. If absent, the official
+# demo token is used because allow_demo_token is true.
+api_token_env: EODHD_API_TOKEN
+allow_demo_token: true
+base_url: https://eodhd.com/api
+
+# Keep this list deliberately small on the 20-call/day free plan. The official
+# demo token supports AAPL.US, TSLA.US, VTI.US, AMZN.US and a few FX/crypto symbols.
+symbols:
+  - AAPL.US
+  - TSLA.US
+exchange_code: US
+lookback_days: 365
+
+output_dir: data/bronze
+cache_dir: data/cache/eodhd
+state_dir: data/state/eodhd
+cache_ttl_hours: 24
+refresh: false
+timeout_seconds: 30
+max_retries: 2
+max_calls_per_day: 20
+
+# These are off by default to preserve the free-plan call budget. Metadata can
+# instead be supplied below without an API request.
+fetch_symbol_metadata: false
+metadata_failure_policy: warn
+include_corporate_actions: false
+metadata_overrides:
+  - provider_symbol: AAPL.US
+    isin: US0378331005
+    name: Apple Inc
+    exchange: NASDAQ
+    currency: USD
+    security_type: Common Stock
+  - provider_symbol: TSLA.US
+    isin: US88160R1014
+    name: Tesla Inc
+    exchange: NASDAQ
+    currency: USD
+    security_type: Common Stock
+
+min_listed_sessions: 20
+min_price: 1.0
+min_adv20_usd: 1000000.0
