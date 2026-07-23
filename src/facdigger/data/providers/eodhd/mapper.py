@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from typing import Any
@@ -78,6 +79,71 @@ def security_identity(ticker: str, metadata: dict[str, Any] | None) -> tuple[str
     return f"eodhd:symbol:{ticker.upper()}", "provider_symbol_fallback"
 
 
+def filter_valid_eod_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate usable observations from provider placeholders or corrupt OHLCV rows."""
+
+    valid: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            open_ = float(row["open"])
+            high = float(row["high"])
+            low = float(row["low"])
+            close = float(row["close"])
+            volume = float(row["volume"])
+            adjusted_close = float(row.get("adjusted_close", close))
+            adjustment = adjusted_close / close if close else math.nan
+            values = (open_, high, low, close, volume, adjusted_close, adjustment)
+            is_valid = (
+                bool(row.get("date"))
+                and all(math.isfinite(value) for value in values)
+                and min(open_, high, low, close) > 0
+                and high >= max(open_, close, low)
+                and low <= min(open_, close, high)
+                and volume >= 0
+                and adjustment > 0
+            )
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            is_valid = False
+        (valid if is_valid else rejected).append(row)
+    return valid, rejected
+
+
+def consolidate_bars(frame: pl.DataFrame) -> pl.DataFrame:
+    """Resolve overlapping EODHD ticker aliases for one stable security identity.
+
+    EODHD can expose both old and current tickers with the same ISIN and return
+    overlapping histories for both endpoints. Prefer an active alias, then the
+    alias with the latest coverage, with provider symbol as a deterministic
+    final tie-breaker. Non-overlapping history from old tickers is retained.
+    """
+
+    if frame.is_empty():
+        return frame
+    return (
+        frame.with_columns(
+            pl.col("trade_date")
+            .max()
+            .over("provider_symbol")
+            .alias("_provider_last_trade_date")
+        )
+        .sort(
+            [
+                "security_id",
+                "trade_date",
+                "is_delisted_source",
+                "_provider_last_trade_date",
+                "provider_symbol",
+            ],
+            descending=[False, False, False, True, False],
+        )
+        .unique(subset=["security_id", "trade_date"], keep="first", maintain_order=True)
+        .drop("_provider_last_trade_date")
+    )
+
+
 def map_eod_bars(
     rows_by_symbol: dict[str, list[dict[str, Any]]],
     metadata: dict[str, dict[str, Any]],
@@ -120,7 +186,7 @@ def map_eod_bars(
             )
     if not records:
         raise ValueError("EODHD returned no usable EOD rows")
-    return validate_bars(pl.DataFrame(records))
+    return validate_bars(consolidate_bars(pl.DataFrame(records)))
 
 
 def build_universe(

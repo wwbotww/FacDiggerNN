@@ -19,6 +19,7 @@ from facdigger.data.providers.eodhd.mapper import (
     build_imputed_delistings,
     build_metadata_index,
     build_universe,
+    filter_valid_eod_rows,
     map_corporate_actions,
     map_eod_bars,
     parse_split_ratio,
@@ -143,6 +144,73 @@ def test_eodhd_mapping_satisfies_standard_contracts() -> None:
     assert universe["eligible"].sum() == 9
 
 
+def test_eodhd_mapping_consolidates_overlapping_ticker_aliases() -> None:
+    metadata = build_metadata_index(
+        [
+            {
+                "Code": "NEW",
+                "Exchange": "NASDAQ",
+                "Type": "Common Stock",
+                "Isin": "US0000000001",
+                "_is_delisted": False,
+            },
+            {
+                "Code": "OLD",
+                "Exchange": "NASDAQ",
+                "Type": "Common Stock",
+                "Isin": "US0000000001",
+                "_is_delisted": True,
+            },
+        ],
+        "US",
+    )
+    old_rows = [{**EOD_ROWS[0], "volume": 10}, EOD_ROWS[1]]
+    new_rows = [{**EOD_ROWS[0], "volume": 20}, *EOD_ROWS[1:3]]
+
+    bars = map_eod_bars(
+        {"OLD.US": old_rows, "NEW.US": new_rows},
+        metadata,
+        source_revision="test-aliases",
+        ingested_at=datetime(2025, 2, 1, tzinfo=timezone.utc),
+    )
+
+    assert bars.height == 3
+    assert bars["security_id"].n_unique() == 1
+    assert bars.filter(pl.col("trade_date").dt.day() == 1).row(0, named=True)[
+        "provider_symbol"
+    ] == "NEW.US"
+    assert bars.filter(pl.col("trade_date").dt.day() == 1)["volume"].item() == 20
+
+
+def test_invalid_eodhd_placeholders_are_dropped_without_repairing_prices() -> None:
+    valid, rejected = filter_valid_eod_rows(
+        [
+            EOD_ROWS[0],
+            {
+                "date": "2025-01-02",
+                "open": 0,
+                "high": 0,
+                "low": 0,
+                "close": 0,
+                "adjusted_close": 0,
+                "volume": 0,
+            },
+            {
+                "date": "2025-01-03",
+                "open": 10.0,
+                "high": 10.1,
+                "low": 10.05,
+                "close": 10.0,
+                "adjusted_close": 10.0,
+                "volume": 100,
+            },
+        ]
+    )
+
+    assert valid == [EOD_ROWS[0]]
+    assert len(rejected) == 2
+
+
 def test_corporate_action_mapping_has_explicit_factor_semantics() -> None:
     metadata = build_metadata_index([], "US")
     actions = map_corporate_actions(
@@ -257,10 +325,28 @@ def test_top_liquid_config_disallows_demo_fallback_and_explicit_symbols() -> Non
 def test_historical_discovery_includes_active_and_delisted_without_current_ranking() -> None:
     active = [
         {"Code": "AAA", "Exchange": "NASDAQ", "Type": "Common Stock"},
+        {
+            "Code": "AAA-WT",
+            "Name": "Alpha Warrants",
+            "Exchange": "NASDAQ",
+            "Type": "Common Stock",
+        },
+        {
+            "Code": "AAGRW",
+            "Name": "A generic provider name",
+            "Exchange": "NASDAQ",
+            "Type": "Common Stock",
+        },
         {"Code": "ETF1", "Exchange": "NASDAQ", "Type": "ETF"},
     ]
     delisted = [
         {"Code": "OLD", "Exchange": "NYSE", "Type": "Common Stock"},
+        {
+            "Code": "OLDU",
+            "Name": "Old Acquisition Units",
+            "Exchange": "NYSE",
+            "Type": "Common Stock",
+        },
         {"Code": "OTC", "Exchange": "PINK", "Type": "Common Stock"},
     ]
     selection = EODHDConfig.model_validate(
@@ -285,6 +371,7 @@ def test_historical_discovery_includes_active_and_delisted_without_current_ranki
     }
     assert audit["selection_uses_current_liquidity"] is False
     assert audit["daily_max_symbols"] == 1000
+    assert audit["excluded_derivative_candidates"] == 3
 
 
 def test_dynamic_universe_grid_and_delisting_imputation_are_auditable() -> None:

@@ -24,6 +24,8 @@ from facdigger.data.providers.eodhd.mapper import (
     build_imputed_delistings,
     build_metadata_index,
     build_universe,
+    consolidate_bars,
+    filter_valid_eod_rows,
     map_corporate_actions,
     map_eod_bars,
 )
@@ -218,6 +220,8 @@ class EODHDProvider:
         split_batch: dict[str, list[dict[str, Any]]] = {}
         bar_parts: list[pl.DataFrame] = []
         action_parts: list[pl.DataFrame] = []
+        rejected_eod_rows = 0
+        rejected_eod_symbols: set[str] = set()
         date_params = {"from": start.isoformat(), "to": end.isoformat()}
 
         def flush_batch() -> None:
@@ -248,8 +252,12 @@ class EODHDProvider:
             payload = client.get_json(f"eod/{symbol}", {**date_params, "period": "d", "order": "a"})
             if not isinstance(payload, list):
                 raise EODHDError(f"EODHD EOD response for {symbol} is not an array")
-            if payload:
-                eod_batch[symbol] = payload
+            valid_payload, rejected_payload = filter_valid_eod_rows(payload)
+            if rejected_payload:
+                rejected_eod_rows += len(rejected_payload)
+                rejected_eod_symbols.add(symbol)
+            if valid_payload:
+                eod_batch[symbol] = valid_payload
             if self.config.include_corporate_actions:
                 div_payload = client.get_json(f"div/{symbol}", date_params)
                 split_payload = client.get_json(f"splits/{symbol}", date_params)
@@ -264,7 +272,22 @@ class EODHDProvider:
         flush_batch()
         if not bar_parts:
             raise EODHDError("EODHD returned no usable EOD histories")
-        bars = validate_bars(pl.concat(bar_parts, how="vertical_relaxed"))
+        combined_bars = pl.concat(bar_parts, how="vertical_relaxed")
+        bars = validate_bars(consolidate_bars(combined_bars))
+        overlap_rows_resolved = combined_bars.height - bars.height
+        selection_audit["overlapping_alias_rows_resolved"] = overlap_rows_resolved
+        selection_audit["invalid_eod_rows_dropped"] = rejected_eod_rows
+        selection_audit["invalid_eod_symbols"] = sorted(rejected_eod_symbols)
+        if overlap_rows_resolved:
+            warnings.append(
+                "resolved "
+                f"{overlap_rows_resolved} overlapping ticker-alias rows using stable security_id"
+            )
+        if rejected_eod_rows:
+            warnings.append(
+                f"dropped {rejected_eod_rows} invalid provider OHLCV rows across "
+                f"{len(rejected_eod_symbols)} symbols; missing sessions remain explicit in universe"
+            )
         universe = build_universe(
             bars,
             min_listed_sessions=self.config.min_listed_sessions,
