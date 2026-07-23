@@ -34,5 +34,7 @@ non_overlapping_offset: 0
 decisions:
   minimum_positive_cell_ratio: 0.5
   cost_bps: 20
-  require_neutralized_positive: true
-  require_source_research_ready: true
+  # EOD-only engineering mode has no point-in-time industry/market-cap exposure.
+  # Formal research configs must turn both gates back on.
+  require_neutralized_positive: false
+  require_source_research_ready: false

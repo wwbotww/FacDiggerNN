@@ -16,6 +16,7 @@ from facdigger.data.providers.eodhd.client import (
 )
 from facdigger.data.providers.eodhd.config import EODHDConfig
 from facdigger.data.providers.eodhd.mapper import (
+    build_imputed_delistings,
     build_metadata_index,
     build_universe,
     map_corporate_actions,
@@ -23,7 +24,11 @@ from facdigger.data.providers.eodhd.mapper import (
     parse_split_ratio,
 )
 from facdigger.data.providers.eodhd.provider import EODHDProvider
-from facdigger.data.providers.eodhd.universe import select_top_liquid_symbols
+from facdigger.data.providers.eodhd.universe import (
+    discover_historical_symbols,
+    select_top_liquid_symbols,
+)
+from facdigger.labels.forward_return import build_forward_excess_return_labels
 
 EOD_ROWS = [
     {
@@ -247,6 +252,107 @@ def test_top_liquid_config_disallows_demo_fallback_and_explicit_symbols() -> Non
                 "universe": {"mode": "top_liquid", "max_symbols": 10},
             }
         )
+
+
+def test_historical_discovery_includes_active_and_delisted_without_current_ranking() -> None:
+    active = [
+        {"Code": "AAA", "Exchange": "NASDAQ", "Type": "Common Stock"},
+        {"Code": "ETF1", "Exchange": "NASDAQ", "Type": "ETF"},
+    ]
+    delisted = [
+        {"Code": "OLD", "Exchange": "NYSE", "Type": "Common Stock"},
+        {"Code": "OTC", "Exchange": "PINK", "Type": "Common Stock"},
+    ]
+    selection = EODHDConfig.model_validate(
+        {
+            "allow_demo_token": False,
+            "universe": {"mode": "historical_liquid", "max_symbols": 1000},
+            "delisting_imputation": {"enabled": True},
+        }
+    ).universe
+
+    symbols, metadata, audit = discover_historical_symbols(
+        active,
+        delisted,
+        exchange_code="US",
+        config=selection,
+    )
+
+    assert symbols == ["AAA.US", "OLD.US"]
+    assert {row["Code"]: row["_is_delisted"] for row in metadata} == {
+        "AAA": False,
+        "OLD": True,
+    }
+    assert audit["selection_uses_current_liquidity"] is False
+    assert audit["daily_max_symbols"] == 1000
+
+
+def test_dynamic_universe_grid_and_delisting_imputation_are_auditable() -> None:
+    metadata = build_metadata_index(
+        [
+            {
+                "Code": "AAA",
+                "Exchange": "NASDAQ",
+                "Type": "Common Stock",
+                "_is_delisted": False,
+            },
+            {
+                "Code": "OLD",
+                "Exchange": "NYSE",
+                "Type": "Common Stock",
+                "_is_delisted": True,
+            },
+        ],
+        "US",
+    )
+    active_rows = [row for index, row in enumerate(EOD_ROWS) if index != 9]
+    bars = map_eod_bars(
+        {"AAA.US": active_rows, "OLD.US": EOD_ROWS[:24]},
+        metadata,
+        source_revision="test-historical",
+        ingested_at=datetime(2025, 2, 1, tzinfo=timezone.utc),
+    )
+    universe = build_universe(
+        bars,
+        min_listed_sessions=1,
+        min_price=1.0,
+        min_adv20_usd=1.0,
+        max_daily_symbols=1,
+    )
+    delistings = build_imputed_delistings(
+        bars,
+        universe,
+        exchange_returns={"XNAS": -0.55, "XNYS": -0.30, "XASE": -0.30},
+        default_return=-0.50,
+        source_revision="test-historical",
+    )
+
+    assert universe.group_by("trade_date").agg(pl.col("eligible").sum())[
+        "eligible"
+    ].max() == 1
+    halted = universe.filter(
+        (pl.col("security_id") == "eodhd:symbol:AAA.US")
+        & (pl.col("trade_date").dt.day() == 10)
+    )
+    assert halted["is_halted"].to_list() == [True]
+    assert delistings is not None
+    assert delistings["delisting_return"].to_list() == [-0.30]
+    assert delistings["is_imputed"].to_list() == [True]
+    assert delistings["imputation_method"].to_list() == ["exchange_penalty:XNYS"]
+
+    labels = build_forward_excess_return_labels(
+        bars,
+        universe,
+        delistings=delistings,
+        horizon=5,
+    )
+    crossing = labels.filter(
+        (pl.col("security_id") == "eodhd:symbol:OLD.US")
+        & (pl.col("asof_date").dt.day() == 20)
+    ).row(0, named=True)
+    assert crossing["label_end"].day == 25
+    assert crossing["crosses_delisting"] is True
+    assert crossing["raw_return"] is not None
 
 
 class FakeDiscoveryClient:

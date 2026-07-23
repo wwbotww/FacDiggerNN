@@ -23,6 +23,7 @@ from facdigger.training.common import (
     build_prediction_frame,
     load_source_provenance,
     load_training_snapshot,
+    split_supervised_training_index,
 )
 from facdigger.training.e1_config import E1ExperimentConfig
 from facdigger.training.e1_engine import predict_e1, train_e1
@@ -94,19 +95,29 @@ def run_e1(
     if config.model.patch_length > context_length:
         raise DataContractError("E1 patch_length cannot exceed dataset context_length")
 
-    datasets = {
+    protocol_index, selection_audit = split_supervised_training_index(
+        frames["sample_index"],
+        selection_fraction=config.selection_fraction,
+    )
+    training_datasets = {
         split: SnapshotWindowDataset(
             features=frames["features"],
-            sample_index=frames["sample_index"],
+            sample_index=protocol_index,
             channels=config.channels,
             context_length=context_length,
             split=split,
         )
-        for split in {"train", "valid", config.evaluation_split}
+        for split in {"train_fit", "inner_selection"}
     }
-    train_dataset = datasets["train"]
-    valid_dataset = datasets["valid"]
-    evaluation_dataset = datasets[config.evaluation_split]
+    evaluation_dataset = SnapshotWindowDataset(
+        features=frames["features"],
+        sample_index=frames["sample_index"],
+        channels=config.channels,
+        context_length=context_length,
+        split=config.evaluation_split,
+    )
+    train_dataset = training_datasets["train_fit"]
+    valid_dataset = training_datasets["inner_selection"]
     config_payload = config.model_dump(mode="json")
     config_hash = sha256_json(config_payload)
     resume_path = Path(resume_from).resolve() if resume_from is not None else None
@@ -137,6 +148,7 @@ def run_e1(
         "evaluation_split": config.evaluation_split,
         "test_unlocked": config.unlock_test,
         "resumed_from": str(resume_path) if resume_path is not None else None,
+        "supervised_selection_audit": selection_audit,
     }
     resolved_config_path.write_text(
         yaml.safe_dump(config_payload, allow_unicode=True, sort_keys=True),
@@ -208,8 +220,8 @@ def run_e1(
                 "model_internal_scaling": config.model.scaling,
             },
             "row_counts": {
-                "train": len(train_dataset),
-                "valid": len(valid_dataset),
+                "train_fit": len(train_dataset),
+                "inner_selection": len(valid_dataset),
                 "evaluation": len(evaluation_dataset),
             },
             "checkpoint": {

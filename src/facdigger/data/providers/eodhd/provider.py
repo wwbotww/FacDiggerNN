@@ -12,17 +12,25 @@ from typing import Any
 
 import polars as pl
 
-from facdigger.data.contracts import table_audit
+from facdigger.data.contracts import (
+    table_audit,
+    validate_bars,
+    validate_corporate_actions,
+)
 from facdigger.data.providers.base import ProviderIngestResult
 from facdigger.data.providers.eodhd.client import DailyCallBudget, EODHDClient, EODHDError
 from facdigger.data.providers.eodhd.config import EODHDConfig
 from facdigger.data.providers.eodhd.mapper import (
+    build_imputed_delistings,
     build_metadata_index,
     build_universe,
     map_corporate_actions,
     map_eod_bars,
 )
-from facdigger.data.providers.eodhd.universe import select_top_liquid_symbols
+from facdigger.data.providers.eodhd.universe import (
+    discover_historical_symbols,
+    select_top_liquid_symbols,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -75,6 +83,32 @@ class EODHDProvider:
         self, client: EODHDClient, warnings: list[str]
     ) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, Any]]:
         override_rows = [override.model_dump() for override in self.config.metadata_overrides]
+        if self.config.universe.mode == "historical_liquid":
+            active = client.get_json(
+                f"exchange-symbol-list/{self.config.exchange_code}",
+                {"type": "common_stock", "delisted": 0},
+            )
+            delisted = client.get_json(
+                f"exchange-symbol-list/{self.config.exchange_code}",
+                {"type": "common_stock", "delisted": 1},
+            )
+            if not isinstance(active, list) or not isinstance(delisted, list):
+                raise EODHDError("EODHD historical symbol-list response is not an array")
+            symbols, metadata_rows, selection_audit = discover_historical_symbols(
+                active,
+                delisted,
+                exchange_code=self.config.exchange_code,
+                config=self.config.universe,
+            )
+            metadata = build_metadata_index(
+                [*metadata_rows, *override_rows],
+                self.config.exchange_code,
+            )
+            warnings.append(
+                "delisting terminal returns are conservatively imputed by exchange; "
+                "results require sensitivity review"
+            )
+            return symbols, metadata, selection_audit
         if self.config.universe.mode == "top_liquid":
             payload = client.get_json(
                 f"exchange-symbol-list/{self.config.exchange_code}",
@@ -95,7 +129,13 @@ class EODHDProvider:
                 exchange_code=self.config.exchange_code,
                 config=self.config.universe,
             )
-            metadata = build_metadata_index([*payload, *override_rows], self.config.exchange_code)
+            metadata = build_metadata_index(
+                [
+                    *[{**row, "_is_delisted": False} for row in payload],
+                    *override_rows,
+                ],
+                self.config.exchange_code,
+            )
             warnings.append(str(selection_audit["bias_warning"]))
             return symbols, metadata, selection_audit
 
@@ -110,7 +150,9 @@ class EODHDProvider:
                     )
                     if not isinstance(payload, list):
                         raise EODHDError("EODHD symbol-list response is not an array")
-                    rows.extend(payload)
+                    rows.extend(
+                        {**row, "_is_delisted": bool(delisted)} for row in payload
+                    )
             except EODHDError as exc:
                 if self.config.metadata_failure_policy == "fail":
                     raise
@@ -165,18 +207,49 @@ class EODHDProvider:
             "splits/dividends",
             "trade status is inferred only from an observed daily bar",
             "historical industry and float market cap are unavailable in this EOD-only ingestion",
-            "no delistings table is emitted without a reliable terminal return or value",
         ]
+        if not self.config.delisting_imputation.enabled:
+            warnings.append(
+                "no delistings table is emitted without a reliable terminal return or value"
+            )
         symbols, metadata, selection_audit = self._resolve_symbols_and_metadata(client, warnings)
-        eod: dict[str, list[dict[str, Any]]] = {}
-        dividends: dict[str, list[dict[str, Any]]] = {}
-        splits: dict[str, list[dict[str, Any]]] = {}
+        eod_batch: dict[str, list[dict[str, Any]]] = {}
+        dividend_batch: dict[str, list[dict[str, Any]]] = {}
+        split_batch: dict[str, list[dict[str, Any]]] = {}
+        bar_parts: list[pl.DataFrame] = []
+        action_parts: list[pl.DataFrame] = []
         date_params = {"from": start.isoformat(), "to": end.isoformat()}
+
+        def flush_batch() -> None:
+            if not eod_batch:
+                return
+            bar_parts.append(
+                map_eod_bars(
+                    eod_batch,
+                    metadata,
+                    source_revision=source_revision,
+                    ingested_at=ingested_at,
+                )
+            )
+            if self.config.include_corporate_actions:
+                mapped = map_corporate_actions(
+                    dividends_by_symbol=dividend_batch,
+                    splits_by_symbol=split_batch,
+                    metadata=metadata,
+                    source_revision=source_revision,
+                )
+                if mapped is not None:
+                    action_parts.append(mapped)
+            eod_batch.clear()
+            dividend_batch.clear()
+            split_batch.clear()
+
         for symbol in symbols:
             payload = client.get_json(f"eod/{symbol}", {**date_params, "period": "d", "order": "a"})
             if not isinstance(payload, list):
                 raise EODHDError(f"EODHD EOD response for {symbol} is not an array")
-            eod[symbol] = payload
+            if payload:
+                eod_batch[symbol] = payload
             if self.config.include_corporate_actions:
                 div_payload = client.get_json(f"div/{symbol}", date_params)
                 split_payload = client.get_json(f"splits/{symbol}", date_params)
@@ -184,27 +257,44 @@ class EODHDProvider:
                     raise EODHDError(
                         f"EODHD corporate-action response for {symbol} is not an array"
                     )
-                dividends[symbol] = div_payload
-                splits[symbol] = split_payload
-
-        bars = map_eod_bars(
-            eod,
-            metadata,
-            source_revision=source_revision,
-            ingested_at=ingested_at,
-        )
+                dividend_batch[symbol] = div_payload
+                split_batch[symbol] = split_payload
+            if len(eod_batch) >= 250:
+                flush_batch()
+        flush_batch()
+        if not bar_parts:
+            raise EODHDError("EODHD returned no usable EOD histories")
+        bars = validate_bars(pl.concat(bar_parts, how="vertical_relaxed"))
         universe = build_universe(
             bars,
             min_listed_sessions=self.config.min_listed_sessions,
             min_price=self.config.min_price,
             min_adv20_usd=self.config.min_adv20_usd,
+            max_daily_symbols=(
+                self.config.universe.max_symbols
+                if self.config.universe.mode == "historical_liquid"
+                else None
+            ),
         )
-        actions = map_corporate_actions(
-            dividends_by_symbol=dividends,
-            splits_by_symbol=splits,
-            metadata=metadata,
-            source_revision=source_revision,
+        actions = (
+            validate_corporate_actions(pl.concat(action_parts, how="vertical_relaxed"))
+            if action_parts
+            else None
         )
+        delistings = None
+        if self.config.delisting_imputation.enabled:
+            imputation = self.config.delisting_imputation
+            delistings = build_imputed_delistings(
+                bars,
+                universe,
+                exchange_returns={
+                    "XNAS": imputation.nasdaq_return,
+                    "XNYS": imputation.nyse_return,
+                    "XASE": imputation.nyse_american_return,
+                },
+                default_return=imputation.default_return,
+                source_revision=source_revision,
+            )
 
         output_dir = self.config.output_dir.resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -213,6 +303,9 @@ class EODHDProvider:
         if actions is not None:
             frames["corporate_actions"] = actions
             filenames["corporate_actions"] = "corporate_actions.parquet"
+        if delistings is not None:
+            frames["delistings"] = delistings
+            filenames["delistings"] = "delistings.parquet"
         files: dict[str, Path] = {}
         for name, frame in frames.items():
             final_path = output_dir / filenames[name]
@@ -237,7 +330,14 @@ class EODHDProvider:
             "tables": {
                 name: {
                     **table_audit(
-                        frame, "ex_date" if name == "corporate_actions" else "trade_date"
+                        frame,
+                        (
+                            "ex_date"
+                            if name == "corporate_actions"
+                            else "delist_date"
+                            if name == "delistings"
+                            else "trade_date"
+                        ),
                     ),
                     "file": files[name].name,
                     "sha256": _sha256(files[name]),
@@ -245,9 +345,13 @@ class EODHDProvider:
                 for name, frame in frames.items()
             },
             "delistings": {
-                "emitted": False,
-                "reason": (
-                    "EODHD listing status does not provide a defensible terminal return/value"
+                "emitted": delistings is not None,
+                "rows": delistings.height if delistings is not None else 0,
+                "policy": self.config.delisting_imputation.model_dump(mode="json"),
+                "warning": (
+                    "returns are imputed policy assumptions, not provider-observed terminal values"
+                    if delistings is not None
+                    else "no delisting terminal return/value is available"
                 ),
             },
         }

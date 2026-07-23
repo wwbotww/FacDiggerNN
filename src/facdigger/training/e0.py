@@ -32,6 +32,7 @@ from facdigger.training.common import (
     build_prediction_frame,
     load_source_provenance,
     load_training_snapshot,
+    split_supervised_training_index,
 )
 from facdigger.training.e0_config import E0ExperimentConfig
 
@@ -51,19 +52,23 @@ def run_e0(
         raise DataContractError(
             f"E0 channels must exactly match dataset channels: {dataset_channels}"
         )
+    protocol_index, selection_audit = split_supervised_training_index(
+        frames["sample_index"],
+        selection_fraction=config.selection_fraction,
+    )
     tabular, feature_columns = build_multiscale_features(
         frames["features"],
-        frames["sample_index"],
+        protocol_index,
         channels=config.channels,
         windows=config.windows,
         context_length=context_length,
     )
-    train_rows = tabular.filter(pl.col("split") == "train")
-    valid_rows = tabular.filter(pl.col("split") == "valid")
+    train_rows = tabular.filter(pl.col("split") == "train_fit")
+    valid_rows = tabular.filter(pl.col("split") == "inner_selection")
     evaluation_rows = tabular.filter(pl.col("split") == config.evaluation_split)
     if train_rows.is_empty() or valid_rows.is_empty() or evaluation_rows.is_empty():
         raise DataContractError(
-            "E0 requires non-empty train, valid and configured evaluation splits"
+            "E0 requires non-empty train_fit, inner_selection and evaluation splits"
         )
 
     preprocessor = TabularPreprocessor.fit(train_rows, feature_columns)
@@ -177,10 +182,11 @@ def run_e0(
             "feature_columns": feature_columns,
             "input_dimensions_with_masks": train_x.shape[1],
             "row_counts": {
-                "train": train_rows.height,
-                "valid": valid_rows.height,
+                "train_fit": train_rows.height,
+                "inner_selection": valid_rows.height,
                 "evaluation": evaluation_rows.height,
             },
+            "supervised_selection_audit": selection_audit,
             "checkpoint": {
                 "file": f"checkpoints/{checkpoint_name}",
                 "sha256": checkpoint_hash,

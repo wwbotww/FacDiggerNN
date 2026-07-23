@@ -11,6 +11,7 @@ import polars as pl
 from facdigger.data.contracts import (
     validate_bars,
     validate_corporate_actions,
+    validate_delistings,
     validate_universe,
 )
 
@@ -65,6 +66,7 @@ def build_metadata_index(
             "exchange": row.get("Exchange") or row.get("exchange") or exchange_code,
             "currency": row.get("Currency") or row.get("currency") or "USD",
             "security_type": row.get("Type") or row.get("security_type") or "Common Stock",
+            "is_delisted": bool(row.get("_is_delisted", row.get("IsDelisted", False))),
         }
     return result
 
@@ -113,6 +115,7 @@ def map_eod_bars(
                     "identity_quality": identity_quality,
                     "exchange_source": (meta or {}).get("exchange"),
                     "security_type_source": (meta or {}).get("security_type"),
+                    "is_delisted_source": bool((meta or {}).get("is_delisted", False)),
                 }
             )
     if not records:
@@ -126,32 +129,117 @@ def build_universe(
     min_listed_sessions: int,
     min_price: float,
     min_adv20_usd: float,
+    max_daily_symbols: int | None = None,
 ) -> pl.DataFrame:
-    frame = (
-        bars.sort(["security_id", "trade_date"])
+    """Build a full security-session grid and optional daily dynamic-liquidity universe."""
+
+    ordered = bars.sort(["security_id", "trade_date"])
+    calendar = ordered.select("trade_date").unique().sort("trade_date")
+    maximum_date = calendar["trade_date"].max()
+    next_sessions = calendar.with_columns(
+        pl.col("trade_date").shift(-1).alias("_next_session")
+    )
+    securities = (
+        ordered.group_by("security_id", maintain_order=True)
+        .agg(
+            pl.col("symbol").first().alias("_fallback_symbol"),
+            pl.col("trade_date").min().alias("_first_trade_date"),
+            pl.col("trade_date").max().alias("_last_trade_date"),
+            pl.col("exchange_source").drop_nulls().first().alias("_exchange_source"),
+            pl.col("security_type_source")
+            .drop_nulls()
+            .first()
+            .alias("_security_type_source"),
+            pl.col("identity_quality").first().alias("identity_quality"),
+            pl.col("provider_symbol").first().alias("provider_symbol"),
+            pl.col("is_delisted_source").max().alias("_eventually_delisted"),
+        )
+        .join(
+            next_sessions,
+            left_on="_last_trade_date",
+            right_on="trade_date",
+            how="left",
+            validate="m:1",
+        )
         .with_columns(
+            pl.when(pl.col("_eventually_delisted"))
+            .then(pl.coalesce("_next_session", "_last_trade_date"))
+            .otherwise(pl.lit(maximum_date))
+            .alias("_range_end")
+        )
+    )
+    observations = ordered.select(
+        "security_id",
+        "trade_date",
+        pl.col("symbol").alias("_observed_symbol"),
+        "close",
+        "dollar_volume",
+    )
+    frame = (
+        securities.join(calendar, how="cross")
+        .filter(
+            (pl.col("trade_date") >= pl.col("_first_trade_date"))
+            & (pl.col("trade_date") <= pl.col("_range_end"))
+        )
+        .join(
+            observations,
+            on=["security_id", "trade_date"],
+            how="left",
+            validate="1:1",
+        )
+        .sort(["security_id", "trade_date"])
+        .with_columns(
+            pl.col("_observed_symbol")
+            .forward_fill()
+            .backward_fill()
+            .over("security_id")
+            .fill_null(pl.col("_fallback_symbol"))
+            .alias("symbol"),
             pl.col("dollar_volume")
             .rolling_mean(window_size=20, min_samples=20)
             .over("security_id")
             .alias("adv20_usd"),
             pl.int_range(1, pl.len() + 1).over("security_id").alias("listed_days"),
-            pl.col("exchange_source")
+            pl.col("_exchange_source")
             .fill_null("US")
             .str.to_uppercase()
-            .replace_strict(EXCHANGE_MAP, default=pl.col("exchange_source").fill_null("US"))
+            .replace_strict(
+                EXCHANGE_MAP,
+                default=pl.col("_exchange_source").fill_null("US"),
+            )
             .alias("exchange"),
-            pl.col("security_type_source")
+            pl.col("_security_type_source")
             .map_elements(normalize_security_type, return_dtype=pl.String)
             .alias("security_type"),
         )
         .with_columns(
             pl.lit(True).alias("is_primary_listing"),
-            pl.lit(True).alias("is_listed"),
-            pl.lit(False).alias("is_delisted"),
-            pl.lit(False).alias("is_halted"),
+            (
+                ~pl.col("_eventually_delisted")
+                | (pl.col("trade_date") <= pl.col("_last_trade_date"))
+            ).alias("is_listed"),
+            (
+                pl.col("_eventually_delisted")
+                & (pl.col("trade_date") > pl.col("_last_trade_date"))
+            ).alias("is_delisted"),
+            (
+                (
+                    ~pl.col("_eventually_delisted")
+                    | (pl.col("trade_date") <= pl.col("_last_trade_date"))
+                )
+                & pl.col("close").is_null()
+            ).alias("is_halted"),
             pl.lit(None, dtype=pl.String).alias("industry_code"),
             pl.lit(None, dtype=pl.Float64).alias("float_market_cap"),
-            pl.lit("observed_bar_assumed_tradable").alias("trade_status_quality"),
+            pl.when(pl.col("close").is_not_null())
+            .then(pl.lit("observed_bar"))
+            .when(
+                pl.col("_eventually_delisted")
+                & (pl.col("trade_date") > pl.col("_last_trade_date"))
+            )
+            .then(pl.lit("imputed_delisted_session"))
+            .otherwise(pl.lit("missing_bar_assumed_halt"))
+            .alias("trade_status_quality"),
         )
         .with_columns(
             (
@@ -159,11 +247,46 @@ def build_universe(
                 & (pl.col("listed_days") >= min_listed_sessions)
                 & (pl.col("close") >= min_price)
                 & (pl.col("adv20_usd") >= min_adv20_usd)
+                & pl.col("is_listed")
+                & ~pl.col("is_halted")
+            )
+            .fill_null(False)
+            .alias("_eligible_candidate")
+        )
+    )
+    if max_daily_symbols is not None:
+        ranks = (
+            frame.filter(pl.col("_eligible_candidate"))
+            .sort(
+                ["trade_date", "adv20_usd", "security_id"],
+                descending=[False, True, False],
+            )
+            .with_columns(
+                pl.int_range(1, pl.len() + 1)
+                .over("trade_date")
+                .alias("liquidity_rank")
+            )
+            .select("security_id", "trade_date", "liquidity_rank")
+        )
+        frame = frame.join(
+            ranks,
+            on=["security_id", "trade_date"],
+            how="left",
+            validate="1:1",
+        ).with_columns(
+            (
+                pl.col("_eligible_candidate")
+                & (pl.col("liquidity_rank") <= max_daily_symbols)
             )
             .fill_null(False)
             .alias("eligible")
         )
-        .select(
+    else:
+        frame = frame.with_columns(
+            pl.col("_eligible_candidate").alias("eligible"),
+            pl.lit(None, dtype=pl.Int64).alias("liquidity_rank"),
+        )
+    frame = frame.select(
             "security_id",
             "symbol",
             "trade_date",
@@ -182,9 +305,78 @@ def build_universe(
             "trade_status_quality",
             "identity_quality",
             "provider_symbol",
+            "liquidity_rank",
+            "_eventually_delisted",
+            "_last_trade_date",
+        )
+    return validate_universe(frame)
+
+
+def build_imputed_delistings(
+    bars: pl.DataFrame,
+    universe: pl.DataFrame,
+    *,
+    exchange_returns: dict[str, float],
+    default_return: float,
+    source_revision: str,
+) -> pl.DataFrame | None:
+    """Create explicitly marked, conservative delisting-return imputations."""
+
+    last_rows = (
+        bars.filter(pl.col("is_delisted_source"))
+        .sort(["security_id", "trade_date"])
+        .group_by("security_id", maintain_order=True)
+        .tail(1)
+        .select(
+            "security_id",
+            pl.col("trade_date").alias("last_trade_date"),
         )
     )
-    return validate_universe(frame)
+    if last_rows.is_empty():
+        return None
+    delist_dates = (
+        universe.filter(pl.col("is_delisted"))
+        .group_by("security_id")
+        .agg(
+            pl.col("trade_date").min().alias("delist_date"),
+            pl.col("exchange").first().alias("exchange"),
+        )
+    )
+    rows = last_rows.join(
+        delist_dates,
+        on="security_id",
+        how="inner",
+        validate="1:1",
+    )
+    if rows.is_empty():
+        return None
+    return validate_delistings(
+        rows.with_columns(
+            pl.col("exchange")
+            .replace_strict(exchange_returns, default=default_return)
+            .cast(pl.Float64)
+            .alias("delisting_return"),
+            pl.lit(None, dtype=pl.Float64).alias("terminal_value"),
+            pl.col("delist_date").alias("known_at"),
+            pl.lit(source_revision).alias("source_revision"),
+            pl.lit(True).alias("is_imputed"),
+            pl.concat_str(
+                pl.lit("exchange_penalty:"),
+                "exchange",
+            ).alias("imputation_method"),
+        ).select(
+            "security_id",
+            "delist_date",
+            "last_trade_date",
+            "delisting_return",
+            "terminal_value",
+            "known_at",
+            "source_revision",
+            "is_imputed",
+            "imputation_method",
+            "exchange",
+        )
+    )
 
 
 def parse_split_ratio(value: str) -> tuple[float, float]:

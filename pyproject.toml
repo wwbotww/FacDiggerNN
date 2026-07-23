@@ -24,7 +24,6 @@ model = [
   "transformers>=4.37,<6",
 ]
 data = [
-  "duckdb>=1,<2",
   "polars>=1,<2",
   "pyarrow>=16,<24",
 ]

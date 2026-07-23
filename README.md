@@ -2,14 +2,20 @@
 
 FacDiggerNN 是面向美股日频数据的、强调 point-in-time 语义和可复现性的机器学习因子研究工具。M0 的 PatchTST 兼容性探针、M1 标准 Parquet 数据闭环、M2 E0 基线评价、M3 E1 随机 PatchTST、M4 E2 跨域迁移、M5 E3 金融域预训练、M6 walk-forward 研究冻结、M7 checkpoint 回放，以及 M8 最新信号/独立评价闭环已经可运行。
 
-完整设计见 [实施设计](docs/IMPLEMENTATION_PLAN.md)。
+新用户建议先阅读：
+
+- [中文开发文档](docs/开发文档.md)：工程架构、数据契约、模块、CLI、扩展和排错；
+- [中文实验设计文档](docs/实验设计文档.md)：研究问题、E0—E3、walk-forward、指标、统计和正式实验协议。
+
+设计来源与实现过程见[原始设计（实现同步版）](docs/PatchTST迁移学习实现设计文档_AI版.md)和
+[详细实施计划](docs/IMPLEMENTATION_PLAN.md)。
 
 ## 开发环境
 
 推荐 Python 3.11，并使用独立虚拟环境。不要复用已有的全局 Conda 环境。
 
 ```bash
-uv sync --extra model --extra data --extra eodhd --extra dev
+uv sync --extra model --extra data --extra eodhd --extra baseline --extra dev
 source .venv/bin/activate
 ```
 
@@ -24,6 +30,10 @@ python -m pip install -e . --no-deps
 ```
 
 `uv.lock` 是首选的跨平台锁文件；`requirements-lock.txt` 由同一锁文件导出。当前已在 macOS/CPU 上验证 PyTorch 2.13.0 与 Transformers 4.57.6 的 checkpoint 加载、前反向和恢复。Windows + RTX 2070 Super 仍需补跑 CUDA/FP16 冒烟。
+
+### 本地目录管理
+
+`artifacts/`、`data/snapshots/`、`dist/`、测试缓存和 Python bytecode 都是可再生成内容，不进入 Git；模型或标签协议变化后应删除旧结果再重建，避免把不兼容 checkpoint 当作当前实验。`data/bronze/` 是标准化来源，`data/cache/` 可减少 EODHD 重复调用，`data/state/` 维护调用预算，这三类内容默认保留但同样不提交。`.env.local` 只保存本机密钥，绝不能删除后误提交或复制到文档。
 
 ## M0 命令
 
@@ -84,7 +94,7 @@ facdigger dataset build --config configs/datasets/us_equities_daily_v1.yaml
 - 原始 OHLC 保持不变，`adj_factor = adjusted_close / close`；该因子同时包含拆股和分红影响。
 - 免费版优先使用显式小股票列表，避免逐股请求耗尽每日额度；缓存命中不计入本地预算。
 - 日线不能可靠恢复历史停牌、历史行业和流通市值，这些字段会保留缺失或带质量标记。
-- 退市列表不含可直接用于收益标签的可靠终值，因而不会伪造 `delistings.parquet`；未来窗口超出最后行情时标签自然为空。
+- 显式股票列表和 100 股票 pilot 不生成退市终值。历史股票池模式可按明确配置生成保守的退市收益插值，但会逐行标记 `is_imputed`，并把来源标记为不满足正式研究 readiness。
 - `security_id` 优先使用 ISIN；缺少元数据时退化为供应商 ticker，并在 manifest 中告警。
 
 ### EODHD 付费历史数据 pilot
@@ -108,9 +118,26 @@ facdigger dataset build --config configs/datasets/eodhd_all_world_pilot.yaml
 
 数据快照会复制并哈希 `source_manifest.json`，使 provider 请求、筛选规则、预算和警告进入训练血缘。当前流动性排名使用“当前仍活跃股票”和当前成交数据，因此存在存活偏差与历史前视偏差，只用于 100 股票工程/资源门禁。评价报告会保留统计指标，但强制标记 `source_research_ready=false`；正式研究股票池仍需纳入历史退市证券并按当日信息定义 eligibility。
 
+### EODHD 历史动态股票池
+
+`eodhd_historical_liquid.yaml` 同时发现 Nasdaq、NYSE 和 NYSE American 的 active 与 delisted 普通股候选，不按“今天仍活跃”预先截断。标准化后先为每只证券恢复其上市区间内的完整交易日网格，将有行情但缺失的 session 识别为推断停牌，再按当日可知的 20 日平均成交额动态选取最多 1000 只股票。标签窗口使用全市场交易日推进，因此不会因个股停牌或最后行情缺失而把 `t+5` 错移到更晚的个股交易日。
+
+当前账户实测可发现 6327 只 active、16418 只 delisted，合计 22745 个唯一候选。全量采集预计需要约 22745 次 EOD 请求；同时采集 splits/dividends 时约为 6.8 万次请求，因此 `probe` 只核对候选规模和单只历史格式，不会隐式启动全量下载。
+
+```bash
+facdigger data probe --config configs/data/eodhd_historical_liquid.yaml
+
+# 确认 API 配额、磁盘和运行时间后再显式执行
+facdigger data ingest --config configs/data/eodhd_historical_liquid.yaml
+facdigger data validate --config configs/datasets/eodhd_historical_liquid.yaml
+facdigger dataset build --config configs/datasets/eodhd_historical_liquid.yaml
+```
+
+EODHD 当前套餐没有可靠的退市终值/原因。该配置采用可审计的保守插值：Nasdaq 为最后有效价格后的 `-55%`，NYSE/NYSE American 为 `-30%`，未知交易所为 `-50%`。这些值不是观测事实；`delistings.parquet`、source manifest 和训练 provenance 都会保留插值方法及警告。它修复了“跨退市样本静默丢失”的工程缺口，但不能替代 CRSP 等具有真实 delisting return 的数据源，也不能令数据自动达到正式研究标准。
+
 ## M2 E0 基线与统一评价
 
-数据快照 schema v3 会固化 `sample_metadata.parquet`，并新增完全不含标签或 split 的 `inference_index.parquet`。前者确保行业、市值和 eligible 等评价暴露不需要回读可变的原始数据；后者覆盖所有具备完整上下文的 eligible 日期，包括未来收益尚未形成的最新交易日。默认只允许评价 validation；要读取 test，配置必须同时设置 `evaluation_split: test` 和 `unlock_test: true`。
+数据快照 schema v3 会固化 `sample_metadata.parquet`，并新增完全不含标签或 split 的 `inference_index.parquet`。前者确保行业、市值和 eligible 等评价暴露不需要回读可变的原始数据；后者覆盖所有具备完整上下文的 eligible 日期，包括未来收益尚未形成的最新交易日。训练器只在正式 train 内按日期切出尾部 10% 作为 inner selection，并 purge 所有 `label_end` 与该段重叠的拟合样本；checkpoint、early stopping 和阶段选择不得读取 outer validation。manifest 会记录 outer validation/test 的训练及 checkpoint 访问行数为 0。默认只允许最终评价 validation；要读取 test，配置必须同时设置 `evaluation_split: test` 和 `unlock_test: true`。
 
 ```bash
 facdigger train e0 \
@@ -231,7 +258,7 @@ facdigger research run \
 
 validation 完成后会固化配置、fold 计划、完整 cell 矩阵和研究报告哈希。解封 holdout 前这些哈希必须完全一致。统计报告先按日期对多个 seed 求均值，再在 fold 内计算 Newey–West/HAC 和固定 offset 的非重叠样本推断，并分别回答 E1−E0 架构增量、E2−E1 外域迁移增量、E3−E2 金融预训练增量及 E3 中性化/成本后是否可用。
 
-当前 `m6_eodhd_engineering.yaml` 仍基于 current-active/current-liquidity pilot 股票池。其 source provenance 会明确阻断 research readiness，因此即使统计指标为正，最终结论仍应为 `no_go`；该配置用于完整工程与资源验证，不能替代纳入历史退市证券的正式研究股票池。
+当前数据只有静态行业，且没有点时流通市值，因此无法可信完成“点时行业 + 流通市值”中性化。`m6_eodhd_engineering.yaml` 明确关闭 `require_source_research_ready` 和 `require_neutralized_positive` 两个硬门禁；preflight 会标记 `research_mode=engineering`，允许验证完整训练、回放和报告链路，但不会把缺失中性化伪装成通过。正式研究配置必须重新开启这两个门禁，并提供点时行业、流通市值以及真实退市收益后，才能据此作出 `go/no_go` 研究结论。
 
 ## M7 Checkpoint 回放与因子导出
 

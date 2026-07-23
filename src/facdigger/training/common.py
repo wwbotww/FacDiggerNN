@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,65 @@ from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
 from facdigger.evaluation.contracts import validate_predictions
 from facdigger.evaluation.neutralization import neutralize_predictions
+
+
+def split_supervised_training_index(
+    sample_index: pl.DataFrame,
+    *,
+    selection_fraction: float,
+) -> tuple[pl.DataFrame, dict[str, Any]]:
+    """Create fit/selection partitions wholly inside the official train split."""
+
+    if not 0 < selection_fraction < 0.5:
+        raise ValueError("selection_fraction must satisfy 0 < value < 0.5")
+    official_train = sample_index.filter(pl.col("split") == "train").sort(
+        ["asof_date", "security_id"]
+    )
+    dates = official_train["asof_date"].unique().sort().to_list()
+    if len(dates) < 3:
+        raise DataContractError("supervised inner selection requires at least three train dates")
+    selection_count = max(1, math.ceil(len(dates) * selection_fraction))
+    selection_count = min(selection_count, len(dates) - 2)
+    selection_dates = dates[-selection_count:]
+    selection_start = selection_dates[0]
+    selection = official_train.filter(pl.col("asof_date").is_in(selection_dates))
+    fit = official_train.filter(pl.col("label_end") < selection_start)
+    if fit.is_empty() or selection.is_empty():
+        raise DataContractError("supervised inner selection produced an empty partition")
+    purged_rows = official_train.height - fit.height - selection.height
+    protocol_index = pl.concat(
+        [
+            fit.with_columns(pl.lit("train_fit").alias("split")),
+            selection.with_columns(pl.lit("inner_selection").alias("split")),
+            sample_index.filter(pl.col("split") != "train"),
+        ],
+        how="vertical",
+    ).sort(["asof_date", "security_id"])
+    outer_valid = sample_index.filter(pl.col("split") == "valid")
+    outer_test = sample_index.filter(pl.col("split") == "test")
+    audit = {
+        "schema_version": 1,
+        "source_split": "train",
+        "selection_policy": "chronological_tail_with_label_overlap_purge",
+        "selection_fraction": selection_fraction,
+        "official_train_rows": official_train.height,
+        "fit_rows": fit.height,
+        "selection_rows": selection.height,
+        "purged_rows": purged_rows,
+        "fit_min_asof_date": fit["asof_date"].min(),
+        "fit_max_asof_date": fit["asof_date"].max(),
+        "fit_max_label_end": fit["label_end"].max(),
+        "selection_min_asof_date": selection_start,
+        "selection_max_asof_date": selection["asof_date"].max(),
+        "outer_validation_rows_used_for_training": 0,
+        "outer_validation_rows_used_for_checkpoint_selection": 0,
+        "outer_test_rows_used": 0,
+        "outer_validation_rows": outer_valid.height,
+        "outer_test_rows": outer_test.height,
+    }
+    if audit["fit_max_label_end"] >= audit["selection_min_asof_date"]:
+        raise DataContractError("fit labels overlap inner selection dates")
+    return protocol_index, audit
 
 
 def load_training_snapshot(
@@ -58,6 +118,7 @@ def load_source_provenance(dataset_dir: Path, dataset_manifest: dict[str, Any]) 
         "source_revision": payload.get("source_revision"),
         "manifest_sha256": sha256_file(path),
         "selection": selection,
+        "delistings": payload.get("delistings"),
         "research_ready": selection.get("research_ready"),
         "warnings": list(payload.get("warnings") or []),
     }

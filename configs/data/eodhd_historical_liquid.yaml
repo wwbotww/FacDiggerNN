@@ -1,0 +1,48 @@
+provider: eodhd
+
+api_token_env: EODHD_API_TOKEN
+allow_demo_token: false
+base_url: https://eodhd.com/api
+
+symbols: []
+exchange_code: US
+universe:
+  # Discover all in-scope active and delisted candidates, then select the top
+  # 1000 independently on each historical date using trailing ADV20.
+  mode: historical_liquid
+  max_symbols: 1000
+  exchanges: [NASDAQ, NYSE, NYSE MKT, AMEX]
+  security_types: [common_stock]
+  min_price: 5.0
+  min_avg_volume_200d: 100000.0
+
+start: 2010-01-01
+end: 2025-12-31
+
+output_dir: data/bronze/eodhd_us_historical_liquid
+cache_dir: data/cache/eodhd_historical_liquid
+state_dir: data/state/eodhd_historical_liquid
+cache_ttl_hours: 720
+refresh: false
+timeout_seconds: 45
+max_retries: 2
+max_calls_per_day: 90000
+
+fetch_symbol_metadata: false
+metadata_failure_policy: fail
+include_corporate_actions: true
+metadata_overrides: []
+
+min_listed_sessions: 252
+min_price: 5.0
+min_adv20_usd: 1000000.0
+
+# EODHD does not supply a defensible terminal return/reason in this package.
+# These assumptions are explicit, versioned and retained in the source manifest.
+delisting_imputation:
+  enabled: true
+  method: exchange_penalty
+  nasdaq_return: -0.55
+  nyse_return: -0.30
+  nyse_american_return: -0.30
+  default_return: -0.50

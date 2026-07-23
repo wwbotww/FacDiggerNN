@@ -54,6 +54,7 @@ class E2ExperimentConfig(StrictModel):
     evaluation_split: Literal["valid", "test"] = "valid"
     unlock_test: bool = False
     minimum_coverage: float = Field(default=0.98, gt=0, le=1)
+    selection_fraction: float = Field(default=0.1, gt=0, lt=0.5)
     channels: list[str] = Field(default_factory=lambda: list(DEFAULT_CHANNELS))
     costs_bps: list[float] = Field(default_factory=lambda: [0.0, 10.0, 20.0, 50.0])
     model: RandomPatchTSTConfig = Field(default_factory=RandomPatchTSTConfig)

@@ -71,5 +71,19 @@ split:
     report = research_preflight(config)
 
     assert report["ready"] is False
-    assert report["checks"]["source_research_ready"] is False
+    assert report["checks"]["source_readiness_gate"] is False
     assert "research_ready=true" in report["blockers"][0]
+
+    engineering = config.model_copy(
+        update={
+            "decisions": config.decisions.model_copy(
+                update={
+                    "require_source_research_ready": False,
+                    "require_neutralized_positive": False,
+                }
+            )
+        }
+    )
+    engineering_report = research_preflight(engineering)
+    assert engineering_report["ready"] is True
+    assert engineering_report["research_mode"] == "engineering"

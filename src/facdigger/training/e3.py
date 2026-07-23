@@ -23,6 +23,7 @@ from facdigger.training.common import (
     build_prediction_frame,
     load_source_provenance,
     load_training_snapshot,
+    split_supervised_training_index,
 )
 from facdigger.training.e1_engine import predict_e1
 from facdigger.training.e2_config import E2ExperimentConfig
@@ -52,6 +53,7 @@ def _downstream_config(config: E3ExperimentConfig) -> E2ExperimentConfig:
             "evaluation_split": config.evaluation_split,
             "unlock_test": config.unlock_test,
             "minimum_coverage": config.minimum_coverage,
+            "selection_fraction": config.selection_fraction,
             "channels": config.channels,
             "costs_bps": config.costs_bps,
             "model": config.model.model_dump(mode="json"),
@@ -150,16 +152,27 @@ def run_e3(
         context_length=context_length,
         split="pretrain_selection",
     )
-    datasets = {
+    protocol_index, supervised_selection_audit = split_supervised_training_index(
+        frames["sample_index"],
+        selection_fraction=config.selection_fraction,
+    )
+    training_datasets = {
         split: SnapshotWindowDataset(
             features=frames["features"],
-            sample_index=frames["sample_index"],
+            sample_index=protocol_index,
             channels=config.channels,
             context_length=context_length,
             split=split,
         )
-        for split in {"train", "valid", config.evaluation_split}
+        for split in {"train_fit", "inner_selection"}
     }
+    evaluation_dataset = SnapshotWindowDataset(
+        features=frames["features"],
+        sample_index=frames["sample_index"],
+        channels=config.channels,
+        context_length=context_length,
+        split=config.evaluation_split,
+    )
     config_payload = config.model_dump(mode="json")
     config_hash = sha256_json(config_payload)
     resume_path = Path(resume_from).resolve() if resume_from is not None else None
@@ -195,6 +208,7 @@ def run_e3(
         "source_checkpoint": config.source.model_dump(mode="json"),
         "resumed_from": str(resume_path) if resume_path is not None else None,
         "pretraining_leakage_audit": leakage_audit,
+        "supervised_selection_audit": supervised_selection_audit,
     }
     (run_dir / "resolved_config.yaml").write_text(
         yaml.safe_dump(config_payload, allow_unicode=True, sort_keys=True),
@@ -258,8 +272,8 @@ def run_e3(
 
         model, finetuning_audit, chain_audit = train_e2(
             downstream,
-            train_dataset=datasets["train"],
-            valid_dataset=datasets["valid"],
+            train_dataset=training_datasets["train_fit"],
+            valid_dataset=training_datasets["inner_selection"],
             dataset_id=str(dataset_manifest["dataset_id"]),
             checkpoint_dir=run_dir / "checkpoints",
             resume_from=resume_path if resume_family == "e2" else None,
@@ -270,14 +284,14 @@ def run_e3(
         checkpoint_hash = sha256_file(best_checkpoint)
         scores = predict_e1(
             model,
-            datasets[config.evaluation_split],
+            evaluation_dataset,
             batch_size=config.finetuning.batch_size,
             device=finetuning_audit["device"],
             precision=finetuning_audit["precision"],
             num_workers=config.finetuning.num_workers,
         )
         predictions, neutralization_audit = build_prediction_frame(
-            datasets[config.evaluation_split].sample_rows,
+            evaluation_dataset.sample_rows,
             frames["sample_metadata"],
             scores,
             model_id=config.experiment_id,
@@ -323,9 +337,9 @@ def run_e3(
             "row_counts": {
                 "pretrain": len(pretrain_dataset),
                 "pretrain_selection": len(selection_dataset),
-                "train": len(datasets["train"]),
-                "valid": len(datasets["valid"]),
-                "evaluation": len(datasets[config.evaluation_split]),
+                "train_fit": len(training_datasets["train_fit"]),
+                "inner_selection": len(training_datasets["inner_selection"]),
+                "evaluation": len(evaluation_dataset),
             },
             "pretraining": pretraining_audit,
             "weight_loading": chain_audit,

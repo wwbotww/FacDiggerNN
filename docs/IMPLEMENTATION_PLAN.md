@@ -71,24 +71,28 @@ M0 必须完成一个独立兼容性探针：
 ### 3.1 核心用例
 
 ```bash
-# 1. 导入并审计原始数据
-facdigger data ingest --config configs/data/us_equities_daily.yaml
-facdigger data validate --snapshot <snapshot_id>
+# 1. 探测、导入并审计 EODHD 历史动态股票池
+facdigger data probe --config configs/data/eodhd_historical_liquid.yaml
+facdigger data ingest --config configs/data/eodhd_historical_liquid.yaml
+facdigger data validate --config configs/datasets/eodhd_historical_liquid.yaml
 
 # 2. 构建点时特征、股票池、标签和样本索引
-facdigger dataset build --config configs/datasets/daily_v1.yaml
+facdigger dataset build --config configs/datasets/eodhd_historical_liquid.yaml
 
 # 3. 训练对照实验
-facdigger train --experiment e0_lightgbm --dataset <dataset_id>
-facdigger train --experiment e1_random --dataset <dataset_id>
-facdigger pretrain --experiment e3_domain_adapt --dataset <dataset_id>
-facdigger train --experiment e2_transfer --dataset <dataset_id>
-facdigger train --experiment e3_domain_adapt --dataset <dataset_id>
+facdigger train e0 --config configs/experiments/e0_lightgbm_paid_pilot.yaml --dataset data/snapshots/<dataset_id>
+facdigger train e1 --config configs/experiments/e1_random.yaml --dataset data/snapshots/<dataset_id>
+facdigger train e2 --config configs/experiments/e2_etth1.yaml --dataset data/snapshots/<dataset_id>
+facdigger train e3 --config configs/experiments/e3_financial_pretrain.yaml --dataset data/snapshots/<dataset_id>
 
-# 4. 统一推理和评价
-facdigger predict --run <run_id> --split test
-facdigger evaluate --run <run_id>
-facdigger compare --runs <e0_id>,<e1_id>,<e2_id>,<e3_id>
+# 4. Walk-forward 工程检查与冻结评价
+facdigger research preflight --config configs/research/m6_eodhd_engineering.yaml
+facdigger research run --config configs/research/m6_eodhd_engineering.yaml
+
+# 5. 统一回放、独立评价和对比
+facdigger predict --run artifacts/e3/<run_id>
+facdigger evaluate --predictions artifacts/e3/<run_id>/predictions.parquet --dataset data/snapshots/<dataset_id> --output artifacts/evaluations/<evaluation_id>
+facdigger compare --runs artifacts/e0/<run_id>,artifacts/e1/<run_id>,artifacts/e2/<run_id>,artifacts/e3/<run_id>
 ```
 
 ### 3.2 研究对象
@@ -139,12 +143,12 @@ flowchart LR
 |---|---|---|
 | Python | 3.11 | 生态成熟，兼顾 Windows |
 | 表处理 | Polars + PyArrow | Parquet 友好，降低 pandas 内存压力 |
-| 查询/审计 | DuckDB | 直接查询 Parquet，无需部署数据库 |
+| 查询/审计 | Polars lazy scan | 直接查询 Parquet，无需部署数据库 |
 | 深度学习 | PyTorch + Transformers | PatchTST 现成实现和权重生态 |
 | 树模型 | LightGBM | 强 tabular 横截面基线 |
 | 配置/校验 | YAML + Pydantic | 配置可读且有强校验 |
 | CLI | Typer | 把研究流程固化为稳定命令 |
-| 测试 | pytest + hypothesis | 单元测试和时点性质测试 |
+| 测试 | pytest | 单元、集成、恢复和时点协议测试 |
 | 报告 | JSON/Parquet + HTML | 机器可读和人工审阅兼顾 |
 
 首版不引入在线数据库、消息队列、Kubernetes 或远程实验平台。运行清单和 artifact 目录已足够；需要多人协作时再接 MLflow。
@@ -158,62 +162,64 @@ FacDiggerNN/
 ├── configs/
 │   ├── data/
 │   ├── datasets/
-│   ├── models/
-│   └── experiments/
+│   ├── experiments/
+│   └── research/
 ├── src/facdigger/
 │   ├── cli.py
 │   ├── config.py
 │   ├── data/
-│   │   ├── adapters/base.py
-│   │   ├── ingest.py
-│   │   ├── calendar.py
-│   │   ├── adjustments.py
-│   │   ├── universe.py
-│   │   ├── validation.py
-│   │   └── snapshots.py
+│   │   ├── adapters.py
+│   │   ├── contracts.py
+│   │   ├── snapshots.py
+│   │   └── providers/eodhd/
+│   │       ├── client.py
+│   │       ├── config.py
+│   │       ├── mapper.py
+│   │       ├── provider.py
+│   │       └── universe.py
 │   ├── features/
-│   │   ├── registry.py
 │   │   ├── price_volume.py
-│   │   ├── transforms.py
-│   │   └── pipeline.py
+│   │   └── scaling.py
 │   ├── labels/
-│   │   ├── forward_return.py
-│   │   └── benchmark.py
+│   │   └── forward_return.py
 │   ├── datasets/
 │   │   ├── splits.py
 │   │   ├── index.py
 │   │   ├── window.py
-│   │   ├── sampler.py
-│   │   └── scaling.py
+│   │   └── sampler.py
 │   ├── models/
 │   │   ├── baselines.py
 │   │   ├── patchtst_adapter.py
-│   │   ├── transfer.py
-│   │   └── alpha_head.py
+│   │   ├── patchtst_alpha.py
+│   │   ├── patchtst_pretrain.py
+│   │   └── patchtst_transfer.py
 │   ├── training/
-│   │   ├── pretrain.py
-│   │   ├── finetune.py
-│   │   ├── losses.py
-│   │   └── checkpoint.py
+│   │   ├── common.py
+│   │   ├── e0.py
+│   │   ├── e1.py
+│   │   ├── e2.py
+│   │   └── e3.py
 │   ├── evaluation/
-│   │   ├── ic.py
-│   │   ├── quantiles.py
-│   │   ├── turnover.py
+│   │   ├── metrics.py
 │   │   ├── neutralization.py
-│   │   ├── stability.py
-│   │   └── report.py
-│   └── experiments/
-│       ├── manifest.py
-│       └── runner.py
+│   │   ├── report.py
+│   │   └── runner.py
+│   ├── inference/
+│   │   └── runner.py
+│   └── research/
+│       ├── folds.py
+│       ├── preflight.py
+│       ├── runner.py
+│       └── statistics.py
 ├── tests/
 │   ├── unit/
-│   ├── integration/
-│   └── leakage/
+│   └── integration/
 ├── data/                 # 默认 gitignore
 │   ├── bronze/
-│   ├── gold/
+│   ├── cache/
+│   ├── state/
 │   └── snapshots/
-└── artifacts/            # 默认 gitignore，保留小型示例清单
+└── artifacts/            # 默认 gitignore，可再生成
 ```
 
 ## 7. 数据设计
@@ -245,7 +251,7 @@ EODHD 连接器位于 `data/providers/eodhd`，通过通用 `MarketDataProvider`
 - EODHD 原始 OHLC 不复权，`adjusted_close` 同时包含拆股和分红调整。标准表保留原始 OHLC，并记录 `adj_factor=adjusted_close/close` 和调整口径。
 - `security_id` 优先由 ISIN 生成；缺少元数据时只能退化为 provider ticker，必须写入 `identity_quality` 和采集告警，不能宣称跨 ticker 变更稳定。
 - EOD 日线不能还原历史停牌状态、历史行业或点时流通市值。首版只把存在有效 bar 的 session 标记为“推断可交易”，其余字段保持缺失并附质量标记。
-- 供应商的“已退市”标志不能替代退市收益或终值。没有可靠 terminal value 时不得生成标准 `delistings` 表；纳入退市证券历史行情与退市标签处理是两个独立能力。
+- 供应商的“已退市”标志不能替代退市收益或终值。没有可靠 terminal value 时，正式研究不得把估计值冒充观测值；工程阶段可按显式、版本化的保守政策生成 `is_imputed=true` 的 `delistings` 表，并必须在表、manifest 和训练 provenance 中记录方法、参数与限制。纳入退市证券历史行情与退市标签处理仍是两个独立能力。
 - 免费版约一年的历史只有约 252 个交易日，不足以形成 512 日上下文。免费配置只用于采集和短窗口管线冒烟；最终研究需要升级历史覆盖或导入合规的长期历史快照。
 
 ### 7.2 最低数据表契约
@@ -344,7 +350,7 @@ label = raw_return - benchmark_return(t+1, t+5)
 
 基准收益可选：CRSP 风格全市场收益、Russell 3000、S&P 500、行业收益或当日可交易股票池等权收益。MVP 使用“当日 eligible 股票池等权收益”更贴近纯横截面排序，并以 Russell 3000 或可获得的宽基总回报指数做敏感性对照。基准成分和收益都必须具备 point-in-time 语义。
 
-对于在 `t+1` 至 `t+5` 之间退市的股票，标签必须纳入供应商提供的 delisting return、现金收购价或可验证的最终回收价值。若数据源不提供退市收益，不得把这些样本静默删除；需要单独标记、报告缺失比例，并把由此产生的幸存者偏差列为数据限制。
+对于在 `t+1` 至 `t+5` 之间退市的股票，正式标签应纳入供应商提供的 delisting return、现金收购价或可验证的最终回收价值。若工程阶段的数据源不提供退市收益，不得把这些样本静默删除；可使用明确标记的保守插值，并报告插值比例、政策参数及其敏感性。使用插值的来源保持 `source_research_ready=false`，直到替换为可验证终值。
 
 ### 7.6 时间切分与 purge
 

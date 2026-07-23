@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 
 import pytest
@@ -114,6 +115,10 @@ def test_e1_run_can_be_reloaded_for_bitwise_replay(tmp_path) -> None:
         }
     )
     run_dir, _ = run_e1(config, snapshot, repository_root=tmp_path)
+    run_manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert run_manifest["supervised_selection_audit"][
+        "outer_validation_rows_used_for_checkpoint_selection"
+    ] == 0
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"

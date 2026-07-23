@@ -9,6 +9,56 @@ from facdigger.data.providers.eodhd.config import EODHDUniverseSelection
 from facdigger.data.providers.eodhd.mapper import normalize_security_type, provider_symbol
 
 
+def discover_historical_symbols(
+    active_rows: list[dict[str, Any]],
+    delisted_rows: list[dict[str, Any]],
+    *,
+    exchange_code: str,
+    config: EODHDUniverseSelection,
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    """Discover all in-scope active and delisted candidates without current-liquidity ranking."""
+
+    allowed_exchanges = {value.strip().upper() for value in config.exchanges}
+    allowed_types = {normalize_security_type(value) for value in config.security_types}
+    selected: dict[str, dict[str, Any]] = {}
+    active_symbols: set[str] = set()
+    delisted_symbols: set[str] = set()
+    for rows, is_delisted in ((active_rows, False), (delisted_rows, True)):
+        for source in rows:
+            code = str(source.get("Code", "")).strip().upper()
+            if not code:
+                continue
+            if str(source.get("Exchange", "")).strip().upper() not in allowed_exchanges:
+                continue
+            if normalize_security_type(source.get("Type")) not in allowed_types:
+                continue
+            symbol = provider_symbol(code, exchange_code)
+            row = {**source, "_is_delisted": is_delisted}
+            selected[symbol] = row
+            (delisted_symbols if is_delisted else active_symbols).add(symbol)
+    symbols = sorted(selected)
+    if not symbols:
+        raise ValueError("historical_liquid discovery found no eligible candidates")
+    metadata = [selected[symbol] for symbol in symbols]
+    audit = {
+        "mode": "historical_liquid",
+        "research_ready": False,
+        "research_ready_reason": (
+            "dynamic point-in-time liquidity is enabled, but delisting returns are imputed "
+            "and point-in-time risk exposures are unavailable"
+        ),
+        "active_metadata_rows": len(active_rows),
+        "delisted_metadata_rows": len(delisted_rows),
+        "active_candidates": len(active_symbols),
+        "delisted_candidates": len(delisted_symbols),
+        "candidate_count": len(symbols),
+        "daily_max_symbols": config.max_symbols,
+        "ranking": "daily_adv20_usd_desc_then_security_id",
+        "selection_uses_current_liquidity": False,
+    }
+    return symbols, metadata, audit
+
+
 def select_top_liquid_symbols(
     metadata_rows: list[dict[str, Any]],
     bulk_rows: list[dict[str, Any]],

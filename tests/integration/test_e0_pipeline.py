@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from datetime import date, timedelta
 
@@ -118,8 +119,13 @@ def test_e0_mlp_train_predict_report_pipeline(tmp_path) -> None:
     ]:
         assert (run_dir / filename).is_file()
     predictions = pl.read_parquet(run_dir / "predictions.parquet")
+    run_manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert predictions["score_raw"].is_finite().all()
     assert predictions["score_neutralized"].is_not_null().all()
+    assert run_manifest["supervised_selection_audit"][
+        "outer_validation_rows_used_for_checkpoint_selection"
+    ] == 0
+    assert run_manifest["row_counts"]["inner_selection"] > 0
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"

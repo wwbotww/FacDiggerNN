@@ -42,6 +42,7 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
             "source_revision": payload.get("source_revision"),
             "manifest_sha256": sha256_file(base.sources.source_manifest),
             "selection": selection,
+            "delistings": payload.get("delistings"),
             "research_ready": selection.get("research_ready"),
             "warnings": list(payload.get("warnings") or []),
         }
@@ -54,10 +55,13 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
         maximum_date = dates["trade_date"].max()
         universe_rows = dates.height
     required_end = max(fold.test_end for fold in config.folds)
+    require_source_ready = config.decisions.require_source_research_ready
     checks = {
         "source_files_exist": not missing_sources,
         "source_provenance_available": provenance["available"],
-        "source_research_ready": provenance["research_ready"] is True,
+        "source_readiness_gate": (
+            provenance["research_ready"] is True or not require_source_ready
+        ),
         "universe_covers_final_fold": maximum_date is not None and maximum_date >= required_end,
         "model_configs_exist": len(model_paths) == 4,
         "three_or_more_folds": len(config.folds) >= 3,
@@ -68,7 +72,7 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
         blockers.append(f"missing configured sources: {missing_sources}")
     if not provenance["available"]:
         blockers.append("source provenance manifest is unavailable")
-    elif provenance["research_ready"] is not True:
+    elif provenance["research_ready"] is not True and require_source_ready:
         blockers.append("source provenance explicitly does not declare research_ready=true")
     if not checks["universe_covers_final_fold"]:
         blockers.append(
@@ -76,6 +80,13 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
         )
     return {
         "ready": all(checks.values()),
+        "research_mode": (
+            "formal"
+            if config.decisions.require_source_research_ready
+            and config.decisions.require_neutralized_positive
+            else "engineering"
+        ),
+        "decision_gates": config.decisions.model_dump(mode="json"),
         "research_id": config.research_id,
         "checks": checks,
         "blockers": blockers,

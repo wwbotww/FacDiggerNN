@@ -24,14 +24,25 @@ class SecurityMetadataOverride(StrictModel):
 
 
 class EODHDUniverseSelection(StrictModel):
-    """Deterministic current-liquidity selection for paid-plan engineering pilots."""
+    """Deterministic provider-universe selection."""
 
-    mode: Literal["explicit", "top_liquid"] = "explicit"
+    mode: Literal["explicit", "top_liquid", "historical_liquid"] = "explicit"
     max_symbols: int = Field(default=100, ge=1, le=10_000)
     exchanges: list[str] = Field(default_factory=lambda: ["NASDAQ", "NYSE", "NYSE MKT", "AMEX"])
     security_types: list[str] = Field(default_factory=lambda: ["common_stock"])
     min_price: float = Field(default=5.0, ge=0)
     min_avg_volume_200d: float = Field(default=100_000.0, ge=0)
+
+
+class DelistingImputationConfig(StrictModel):
+    """Conservative missing delisting-return policy when no terminal source exists."""
+
+    enabled: bool = False
+    method: Literal["exchange_penalty"] = "exchange_penalty"
+    nasdaq_return: float = Field(default=-0.55, ge=-1, le=0)
+    nyse_return: float = Field(default=-0.30, ge=-1, le=0)
+    nyse_american_return: float = Field(default=-0.30, ge=-1, le=0)
+    default_return: float = Field(default=-0.50, ge=-1, le=0)
 
 
 class EODHDConfig(StrictModel):
@@ -60,6 +71,9 @@ class EODHDConfig(StrictModel):
     min_listed_sessions: int = Field(default=20, ge=1)
     min_price: float = Field(default=1.0, ge=0)
     min_adv20_usd: float = Field(default=1_000_000.0, ge=0)
+    delisting_imputation: DelistingImputationConfig = Field(
+        default_factory=DelistingImputationConfig
+    )
 
     @model_validator(mode="after")
     def validate_dates_and_symbols(self) -> EODHDConfig:
@@ -73,10 +87,18 @@ class EODHDConfig(StrictModel):
         self.symbols = normalized
         if self.universe.mode == "explicit" and not self.symbols:
             raise ValueError("explicit universe mode requires at least one symbol")
-        if self.universe.mode == "top_liquid" and self.symbols:
-            raise ValueError("top_liquid universe mode discovers symbols; symbols must be empty")
-        if self.universe.mode == "top_liquid" and self.allow_demo_token:
-            raise ValueError("top_liquid universe mode requires allow_demo_token=false")
+        if self.universe.mode in {"top_liquid", "historical_liquid"} and self.symbols:
+            raise ValueError(
+                f"{self.universe.mode} universe mode discovers symbols; symbols must be empty"
+            )
+        if self.universe.mode in {"top_liquid", "historical_liquid"} and self.allow_demo_token:
+            raise ValueError(
+                f"{self.universe.mode} universe mode requires allow_demo_token=false"
+            )
+        if self.universe.mode == "historical_liquid" and not self.delisting_imputation.enabled:
+            raise ValueError(
+                "historical_liquid requires delisting_imputation.enabled=true"
+            )
         if not self.universe.exchanges or not self.universe.security_types:
             raise ValueError("universe exchanges and security_types must not be empty")
         return self
