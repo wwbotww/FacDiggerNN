@@ -1,11 +1,11 @@
-dataset_name: us_equities_daily_v1
+dataset_name: eodhd_all_world_us_pilot
 
 sources:
-  bars: data/bronze/bars_daily.parquet
-  universe: data/bronze/universe_daily.parquet
+  bars: data/bronze/eodhd_us_pilot/bars_daily.parquet
+  universe: data/bronze/eodhd_us_pilot/universe_daily.parquet
   corporate_actions: null
   delistings: null
-  source_manifest: null
+  source_manifest: data/bronze/eodhd_us_pilot/eodhd_ingestion_manifest.json
 
 output_root: data/snapshots
 
@@ -31,7 +31,7 @@ label:
   benchmark: eligible_equal_weight
 
 split:
-  train_end: 2018-12-31
-  valid_end: 2020-12-31
-  test_end: 2022-12-31
+  train_end: 2022-12-30
+  valid_end: 2024-12-31
+  test_end: 2025-12-31
   embargo_sessions: 5

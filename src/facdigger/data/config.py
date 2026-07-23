@@ -29,6 +29,7 @@ class ParquetSourceConfig(StrictModel):
     universe: Path
     corporate_actions: Path | None = None
     delistings: Path | None = None
+    source_manifest: Path | None = None
 
 
 class FeatureSetConfig(StrictModel):

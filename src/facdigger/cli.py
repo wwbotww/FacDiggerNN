@@ -22,9 +22,11 @@ app = typer.Typer(
 data_app = typer.Typer(help="Validate or ingest point-in-time market data.")
 dataset_app = typer.Typer(help="Build immutable feature/label dataset snapshots.")
 train_app = typer.Typer(help="Train factor-model experiments.")
+research_app = typer.Typer(help="Run and freeze walk-forward E0-E3 research.")
 app.add_typer(data_app, name="data")
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(train_app, name="train")
+app.add_typer(research_app, name="research")
 
 
 @app.command()
@@ -195,6 +197,140 @@ def train_e0_command(
     )
 
 
+@train_app.command("e1")
+def train_e1_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
+    resume: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, readable=True, help="Resume from last.pt."),
+    ] = None,
+) -> None:
+    """Train and evaluate a randomly initialized PatchTST alpha model."""
+
+    from facdigger.training.e1 import run_e1
+    from facdigger.training.e1_config import load_e1_config
+
+    try:
+        run_dir, metrics = run_e1(
+            load_e1_config(config),
+            dataset,
+            repository_root=Path.cwd(),
+            resume_from=resume,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    raw = metrics["metrics"]["raw"]
+    typer.echo(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "dataset_id": metrics["dataset_id"],
+                "evaluation_split": metrics["evaluation_split"],
+                "coverage": metrics["coverage"]["coverage"],
+                "mean_rank_ic": raw["rank_ic"]["mean"],
+                "rank_icir": raw["rank_ic"]["ir"],
+                "gross_q_high_minus_low": raw["portfolio"].get("gross_q_high_minus_low"),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@train_app.command("e2")
+def train_e2_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
+    resume: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, readable=True, help="Resume from last.pt."),
+    ] = None,
+) -> None:
+    """Train and evaluate an ETTh1-initialized PatchTST alpha model."""
+
+    from facdigger.training.e2 import run_e2
+    from facdigger.training.e2_config import load_e2_config
+
+    try:
+        run_dir, metrics = run_e2(
+            load_e2_config(config),
+            dataset,
+            repository_root=Path.cwd(),
+            resume_from=resume,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    raw = metrics["metrics"]["raw"]
+    typer.echo(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "dataset_id": metrics["dataset_id"],
+                "evaluation_split": metrics["evaluation_split"],
+                "coverage": metrics["coverage"]["coverage"],
+                "mean_rank_ic": raw["rank_ic"]["mean"],
+                "rank_icir": raw["rank_ic"]["ir"],
+                "gross_q_high_minus_low": raw["portfolio"].get("gross_q_high_minus_low"),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@train_app.command("e3")
+def train_e3_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
+    resume: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Resume from pretraining or fine-tuning last.pt.",
+        ),
+    ] = None,
+) -> None:
+    """Train E3 with train-only financial masked pretraining."""
+
+    from facdigger.training.e3 import run_e3
+    from facdigger.training.e3_config import load_e3_config
+
+    try:
+        run_dir, metrics = run_e3(
+            load_e3_config(config),
+            dataset,
+            repository_root=Path.cwd(),
+            resume_from=resume,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    raw = metrics["metrics"]["raw"]
+    typer.echo(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "dataset_id": metrics["dataset_id"],
+                "evaluation_split": metrics["evaluation_split"],
+                "coverage": metrics["coverage"]["coverage"],
+                "mean_rank_ic": raw["rank_ic"]["mean"],
+                "rank_icir": raw["rank_ic"]["ir"],
+                "gross_q_high_minus_low": raw["portfolio"].get("gross_q_high_minus_low"),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 @app.command("compare")
 def compare_command(
     runs: Annotated[
@@ -220,6 +356,82 @@ def compare_command(
                 "dataset_id": comparison["dataset_id"],
                 "evaluation_split": comparison["evaluation_split"],
                 "runs": comparison["runs"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@research_app.command("plan")
+def research_plan_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Validate and display an M6 matrix without building snapshots or training."""
+
+    from facdigger.experiments.manifest import sha256_json
+    from facdigger.research.config import load_m6_config
+    from facdigger.research.folds import validate_model_config_paths
+
+    research = load_m6_config(config)
+    paths = validate_model_config_paths(research)
+    typer.echo(
+        json.dumps(
+            {
+                "research_id": research.research_id,
+                "config_hash": sha256_json(research.model_dump(mode="json")),
+                "folds": [fold.model_dump(mode="json") for fold in research.folds],
+                "seeds": research.seeds,
+                "models": {key: str(value) for key, value in paths.items()},
+                "validation_cells": len(research.folds) * len(research.seeds) * 4,
+                "final_holdout_cells": len(research.seeds) * 4,
+                "holdout_policy": "separate resume command with explicit unlock",
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@research_app.command("run")
+def research_run_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    resume_run: Annotated[
+        Path | None,
+        typer.Option(exists=True, file_okay=False, readable=True, help="Resume an M6 run."),
+    ] = None,
+    unlock_final_holdout: Annotated[
+        bool,
+        typer.Option(
+            help="Read the frozen final test split; requires --resume-run after validation."
+        ),
+    ] = False,
+) -> None:
+    """Execute or resume the frozen walk-forward research matrix."""
+
+    from facdigger.research.config import load_m6_config
+    from facdigger.research.runner import run_m6_research
+
+    try:
+        run_dir, manifest = run_m6_research(
+            load_m6_config(config),
+            repository_root=Path.cwd(),
+            resume_run=resume_run,
+            unlock_final_holdout=unlock_final_holdout,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "status": manifest["status"],
+                "phase": manifest["phase"],
+                "holdout_unlocked": manifest["holdout_unlocked"],
             },
             ensure_ascii=False,
             indent=2,

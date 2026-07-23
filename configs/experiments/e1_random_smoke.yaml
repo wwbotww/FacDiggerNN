@@ -1,0 +1,49 @@
+experiment_id: e1_random_patchtst_smoke
+seed: 42
+output_root: artifacts/e1
+evaluation_split: valid
+unlock_test: false
+minimum_coverage: 0.98
+
+channels:
+  - r_close
+  - r_gap
+  - r_intraday
+  - range
+  - dlog_volume
+  - vol20
+  - dollar_volume_z20
+costs_bps: [0, 10, 20, 50]
+
+# Reduced only for the one-year/two-symbol engineering smoke test. The full
+# E1 experiment keeps 6 layers, d_model=128 and 16 heads.
+model:
+  patch_length: 12
+  patch_stride: 12
+  d_model: 32
+  num_attention_heads: 4
+  num_hidden_layers: 2
+  ffn_dim: 64
+  dropout: 0.1
+  attention_dropout: 0.0
+  positional_dropout: 0.0
+  path_dropout: 0.0
+  ff_dropout: 0.0
+  norm_type: batchnorm
+  pre_norm: false
+  scaling: mean
+  alpha_hidden_dim: 32
+  alpha_dropout: 0.1
+
+training:
+  batch_size: 32
+  max_epochs: 20
+  patience: 5
+  minimum_epochs: 3
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  device: cpu
+  precision: fp32
+  num_workers: 0

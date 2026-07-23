@@ -16,9 +16,8 @@ import yaml
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
 from facdigger.environment import collect_environment
-from facdigger.evaluation.contracts import prediction_coverage, validate_predictions
+from facdigger.evaluation.contracts import prediction_coverage
 from facdigger.evaluation.metrics import evaluate_predictions
-from facdigger.evaluation.neutralization import neutralize_predictions
 from facdigger.evaluation.report import write_evaluation_report
 from facdigger.experiments.manifest import collect_git_state, sha256_json
 from facdigger.models.baselines import (
@@ -28,62 +27,13 @@ from facdigger.models.baselines import (
     train_lightgbm,
     train_mlp,
 )
+from facdigger.training.common import (
+    apply_source_readiness_gate,
+    build_prediction_frame,
+    load_source_provenance,
+    load_training_snapshot,
+)
 from facdigger.training.e0_config import E0ExperimentConfig
-
-
-def _load_snapshot(dataset_dir: Path) -> tuple[dict[str, Any], dict[str, pl.DataFrame]]:
-    manifest_path = dataset_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Dataset manifest does not exist: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version", 0) < 2:
-        raise DataContractError(
-            "E0 requires dataset snapshot schema >= 2 with sample_metadata.parquet"
-        )
-    frames = {
-        name: pl.read_parquet(dataset_dir / filename)
-        for name, filename in {
-            "features": "features.parquet",
-            "sample_index": "sample_index.parquet",
-            "sample_metadata": "sample_metadata.parquet",
-        }.items()
-    }
-    return manifest, frames
-
-
-def _build_prediction_frame(
-    rows: pl.DataFrame,
-    metadata: pl.DataFrame,
-    scores: np.ndarray,
-    *,
-    model_id: str,
-    checkpoint_hash: str,
-    dataset_id: str,
-) -> tuple[pl.DataFrame, dict[str, Any]]:
-    predictions = (
-        rows.select("sample_id", "security_id", "symbol", "asof_date", "split", "target")
-        .with_columns(pl.Series("score_raw", scores, dtype=pl.Float64))
-        .join(
-            metadata.select(
-                "sample_id",
-                "eligible",
-                "industry_code",
-                "log_float_market_cap",
-            ),
-            on="sample_id",
-            how="left",
-            validate="1:1",
-        )
-        .with_columns(
-            pl.lit(None, dtype=pl.Float64).alias("score_neutralized"),
-            pl.lit(model_id).alias("model_id"),
-            pl.lit(checkpoint_hash).alias("checkpoint_hash"),
-            pl.lit(dataset_id).alias("dataset_id"),
-        )
-        .drop("sample_id")
-    )
-    predictions, neutralization_audit = neutralize_predictions(predictions)
-    return validate_predictions(predictions), neutralization_audit
 
 
 def run_e0(
@@ -93,7 +43,7 @@ def run_e0(
     repository_root: str | Path,
 ) -> tuple[Path, dict[str, Any]]:
     dataset_path = Path(dataset_dir).resolve()
-    dataset_manifest, frames = _load_snapshot(dataset_path)
+    dataset_manifest, frames = load_training_snapshot(dataset_path)
     dataset_config = dataset_manifest["config"]
     context_length = int(dataset_config["features"]["context_length"])
     dataset_channels = list(dataset_config["features"]["channels"])
@@ -165,7 +115,7 @@ def run_e0(
                 preprocessing=preprocessor.to_dict(),
             )
         checkpoint_hash = sha256_file(checkpoint_path)
-        predictions, neutralization_audit = _build_prediction_frame(
+        predictions, neutralization_audit = build_prediction_frame(
             evaluation_rows,
             frames["sample_metadata"],
             scores,
@@ -179,7 +129,10 @@ def run_e0(
             split=config.evaluation_split,
             minimum=config.minimum_coverage,
         )
-        factor_metrics = evaluate_predictions(predictions, config.costs_bps)
+        source_provenance = load_source_provenance(dataset_path, dataset_manifest)
+        factor_metrics = apply_source_readiness_gate(
+            evaluate_predictions(predictions, config.costs_bps), source_provenance
+        )
         metrics = {
             "schema_version": 1,
             "run_id": run_id,
@@ -188,6 +141,7 @@ def run_e0(
             "evaluation_split": config.evaluation_split,
             "coverage": coverage,
             "neutralization": neutralization_audit,
+            "source_provenance": source_provenance,
             "metrics": factor_metrics,
         }
         predictions.write_parquet(temporary_dir / "predictions.parquet")
@@ -224,6 +178,7 @@ def run_e0(
                 "sha256": checkpoint_hash,
             },
             "training": training_audit,
+            "source_provenance": source_provenance,
             "git": collect_git_state(repository_root),
             "environment": collect_environment(include_model_dependencies=True),
             "artifacts": {

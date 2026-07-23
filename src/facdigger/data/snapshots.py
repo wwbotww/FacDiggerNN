@@ -31,15 +31,17 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def _source_hashes(config: DatasetBuildConfig) -> dict[str, str | None]:
-    return {
-        name: sha256_file(path) if path is not None and path.is_file() else None
-        for name, path in {
-            "bars": config.sources.bars,
-            "universe": config.sources.universe,
-            "corporate_actions": config.sources.corporate_actions,
-            "delistings": config.sources.delistings,
-        }.items()
+    paths = {
+        "bars": config.sources.bars,
+        "universe": config.sources.universe,
+        "corporate_actions": config.sources.corporate_actions,
+        "delistings": config.sources.delistings,
+        "source_manifest": config.sources.source_manifest,
     }
+    missing = [name for name, path in paths.items() if path is not None and not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Configured dataset source files do not exist: {missing}")
+    return {name: sha256_file(path) if path is not None else None for name, path in paths.items()}
 
 
 def _feature_audit(features: pl.DataFrame) -> dict[str, Any]:
@@ -151,6 +153,9 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
             "sample_metadata": "sample_metadata.parquet",
             "audit": "audit.json",
             "scaler": "scaler.json",
+            "source_manifest": (
+                "source_manifest.json" if config.sources.source_manifest is not None else None
+            ),
         },
     }
 
@@ -174,6 +179,11 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        if config.sources.source_manifest is not None:
+            shutil.copyfile(
+                config.sources.source_manifest,
+                temporary_dir / "source_manifest.json",
+            )
         temporary_dir.rename(final_dir)
     except Exception:
         shutil.rmtree(temporary_dir, ignore_errors=True)

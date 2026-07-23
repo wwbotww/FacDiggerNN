@@ -1,0 +1,38 @@
+research_id: m6_eodhd_engineering
+base_dataset_config: configs/datasets/eodhd_all_world_pilot.yaml
+output_root: artifacts/research
+snapshot_output_root: data/walk_forward_snapshots
+seeds: [17, 42, 73]
+
+folds:
+  - fold_id: wf1
+    train_end: 2020-12-31
+    valid_end: 2021-12-31
+    test_end: 2022-12-30
+    embargo_sessions: 5
+  - fold_id: wf2
+    train_end: 2021-12-31
+    valid_end: 2022-12-30
+    test_end: 2023-12-29
+    embargo_sessions: 5
+  - fold_id: wf3
+    train_end: 2022-12-30
+    valid_end: 2024-12-31
+    test_end: 2025-12-31
+    embargo_sessions: 5
+
+models:
+  e0: configs/experiments/e0_lightgbm_paid_pilot.yaml
+  e1: configs/experiments/e1_random.yaml
+  e2: configs/experiments/e2_etth1.yaml
+  e3: configs/experiments/e3_financial_pretrain.yaml
+
+hac_lags: 5
+non_overlapping_stride: 5
+non_overlapping_offset: 0
+
+decisions:
+  minimum_positive_cell_ratio: 0.5
+  cost_bps: 20
+  require_neutralized_positive: true
+  require_source_research_ready: true

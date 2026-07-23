@@ -1,0 +1,42 @@
+provider: eodhd
+
+# The secret is loaded only from .env.local -> EODHD_API_TOKEN. Demo fallback is
+# intentionally disabled so a paid-data run cannot silently use sample data.
+api_token_env: EODHD_API_TOKEN
+allow_demo_token: false
+base_url: https://eodhd.com/api
+
+symbols: []
+exchange_code: US
+universe:
+  # Engineering pilot only: current active listings ranked by current 200-day
+  # dollar liquidity. The manifest marks this survivorship/look-ahead biased.
+  mode: top_liquid
+  max_symbols: 100
+  exchanges: [NASDAQ, NYSE, NYSE MKT, AMEX]
+  security_types: [common_stock]
+  min_price: 5.0
+  min_avg_volume_200d: 100000.0
+
+start: 2018-01-01
+end: 2025-12-31
+
+output_dir: data/bronze/eodhd_us_pilot
+cache_dir: data/cache/eodhd_all_world
+state_dir: data/state/eodhd_all_world
+cache_ttl_hours: 168
+refresh: false
+timeout_seconds: 30
+max_retries: 2
+# Discovery costs 101 calls and each selected historical series costs 1 call.
+# This local ceiling is deliberately far below the account's 100,000/day limit.
+max_calls_per_day: 1000
+
+fetch_symbol_metadata: false
+metadata_failure_policy: fail
+include_corporate_actions: false
+metadata_overrides: []
+
+min_listed_sessions: 252
+min_price: 5.0
+min_adv20_usd: 1000000.0

@@ -1,6 +1,6 @@
 # FacDiggerNN
 
-FacDiggerNN 是面向美股日频数据的、强调 point-in-time 语义和可复现性的机器学习因子研究工具。M0 的 PatchTST 兼容性探针、M1 标准 Parquet 数据闭环和 M2 E0 基线评价闭环已经可运行。
+FacDiggerNN 是面向美股日频数据的、强调 point-in-time 语义和可复现性的机器学习因子研究工具。M0 的 PatchTST 兼容性探针、M1 标准 Parquet 数据闭环、M2 E0 基线评价、M3 E1 随机 PatchTST、M4 E2 跨域迁移、M5 E3 金融域预训练和 M6 walk-forward 研究冻结闭环已经可运行。
 
 完整设计见 [实施设计](docs/IMPLEMENTATION_PLAN.md)。
 
@@ -87,6 +87,27 @@ facdigger dataset build --config configs/datasets/us_equities_daily_v1.yaml
 - 退市列表不含可直接用于收益标签的可靠终值，因而不会伪造 `delistings.parquet`；未来窗口超出最后行情时标签自然为空。
 - `security_id` 优先使用 ISIN；缺少元数据时退化为供应商 ticker，并在 manifest 中告警。
 
+### EODHD 付费历史数据 pilot
+
+token 放在仓库根目录的 `.env.local` 中，文件权限设为 `600`；该文件已被 Git 忽略。每个新终端先加载环境变量：
+
+```bash
+set -a
+source .env.local
+set +a
+```
+
+付费 pilot 会从 US active common-stock metadata 与最新 bulk EOD 联结，只保留 Nasdaq、NYSE 和 NYSE American，再按 `close × avgvol_200d` 选取 100 个标的。bulk 请求按官方的 100 API calls 权重计入本地预算，缓存命中不重复计费；`allow_demo_token: false` 防止真实任务静默退回 demo 数据。
+
+```bash
+facdigger data probe --config configs/data/eodhd_all_world_pilot.yaml
+facdigger data ingest --config configs/data/eodhd_all_world_pilot.yaml
+facdigger data validate --config configs/datasets/eodhd_all_world_pilot.yaml
+facdigger dataset build --config configs/datasets/eodhd_all_world_pilot.yaml
+```
+
+数据快照会复制并哈希 `source_manifest.json`，使 provider 请求、筛选规则、预算和警告进入训练血缘。当前流动性排名使用“当前仍活跃股票”和当前成交数据，因此存在存活偏差与历史前视偏差，只用于 100 股票工程/资源门禁。评价报告会保留统计指标，但强制标记 `source_research_ready=false`；正式研究股票池仍需纳入历史退市证券并按当日信息定义 eligibility。
+
 ## M2 E0 基线与统一评价
 
 数据快照 schema v2 会额外固化 `sample_metadata.parquet`，确保行业、市值和 eligible 等评价暴露不需要回读可变的原始数据。默认只允许评价 validation；要读取 test，配置必须同时设置 `evaluation_split: test` 和 `unlock_test: true`。
@@ -106,6 +127,108 @@ facdigger compare \
 ```
 
 每个 run 包含 checkpoint、`predictions.parquet`、`metrics.json`、`report.html`、resolved config 和 manifest。评价器统一计算逐日 IC/RankIC、ICIR、高低分组收益、换手、0/10/20/50 bps 成本情景、年度/行业/市值稳定性以及行业和点时市值中性化。缺少点时行业或市值时，中性化结果保持为空，不能用原始分数冒充。
+
+## M3 E1 随机 PatchTST
+
+E1 复用同一份不可变快照和 evaluator。窗口按需从列式特征读取，缺失值以零填充并单独传递 observed mask；模型为随机初始化的 PatchTST encoder 加 AlphaHead。训练 checkpoint 包含模型、optimizer、scheduler、GradScaler、epoch/global step、RNG 和按日期 sampler 状态。
+
+```bash
+facdigger train e1 \
+  --config configs/experiments/e1_random_smoke.yaml \
+  --dataset data/snapshots/<dataset_id>
+
+# 仅恢复 status=failed/running 且数据集、完整配置哈希一致的 run
+facdigger train e1 \
+  --config configs/experiments/e1_random_smoke.yaml \
+  --dataset data/snapshots/<dataset_id> \
+  --resume artifacts/e1/<run_id>/checkpoints/last.pt
+```
+
+CUDA 上可配置 `precision: fp16`；CPU 会使用 FP32。当前免费 EODHD 冒烟配置只覆盖 AAPL/TSLA 和一年历史，目的仅是验证 train → predict → report，不可据此判断因子收益或 PatchTST 相对 E0 的研究优势。正式 E1 应使用设计文档中的 512 日上下文、完整股票池和多 seed/walk-forward 协议。
+
+付费 100 股票、512 日上下文的资源门禁配置为：
+
+```bash
+facdigger train e0 \
+  --config configs/experiments/e0_lightgbm_paid_pilot.yaml \
+  --dataset data/snapshots/<paid_dataset_id>
+
+facdigger train e1 \
+  --config configs/experiments/e1_random_paid_pilot.yaml \
+  --dataset data/snapshots/<paid_dataset_id>
+```
+
+该 E1 配置仅训练两轮并缩小 hidden size/depth，用于证明真实规模下的数据吞吐、checkpoint 和预测完整性，不替代正式的 6-layer、多 seed E1 实验。
+
+## M4 E2 ETTh1 encoder 迁移
+
+E2 固定使用 `ibm-research/patchtst-etth1-pretrain` 的 commit revision。加载分两段执行：原始 checkpoint → 当前 Transformers source backbone → 金融 Alpha backbone；每段都按规范化名称和精确 shape 匹配，并强制 loaded-numel ratio 门槛。任意未列入 allowlist 的 missing、unexpected 或 shape mismatch 都会在训练前阻断。
+
+```bash
+facdigger train e2 \
+  --config configs/experiments/e2_etth1.yaml \
+  --dataset data/snapshots/<512_session_dataset_id>
+
+# 中断后仅允许相同 dataset、完整 config 和 source weight hash 恢复
+facdigger train e2 \
+  --config configs/experiments/e2_etth1.yaml \
+  --dataset data/snapshots/<512_session_dataset_id> \
+  --resume artifacts/e2/<run_id>/checkpoints/last.pt
+```
+
+训练阶段固定为：
+
+- FT-0：冻结整个 encoder，仅训练 AlphaHead；backbone 保持 eval，BatchNorm buffer 也不得变化。
+- FT-1：只解冻最后 `N` 个 encoder blocks，使用独立的 encoder/head learning rate。
+
+每个阶段第一次 optimizer step 前后都会计算 encoder 和 head 的完整参数/缓冲区指纹。FT-0 要求 encoder 不变、head 改变；FT-1 要求两者都改变。run 额外输出 `weight_load_report.json`，checkpoint 保存 source hash、加载报告、阶段审计、optimizer/scheduler/GradScaler、RNG 和 sampler 状态。
+
+`configs/experiments/e2_etth1_smoke.yaml` 只运行一个 FT-0 和一个 FT-1 epoch，用于工程门禁；正式配置为 `configs/experiments/e2_etth1.yaml`。两者都默认只读取 validation。
+
+## M5 E3 金融域 masked-patch 预训练
+
+E3 的初始化链固定为 `ETTh1 encoder → 金融域 masked reconstruction → AlphaHead`。金融预训练只从正式 `train` split 取窗口，并在该区间内部按日期切出尾部 10% 作为重建 checkpoint 选择段；正式 validation 和 test 的使用行数都必须为 0。损失只聚合“随机遮蔽且真实观测”的 patch 元素，不把缺失填充值作为重建目标。
+
+```bash
+facdigger train e3 \
+  --config configs/experiments/e3_financial_pretrain.yaml \
+  --dataset data/snapshots/<512_session_dataset_id>
+
+# 两个阶段都可精确恢复；使用失败 manifest 指向的 last.pt
+facdigger train e3 \
+  --config configs/experiments/e3_financial_pretrain.yaml \
+  --dataset data/snapshots/<512_session_dataset_id> \
+  --resume artifacts/e3/<run_id>/pretraining/checkpoints/last.pt
+```
+
+预训练 checkpoint 保存重建模型、独立 encoder state、optimizer、scheduler、GradScaler、RNG、sequence sampler、切分泄漏审计和 ETTh1 权重哈希。选中的金融 encoder 以 100% 参数量、零未授权 mismatch 的门槛载入新 Alpha 模型，之后复用 M4 完全相同的 FT-0/FT-1 协议和统一 evaluator。`e3_financial_pretrain_smoke.yaml` 只用于一轮预训练加两轮微调的工程门禁。
+
+## M6 Walk-forward 与研究冻结
+
+M6 在 E0–E3 之上增加编排层，不修改单次实验训练器。每个 fold 都从同一基础数据配置重新生成内容寻址快照，因此特征 scaler 只拟合该 fold 的扩展 train 区间；同一 fold 的四个模型与全部 seed 必须共享 dataset_id 和完全相同的预测样本键。
+
+```bash
+# 只校验 3 folds × 3 seeds × 4 models 的协议，不构建数据或启动训练
+facdigger research plan --config configs/research/m6_eodhd_engineering.yaml
+
+# 执行 validation 矩阵；结束后生成 freeze.json，但不会读取 test
+facdigger research run --config configs/research/m6_eodhd_engineering.yaml
+
+# 中断后复用已完成 cell，并恢复存在 checkpoint 的失败 cell
+facdigger research run \
+  --config configs/research/m6_eodhd_engineering.yaml \
+  --resume-run artifacts/research/<research_run_id>
+
+# 仅在审阅 validation/research.html 后执行；只解封最后一折的 test
+facdigger research run \
+  --config configs/research/m6_eodhd_engineering.yaml \
+  --resume-run artifacts/research/<research_run_id> \
+  --unlock-final-holdout
+```
+
+validation 完成后会固化配置、fold 计划、完整 cell 矩阵和研究报告哈希。解封 holdout 前这些哈希必须完全一致。统计报告先按日期对多个 seed 求均值，再在 fold 内计算 Newey–West/HAC 和固定 offset 的非重叠样本推断，并分别回答 E1−E0 架构增量、E2−E1 外域迁移增量、E3−E2 金融预训练增量及 E3 中性化/成本后是否可用。
+
+当前 `m6_eodhd_engineering.yaml` 仍基于 current-active/current-liquidity pilot 股票池。其 source provenance 会明确阻断 research readiness，因此即使统计指标为正，最终结论仍应为 `no_go`；该配置用于完整工程与资源验证，不能替代纳入历史退市证券的正式研究股票池。
 
 最低输入包括：
 

@@ -210,12 +210,18 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
     bronze.mkdir()
     bars_path = bronze / "bars.parquet"
     universe_path = bronze / "universe.parquet"
+    source_manifest_path = bronze / "source_manifest.json"
     bars.write_parquet(bars_path)
     universe.write_parquet(universe_path)
+    source_manifest_path.write_text('{"provider":"synthetic"}\n', encoding="utf-8")
     calendar = sessions(90)
     config = DatasetBuildConfig.model_validate(
         {
-            "sources": {"bars": bars_path, "universe": universe_path},
+            "sources": {
+                "bars": bars_path,
+                "universe": universe_path,
+                "source_manifest": source_manifest_path,
+            },
             "output_root": tmp_path / "snapshots",
             "features": {"context_length": 20},
             "split": {
@@ -241,11 +247,13 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
         "audit.json",
         "scaler.json",
         "manifest.json",
+        "source_manifest.json",
     ]:
         assert (first_dir / filename).is_file()
     audit = json.loads((first_dir / "audit.json").read_text(encoding="utf-8"))
     assert audit["sample_index"]["rows"] > 0
     assert set(audit["sample_index"]["split_counts"]) == {"test", "train", "valid"}
+    assert json.loads((first_dir / "source_manifest.json").read_text())["provider"] == ("synthetic")
 
     moved_config = config.model_copy(update={"output_root": tmp_path / "other-snapshots"})
     moved_dir, moved_manifest = build_dataset_snapshot(moved_config)

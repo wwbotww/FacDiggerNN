@@ -55,23 +55,26 @@ class DailyCallBudget:
             return {"date_utc": today, "network_attempts": 0}
         return state
 
-    def reserve(self) -> int:
+    def reserve(self, cost: int = 1) -> int:
+        if cost < 1:
+            raise ValueError("EODHD API call cost must be positive")
         state = self._read()
-        used = int(state.get("network_attempts", 0))
-        if used >= self.limit:
+        used = int(state.get("api_calls", state.get("network_attempts", 0)))
+        if used + cost > self.limit:
             raise EODHDBudgetError(
-                f"EODHD daily network-attempt budget exhausted ({used}/{self.limit}, UTC day)"
+                f"EODHD daily API-call budget exhausted ({used}+{cost}>{self.limit}, UTC day)"
             )
-        state["network_attempts"] = used + 1
+        state["network_attempts"] = int(state.get("network_attempts", 0)) + 1
+        state["api_calls"] = used + cost
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(self.path)
-        return int(state["network_attempts"])
+        return int(state["api_calls"])
 
     def status(self) -> dict[str, Any]:
         state = self._read()
-        used = int(state["network_attempts"])
+        used = int(state.get("api_calls", state.get("network_attempts", 0)))
         return {**state, "limit": self.limit, "remaining": max(self.limit - used, 0)}
 
 
@@ -160,7 +163,13 @@ class EODHDClient:
         temporary.replace(path)
         return fetched_at
 
-    def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def get_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        call_cost: int = 1,
+    ) -> Any:
         public_params = {**(params or {}), "fmt": "json"}
         identity = self._cache_identity(path, public_params)
         cache_path = self._cache_path(identity)
@@ -176,7 +185,7 @@ class EODHDClient:
         url = f"{self.base_url}/{self._safe_path(path)}"
         last_status: int | None = None
         for attempt in range(self.max_retries + 1):
-            self.budget.reserve()
+            self.budget.reserve(call_cost)
             try:
                 response = self.transport.get(
                     url, params=request_params, timeout=self.timeout_seconds
@@ -201,7 +210,13 @@ class EODHDClient:
                     raise EODHDError(f"EODHD API error for {identity['path']}: {detail}")
                 fetched_at = self._write_cache(cache_path, identity, data)
                 self.request_log.append(
-                    {**identity, "cache_hit": False, "fetched_at": fetched_at, "status": 200}
+                    {
+                        **identity,
+                        "cache_hit": False,
+                        "fetched_at": fetched_at,
+                        "status": 200,
+                        "call_cost": call_cost,
+                    }
                 )
                 return data
 

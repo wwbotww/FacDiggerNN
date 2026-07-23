@@ -5,6 +5,7 @@ sources:
   universe: data/bronze/universe_daily.parquet
   corporate_actions: null
   delistings: null
+  source_manifest: data/bronze/eodhd_ingestion_manifest.json
 
 output_root: data/snapshots
 

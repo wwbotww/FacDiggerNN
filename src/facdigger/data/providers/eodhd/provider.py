@@ -22,6 +22,7 @@ from facdigger.data.providers.eodhd.mapper import (
     map_corporate_actions,
     map_eod_bars,
 )
+from facdigger.data.providers.eodhd.universe import select_top_liquid_symbols
 
 
 def _sha256(path: Path) -> str:
@@ -70,32 +71,71 @@ class EODHDProvider:
         )
         return self._client
 
-    def _metadata(self, client: EODHDClient, warnings: list[str]) -> dict[str, dict[str, Any]]:
-        rows = [override.model_dump() for override in self.config.metadata_overrides]
-        metadata = build_metadata_index(rows, self.config.exchange_code)
+    def _resolve_symbols_and_metadata(
+        self, client: EODHDClient, warnings: list[str]
+    ) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, Any]]:
+        override_rows = [override.model_dump() for override in self.config.metadata_overrides]
+        if self.config.universe.mode == "top_liquid":
+            payload = client.get_json(
+                f"exchange-symbol-list/{self.config.exchange_code}",
+                {"type": "common_stock", "delisted": 0},
+            )
+            if not isinstance(payload, list):
+                raise EODHDError("EODHD active symbol-list response is not an array")
+            bulk = client.get_json(
+                f"eod-bulk-last-day/{self.config.exchange_code}",
+                {"filter": "extended"},
+                call_cost=100,
+            )
+            if not isinstance(bulk, list):
+                raise EODHDError("EODHD bulk EOD response is not an array")
+            symbols, selection_audit = select_top_liquid_symbols(
+                payload,
+                bulk,
+                exchange_code=self.config.exchange_code,
+                config=self.config.universe,
+            )
+            metadata = build_metadata_index([*payload, *override_rows], self.config.exchange_code)
+            warnings.append(str(selection_audit["bias_warning"]))
+            return symbols, metadata, selection_audit
+
+        symbols = list(self.config.symbols)
+        rows = list(override_rows)
         if self.config.fetch_symbol_metadata:
             try:
-                payload = client.get_json(
-                    f"exchange-symbol-list/{self.config.exchange_code}",
-                    {"type": "common_stock", "delisted": 1},
-                )
-                if not isinstance(payload, list):
-                    raise EODHDError("EODHD symbol-list response is not an array")
-                metadata.update(build_metadata_index(payload, self.config.exchange_code))
+                for delisted in (0, 1):
+                    payload = client.get_json(
+                        f"exchange-symbol-list/{self.config.exchange_code}",
+                        {"type": "common_stock", "delisted": delisted},
+                    )
+                    if not isinstance(payload, list):
+                        raise EODHDError("EODHD symbol-list response is not an array")
+                    rows.extend(payload)
             except EODHDError as exc:
                 if self.config.metadata_failure_policy == "fail":
                     raise
                 warnings.append(f"symbol metadata unavailable: {exc}")
+        metadata = build_metadata_index(rows, self.config.exchange_code)
         missing = [symbol for symbol in self.config.symbols if symbol not in metadata]
         if missing:
             warnings.append("security_id uses provider-symbol fallback for: " + ", ".join(missing))
-        return metadata
+        return (
+            symbols,
+            metadata,
+            {
+                "mode": "explicit",
+                "research_ready": None,
+                "selected_count": len(symbols),
+            },
+        )
 
     def probe(self) -> dict[str, Any]:
         client = self._get_client()
         start, end = self.config.resolved_dates()
+        warnings: list[str] = []
+        symbols, _, selection_audit = self._resolve_symbols_and_metadata(client, warnings)
         payload = client.get_json(
-            f"eod/{self.config.symbols[0]}",
+            f"eod/{symbols[0]}",
             {"from": start.isoformat(), "to": end.isoformat(), "period": "d", "order": "a"},
         )
         if not isinstance(payload, list):
@@ -103,7 +143,7 @@ class EODHDProvider:
         fields = sorted({key for row in payload[:10] if isinstance(row, dict) for key in row})
         return {
             "provider": self.name,
-            "symbol": self.config.symbols[0],
+            "symbol": symbols[0],
             "resolved_start": start.isoformat(),
             "resolved_end": end.isoformat(),
             "rows": len(payload),
@@ -111,6 +151,8 @@ class EODHDProvider:
             "sample": payload[-1] if payload else None,
             "requests": client.request_log,
             "budget": client.budget.status(),
+            "selection": selection_audit,
+            "warnings": warnings,
         }
 
     def ingest(self) -> ProviderIngestResult:
@@ -125,12 +167,12 @@ class EODHDProvider:
             "historical industry and float market cap are unavailable in this EOD-only ingestion",
             "no delistings table is emitted without a reliable terminal return or value",
         ]
-        metadata = self._metadata(client, warnings)
+        symbols, metadata, selection_audit = self._resolve_symbols_and_metadata(client, warnings)
         eod: dict[str, list[dict[str, Any]]] = {}
         dividends: dict[str, list[dict[str, Any]]] = {}
         splits: dict[str, list[dict[str, Any]]] = {}
         date_params = {"from": start.isoformat(), "to": end.isoformat()}
-        for symbol in self.config.symbols:
+        for symbol in symbols:
             payload = client.get_json(f"eod/{symbol}", {**date_params, "period": "d", "order": "a"})
             if not isinstance(payload, list):
                 raise EODHDError(f"EODHD EOD response for {symbol} is not an array")
@@ -187,7 +229,8 @@ class EODHDProvider:
             "token_source": self._token_source,
             "resolved_start": start.isoformat(),
             "resolved_end": end.isoformat(),
-            "symbols": self.config.symbols,
+            "symbols": symbols,
+            "selection": selection_audit,
             "requests": client.request_log,
             "budget": client.budget.status(),
             "warnings": warnings,

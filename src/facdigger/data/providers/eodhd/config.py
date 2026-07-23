@@ -23,12 +23,24 @@ class SecurityMetadataOverride(StrictModel):
     security_type: str = "Common Stock"
 
 
+class EODHDUniverseSelection(StrictModel):
+    """Deterministic current-liquidity selection for paid-plan engineering pilots."""
+
+    mode: Literal["explicit", "top_liquid"] = "explicit"
+    max_symbols: int = Field(default=100, ge=1, le=10_000)
+    exchanges: list[str] = Field(default_factory=lambda: ["NASDAQ", "NYSE", "NYSE MKT", "AMEX"])
+    security_types: list[str] = Field(default_factory=lambda: ["common_stock"])
+    min_price: float = Field(default=5.0, ge=0)
+    min_avg_volume_200d: float = Field(default=100_000.0, ge=0)
+
+
 class EODHDConfig(StrictModel):
     provider: Literal["eodhd"] = "eodhd"
     base_url: AnyHttpUrl = "https://eodhd.com/api"
     api_token_env: str = "EODHD_API_TOKEN"
     allow_demo_token: bool = True
-    symbols: list[str] = Field(min_length=1)
+    symbols: list[str] = Field(default_factory=list)
+    universe: EODHDUniverseSelection = Field(default_factory=EODHDUniverseSelection)
     exchange_code: str = "US"
     start: date | None = None
     end: date | None = None
@@ -59,6 +71,14 @@ class EODHDConfig(StrictModel):
         if len(set(normalized)) != len(normalized):
             raise ValueError("symbols must be unique")
         self.symbols = normalized
+        if self.universe.mode == "explicit" and not self.symbols:
+            raise ValueError("explicit universe mode requires at least one symbol")
+        if self.universe.mode == "top_liquid" and self.symbols:
+            raise ValueError("top_liquid universe mode discovers symbols; symbols must be empty")
+        if self.universe.mode == "top_liquid" and self.allow_demo_token:
+            raise ValueError("top_liquid universe mode requires allow_demo_token=false")
+        if not self.universe.exchanges or not self.universe.security_types:
+            raise ValueError("universe exchanges and security_types must not be empty")
         return self
 
     def resolved_dates(self, today: date | None = None) -> tuple[date, date]:
