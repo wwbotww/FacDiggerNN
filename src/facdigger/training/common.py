@@ -30,6 +30,9 @@ def load_training_snapshot(
         "sample_index": "sample_index.parquet",
         "sample_metadata": "sample_metadata.parquet",
     }
+    inference_filename = manifest.get("artifacts", {}).get("inference_index")
+    if inference_filename:
+        filenames["inference_index"] = str(inference_filename)
     if include_features:
         filenames["features"] = "features.parquet"
     frames = {name: pl.read_parquet(dataset_dir / filename) for name, filename in filenames.items()}

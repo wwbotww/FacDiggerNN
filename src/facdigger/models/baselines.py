@@ -74,6 +74,32 @@ def build_multiscale_features(
     return tabular, feature_columns
 
 
+def build_multiscale_inference_features(
+    features: pl.DataFrame,
+    inference_index: pl.DataFrame,
+    *,
+    channels: list[str],
+    windows: list[int],
+    context_length: int,
+) -> tuple[pl.DataFrame, list[str]]:
+    """Rebuild E0 statistics for a target-free inference index."""
+
+    placeholder = inference_index.select(
+        "sample_id", "security_id", "symbol", "asof_date"
+    ).with_columns(
+        pl.lit("inference").alias("split"),
+        pl.lit(0.0, dtype=pl.Float64).alias("target"),
+    )
+    tabular, columns = build_multiscale_features(
+        features,
+        placeholder,
+        channels=channels,
+        windows=windows,
+        context_length=context_length,
+    )
+    return tabular.drop("split", "target"), columns
+
+
 @dataclass(frozen=True)
 class TabularPreprocessor:
     feature_columns: list[str]
@@ -111,6 +137,33 @@ class TabularPreprocessor:
             "missing_policy": "train_standardize_then_zero_fill_plus_observed_mask",
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> TabularPreprocessor:
+        feature_columns = [str(value) for value in payload["feature_columns"]]
+        means = [float(value) for value in payload["means"]]
+        scales = [float(value) for value in payload["scales"]]
+        if not feature_columns or not (
+            len(feature_columns) == len(means) == len(scales)
+        ):
+            raise ValueError("invalid tabular preprocessing checkpoint")
+        if any(scale <= 0 for scale in scales):
+            raise ValueError("tabular preprocessing scales must be positive")
+        return cls(feature_columns=feature_columns, means=means, scales=scales)
+
+
+def build_mlp_model(
+    *, input_dim: int, hidden_dims: list[int], dropout: float, device: str
+) -> Any:
+    from torch import nn
+
+    layers: list[nn.Module] = []
+    width = input_dim
+    for hidden in hidden_dims:
+        layers.extend([nn.Linear(width, hidden), nn.GELU(), nn.Dropout(dropout)])
+        width = hidden
+    layers.append(nn.Linear(width, 1))
+    return nn.Sequential(*layers).to(device)
+
 
 def _torch_device(preference: str) -> str:
     import torch
@@ -145,13 +198,12 @@ def train_mlp(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     device = _torch_device(config.device)
-    layers: list[nn.Module] = []
-    width = train_x.shape[1]
-    for hidden in config.hidden_dims:
-        layers.extend([nn.Linear(width, hidden), nn.GELU(), nn.Dropout(config.dropout)])
-        width = hidden
-    layers.append(nn.Linear(width, 1))
-    model = nn.Sequential(*layers).to(device)
+    model = build_mlp_model(
+        input_dim=train_x.shape[1],
+        hidden_dims=config.hidden_dims,
+        dropout=config.dropout,
+        device=device,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
@@ -234,6 +286,63 @@ def predict_mlp(model: Any, values: np.ndarray, device: str) -> np.ndarray:
     with torch.no_grad():
         result = model(torch.from_numpy(values).to(device)).squeeze(-1).cpu().numpy()
     return result.astype(np.float64)
+
+
+def load_mlp_checkpoint(
+    checkpoint_path: Path, *, device: str
+) -> tuple[Any, TabularPreprocessor, dict[str, Any]]:
+    import torch
+
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if payload.get("model_type") != "mlp":
+        raise ValueError("checkpoint is not an E0 MLP model")
+    model = build_mlp_model(
+        input_dim=int(payload["input_dim"]),
+        hidden_dims=[int(value) for value in payload["hidden_dims"]],
+        dropout=float(payload["dropout"]),
+        device=device,
+    )
+    model.load_state_dict(payload["state_dict"], strict=True)
+    preprocessor = TabularPreprocessor.from_dict(payload["preprocessing"])
+    if int(payload["input_dim"]) != len(preprocessor.feature_columns) * 2:
+        raise ValueError("MLP checkpoint input_dim disagrees with preprocessing")
+    return model, preprocessor, payload
+
+
+def predict_lightgbm_checkpoint(
+    checkpoint_path: Path, values: np.ndarray, *, timeout_seconds: int = 1800
+) -> np.ndarray:
+    """Predict in a clean process to isolate native OpenMP runtimes."""
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="facdigger-lgb-predict-") as temporary:
+        root = Path(temporary)
+        input_path = root / "features.npy"
+        output_path = root / "scores.npy"
+        np.save(input_path, values)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "facdigger.models.lightgbm_predict_worker",
+                "--input",
+                str(input_path),
+                "--checkpoint",
+                str(checkpoint_path),
+                "--output",
+                str(output_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip().splitlines()
+            final_line = detail[-1] if detail else "unknown worker failure"
+            raise RuntimeError(f"isolated LightGBM prediction failed: {final_line}")
+        return np.load(output_path).astype(np.float64)
 
 
 def train_lightgbm(

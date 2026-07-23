@@ -14,7 +14,7 @@ import polars as pl
 
 from facdigger.data.adapters import StandardParquetAdapter
 from facdigger.data.config import DatasetBuildConfig
-from facdigger.datasets.index import build_sample_index
+from facdigger.datasets.index import build_inference_index, build_sample_index
 from facdigger.datasets.splits import assign_chronological_splits
 from facdigger.experiments.manifest import sha256_json
 from facdigger.features.price_volume import build_price_volume_features
@@ -88,7 +88,7 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
     source_paths = semantic_config.pop("sources")
     semantic_config.pop("output_root")
     identity = {
-        "schema_version": 2,
+        "schema_version": 3,
         "config": semantic_config,
         "input_file_hashes": input_hashes,
     }
@@ -123,6 +123,11 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
         bundle.universe,
         context_length=config.features.context_length,
     )
+    inference_index = build_inference_index(
+        features,
+        bundle.universe,
+        context_length=config.features.context_length,
+    )
     sample_metadata = _build_sample_metadata(sample_index, bundle.universe)
     split_counts = {
         row["split"]: row["len"]
@@ -140,6 +145,15 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
             "rows": sample_index.height,
             "split_counts": split_counts,
         },
+        "inference_index": {
+            "rows": inference_index.height,
+            "minimum_asof_date": inference_index["asof_date"].min().isoformat(),
+            "maximum_asof_date": inference_index["asof_date"].max().isoformat(),
+            "latest_cross_section_rows": inference_index.filter(
+                pl.col("asof_date") == inference_index["asof_date"].max()
+            ).height,
+            "contains_target": "target" in inference_index.columns,
+        },
     }
     manifest = {
         **identity,
@@ -151,6 +165,7 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
             "labels": "labels.parquet",
             "sample_index": "sample_index.parquet",
             "sample_metadata": "sample_metadata.parquet",
+            "inference_index": "inference_index.parquet",
             "audit": "audit.json",
             "scaler": "scaler.json",
             "source_manifest": (
@@ -167,6 +182,7 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
         labels.write_parquet(temporary_dir / "labels.parquet")
         sample_index.write_parquet(temporary_dir / "sample_index.parquet")
         sample_metadata.write_parquet(temporary_dir / "sample_metadata.parquet")
+        inference_index.write_parquet(temporary_dir / "inference_index.parquet")
         (temporary_dir / "audit.json").write_text(
             json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

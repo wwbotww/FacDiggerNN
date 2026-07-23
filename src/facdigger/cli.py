@@ -331,6 +331,204 @@ def train_e3_command(
     )
 
 
+@app.command("predict")
+def predict_command(
+    run: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, readable=True, help="Completed source run."),
+    ],
+    split: Annotated[
+        str | None,
+        typer.Option(help="train, valid or test; defaults to the source run evaluation split."),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="New output directory; defaults to <run>/replays/<replay_id>."),
+    ] = None,
+    dataset: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Optional relocated copy of the exact source dataset snapshot.",
+        ),
+    ] = None,
+    device: Annotated[
+        str,
+        typer.Option(help="Inference device: cpu, cuda or auto."),
+    ] = "cpu",
+    unlock_test: Annotated[
+        bool,
+        typer.Option(help="Explicitly allow reading the test split."),
+    ] = False,
+    verify_replay: Annotated[
+        bool,
+        typer.Option(help="Require original-split scores to match source predictions."),
+    ] = True,
+) -> None:
+    """Reload an E0-E3 checkpoint and export target-free factor values."""
+
+    from facdigger.inference.runner import run_inference
+
+    if split is not None and split not in {"train", "valid", "test"}:
+        typer.echo("split must be train, valid or test", err=True)
+        raise typer.Exit(code=2)
+    if device not in {"cpu", "cuda", "auto"}:
+        typer.echo("device must be cpu, cuda or auto", err=True)
+        raise typer.Exit(code=2)
+    try:
+        destination, manifest = run_inference(
+            run,
+            split=split,
+            output_dir=output,
+            dataset_dir=dataset,
+            device=device,
+            unlock_test=unlock_test,
+            require_replay_match=verify_replay,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "output_dir": str(destination),
+                "source_run_id": manifest["source_run_id"],
+                "split": manifest["split"],
+                "rows": manifest["row_count"],
+                "coverage": manifest["coverage"]["coverage"],
+                "replay_matched": manifest["replay_verification"].get("matched"),
+                "factors": str(destination / "factors.parquet"),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("signal")
+def signal_command(
+    run: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, readable=True, help="Completed source run."),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(help="New output directory; defaults to <run>/signals/<signal_id>."),
+    ] = None,
+    dataset: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Optional relocated copy of the exact schema-v3 source snapshot.",
+        ),
+    ] = None,
+    asof: Annotated[
+        str | None,
+        typer.Option(help="latest or YYYY-MM-DD; omit when using a date range."),
+    ] = "latest",
+    start_date: Annotated[
+        str | None, typer.Option(help="Inclusive YYYY-MM-DD range start.")
+    ] = None,
+    end_date: Annotated[
+        str | None, typer.Option(help="Inclusive YYYY-MM-DD range end.")
+    ] = None,
+    device: Annotated[str, typer.Option(help="Inference device: cpu, cuda or auto.")] = "cpu",
+) -> None:
+    """Generate target-free factors for latest or selected schema-v3 dates."""
+
+    from datetime import date
+
+    from facdigger.inference.runner import run_signal_inference
+
+    if device not in {"cpu", "cuda", "auto"}:
+        typer.echo("device must be cpu, cuda or auto", err=True)
+        raise typer.Exit(code=2)
+    if (start_date or end_date) and asof == "latest":
+        asof = None
+    try:
+        destination, signal_manifest = run_signal_inference(
+            run,
+            output_dir=output,
+            dataset_dir=dataset,
+            asof=asof,
+            start_date=date.fromisoformat(start_date) if start_date else None,
+            end_date=date.fromisoformat(end_date) if end_date else None,
+            device=device,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "output_dir": str(destination),
+                "source_run_id": signal_manifest["source_run_id"],
+                "rows": signal_manifest["row_count"],
+                "minimum_asof_date": signal_manifest["selection"]["minimum_asof_date"],
+                "maximum_asof_date": signal_manifest["selection"]["maximum_asof_date"],
+                "factors": str(destination / "factors.parquet"),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@app.command("evaluate")
+def evaluate_command(
+    predictions: Annotated[
+        Path, typer.Option(exists=True, dir_okay=False, readable=True)
+    ],
+    dataset: Annotated[
+        Path, typer.Option(exists=True, file_okay=False, readable=True)
+    ],
+    output: Annotated[Path, typer.Option(help="New independent evaluation directory.")],
+    costs_bps: Annotated[
+        str, typer.Option(help="Comma-separated one-way cost assumptions in basis points.")
+    ] = "0,10,20,50",
+    minimum_coverage: Annotated[
+        float, typer.Option(min=0.0, max=1.0, help="Minimum accepted sample coverage.")
+    ] = 1.0,
+) -> None:
+    """Evaluate an existing prediction table without loading its model."""
+
+    from facdigger.evaluation.runner import evaluate_prediction_file
+
+    try:
+        costs = [float(value.strip()) for value in costs_bps.split(",") if value.strip()]
+        destination, evaluation_manifest = evaluate_prediction_file(
+            predictions,
+            dataset,
+            output,
+            costs_bps=costs,
+            minimum_coverage=minimum_coverage,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "output_dir": str(destination),
+                "dataset_id": evaluation_manifest["dataset_id"],
+                "evaluation_split": evaluation_manifest["evaluation_split"],
+                "rows": evaluation_manifest["row_count"],
+                "coverage": evaluation_manifest["coverage"]["coverage"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 @app.command("compare")
 def compare_command(
     runs: Annotated[
@@ -394,6 +592,25 @@ def research_plan_command(
             default=str,
         )
     )
+
+
+@research_app.command("preflight")
+def research_preflight_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Run the non-training source and protocol gate for a final M6 experiment."""
+
+    from facdigger.research.config import load_m6_config
+    from facdigger.research.preflight import research_preflight
+
+    try:
+        report = research_preflight(load_m6_config(config))
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+    if not report["ready"]:
+        raise typer.Exit(code=1)
 
 
 @research_app.command("run")

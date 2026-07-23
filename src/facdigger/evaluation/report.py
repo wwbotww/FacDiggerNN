@@ -25,10 +25,10 @@ def write_evaluation_report(metrics: dict[str, Any], output: Path) -> None:
         for key, value in summary.items()
     )
     document = f"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>FacDigger E0 Report</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>FacDigger Factor Report</title>
 <style>body{{font-family:system-ui;max-width:960px;margin:2rem auto;line-height:1.5}}
 table{{border-collapse:collapse}}th,td{{border:1px solid #ccc;padding:.4rem .7rem;text-align:left}}
 pre{{background:#f5f5f5;padding:1rem;overflow:auto}}</style></head>
-<body><h1>FacDigger E0 Validation Report</h1><table>{rows}</table>
+<body><h1>FacDigger Factor Evaluation Report</h1><table>{rows}</table>
 <h2>完整指标</h2><pre>{html.escape(payload)}</pre></body></html>"""
     output.write_text(document, encoding="utf-8")

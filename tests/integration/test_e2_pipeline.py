@@ -11,6 +11,7 @@ pytest.importorskip("transformers")
 
 from facdigger.data.config import DatasetBuildConfig  # noqa: E402
 from facdigger.data.snapshots import build_dataset_snapshot  # noqa: E402
+from facdigger.inference.runner import run_inference  # noqa: E402
 from facdigger.models.patchtst_alpha import PatchTSTAlphaModel  # noqa: E402
 from facdigger.models.patchtst_transfer import module_fingerprint  # noqa: E402
 from facdigger.training.e2 import run_e2  # noqa: E402
@@ -175,3 +176,9 @@ def test_e2_runner_writes_transfer_training_and_evaluation_artifacts(tmp_path) -
     assert manifest["status"] == "complete"
     assert manifest["training"]["stage_audits"]["ft0_head_only"]["encoder_changed"] is False
     assert manifest["training"]["stage_audits"]["ft1_last_blocks"]["encoder_changed"] is True
+
+    replay_dir, replay_manifest = run_inference(
+        run_dir, output_dir=tmp_path / "replay", device="cpu"
+    )
+    assert replay_manifest["replay_verification"]["matched"] is True
+    assert (replay_dir / "factors.parquet").is_file()

@@ -126,3 +126,46 @@ class SnapshotWindowDataset:
             "target": np.float32(self.sample_rows["target"][index]),
             "sample_index": index,
         }
+
+
+class SnapshotInferenceWindowDataset(SnapshotWindowDataset):
+    """Materialize target-free windows selected from a schema-v3 inference index."""
+
+    def __init__(
+        self,
+        *,
+        features: pl.DataFrame,
+        inference_index: pl.DataFrame,
+        channels: list[str],
+        context_length: int,
+    ) -> None:
+        required = {
+            "sample_id",
+            "security_id",
+            "asof_date",
+            "feature_start",
+            "feature_end",
+        }
+        missing = sorted(required - set(inference_index.columns))
+        if missing:
+            raise DataContractError(f"inference_index missing required columns: {missing}")
+        if "target" in inference_index.columns:
+            raise DataContractError("inference_index must not contain target")
+        rows = inference_index.with_columns(pl.lit("inference").alias("split"))
+        super().__init__(
+            features=features,
+            sample_index=rows,
+            channels=channels,
+            context_length=context_length,
+            split="inference",
+        )
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        security_id, start = self._locations[index]
+        block = self.blocks[security_id]
+        stop = start + self.context_length
+        return {
+            "values": block.values[start:stop],
+            "observed_mask": block.observed[start:stop],
+            "sample_index": index,
+        }

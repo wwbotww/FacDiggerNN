@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from datetime import date, timedelta
 
 import polars as pl
@@ -7,6 +8,8 @@ import pytest
 
 from facdigger.data.config import DatasetBuildConfig
 from facdigger.data.snapshots import build_dataset_snapshot
+from facdigger.evaluation.runner import evaluate_prediction_file
+from facdigger.inference.runner import run_inference, run_signal_inference
 from facdigger.training.e0 import run_e0
 from facdigger.training.e0_config import E0ExperimentConfig
 
@@ -117,3 +120,48 @@ def test_e0_mlp_train_predict_report_pipeline(tmp_path) -> None:
     predictions = pl.read_parquet(run_dir / "predictions.parquet")
     assert predictions["score_raw"].is_finite().all()
     assert predictions["score_neutralized"].is_not_null().all()
+
+    replay_dir, replay_manifest = run_inference(
+        run_dir, output_dir=tmp_path / "replay", device="cpu"
+    )
+    assert replay_manifest["replay_verification"]["matched"] is True
+    factors = pl.read_parquet(replay_dir / "factors.parquet")
+    assert "target" not in factors.columns
+    assert factors["signal_available"].unique().to_list() == ["after_close"]
+    assert factors["earliest_execution"].unique().to_list() == ["next_session_open"]
+
+    signal_dir, signal_manifest = run_signal_inference(
+        run_dir, output_dir=tmp_path / "latest-signal", device="cpu"
+    )
+    latest_factors = pl.read_parquet(signal_dir / "factors.parquet")
+    assert signal_manifest["factor_contract"]["reads_labels"] is False
+    assert signal_manifest["factor_contract"]["reads_test_membership"] is False
+    assert latest_factors["asof_date"].unique().to_list() == [calendar[-1]]
+    assert "target" not in latest_factors.columns
+    assert latest_factors.height == 6
+
+    target_free_snapshot = tmp_path / "target-free-snapshot"
+    target_free_snapshot.mkdir()
+    for filename in ["manifest.json", "features.parquet", "inference_index.parquet"]:
+        shutil.copyfile(snapshot_dir / filename, target_free_snapshot / filename)
+    _, isolated_signal_manifest = run_signal_inference(
+        run_dir,
+        dataset_dir=target_free_snapshot,
+        output_dir=tmp_path / "isolated-latest-signal",
+        device="cpu",
+    )
+    assert isolated_signal_manifest["row_count"] == 6
+
+    evaluation_dir, evaluation_manifest = evaluate_prediction_file(
+        run_dir / "predictions.parquet",
+        snapshot_dir,
+        tmp_path / "independent-evaluation",
+    )
+    assert evaluation_manifest["coverage"]["coverage"] == 1.0
+    assert (evaluation_dir / "metrics.json").is_file()
+    assert (evaluation_dir / "report.html").is_file()
+
+    with pytest.raises(ValueError, match="unlock_test=true"):
+        run_inference(run_dir, split="test", output_dir=tmp_path / "locked-test")
+    with pytest.raises(FileExistsError, match="already exists"):
+        run_inference(run_dir, output_dir=replay_dir)

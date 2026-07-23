@@ -115,6 +115,13 @@ def run_e0(
                 preprocessing=preprocessor.to_dict(),
             )
         checkpoint_hash = sha256_file(checkpoint_path)
+        preprocessing_artifact = None
+        if config.model_type == "lightgbm":
+            preprocessing_path = checkpoint_path.with_suffix(".preprocessing.json")
+            preprocessing_artifact = {
+                "file": str(preprocessing_path.relative_to(temporary_dir)),
+                "sha256": sha256_file(preprocessing_path),
+            }
         predictions, neutralization_audit = build_prediction_frame(
             evaluation_rows,
             frames["sample_metadata"],
@@ -155,6 +162,7 @@ def run_e0(
         )
         manifest = {
             "schema_version": 1,
+            "status": "complete",
             "run_id": run_id,
             "created_at": created_at.isoformat(),
             "model_id": config.experiment_id,
@@ -176,6 +184,7 @@ def run_e0(
             "checkpoint": {
                 "file": f"checkpoints/{checkpoint_name}",
                 "sha256": checkpoint_hash,
+                "preprocessing": preprocessing_artifact,
             },
             "training": training_audit,
             "source_provenance": source_provenance,

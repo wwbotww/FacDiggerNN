@@ -244,6 +244,7 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
         "labels.parquet",
         "sample_index.parquet",
         "sample_metadata.parquet",
+        "inference_index.parquet",
         "audit.json",
         "scaler.json",
         "manifest.json",
@@ -254,6 +255,13 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
     assert audit["sample_index"]["rows"] > 0
     assert set(audit["sample_index"]["split_counts"]) == {"test", "train", "valid"}
     assert json.loads((first_dir / "source_manifest.json").read_text())["provider"] == ("synthetic")
+    inference_index = pl.read_parquet(first_dir / "inference_index.parquet")
+    sample_index = pl.read_parquet(first_dir / "sample_index.parquet")
+    assert first_manifest["schema_version"] == 3
+    assert "target" not in inference_index.columns
+    assert inference_index["asof_date"].max() == calendar[-1]
+    assert inference_index["asof_date"].max() > sample_index["asof_date"].max()
+    assert audit["inference_index"]["contains_target"] is False
 
     moved_config = config.model_copy(update={"output_root": tmp_path / "other-snapshots"})
     moved_dir, moved_manifest = build_dataset_snapshot(moved_config)

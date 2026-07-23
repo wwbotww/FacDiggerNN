@@ -57,3 +57,6 @@ def test_multiscale_features_use_only_past_and_append_missing_masks() -> None:
     assert matrix.shape == (1, len(columns) * 2)
     assert matrix[0, 0] == 0.0
     assert matrix[0, len(columns)] == 0.0
+
+    restored = TabularPreprocessor.from_dict(preprocessor.to_dict())
+    assert restored == preprocessor
