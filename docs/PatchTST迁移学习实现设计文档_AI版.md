@@ -202,6 +202,9 @@ flowchart TD
 - EODHD 连接器必须同时纳入 active 与 delisted 候选，再按历史当日流动性决定 eligibility；当前 metadata 不能用于历史流动性排序。
 - 原始 OHLC 保持不变，`adj_factor = adjusted_close / close`。EODHD 的 adjusted close 同时包含拆股和分红影响，该限制必须进入来源告警。
 - 日线无法直接区分停牌与缺数。实现以完整市场 session 网格承载缺口，使用 `trade_status_quality` 明确标注推断，不把缺失 bar 当作正常交易。
+- market session 必须来自版本化的 US exchange regular-session 日历，不能使用 bars 日期并集；闭市日异常 bar 在 provider 边界丢弃。
+- ticker alias 合并前必须检查同日 adjusted-price 冲突和相邻 session 数量级断裂；不可信身份整条隔离，不能只 winsorize feature。公司行动 exact alias 可确定性去重，经济条款冲突必须整组 fail closed。
+- historical EODHD 的 manifest 必须写入来源质量证明；`data validate`、snapshot 和 M6 preflight 均要求 `quality.gate.status=passed`，工程模式也不能绕过。
 
 ## 4.2 首版7通道特征
 

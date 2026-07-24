@@ -120,9 +120,9 @@ facdigger dataset build --config configs/datasets/eodhd_all_world_pilot.yaml
 
 ### EODHD 历史动态股票池
 
-`eodhd_historical_liquid.yaml` 同时发现 Nasdaq、NYSE 和 NYSE American 的 active 与 delisted 普通股候选，不按“今天仍活跃”预先截断。标准化后先为每只证券恢复其上市区间内的完整交易日网格，将有行情但缺失的 session 识别为推断停牌，再按当日可知的 20 日平均成交额动态选取最多 1000 只股票。标签窗口使用全市场交易日推进，因此不会因个股停牌或最后行情缺失而把 `t+5` 错移到更晚的个股交易日。
+`eodhd_historical_liquid.yaml` 同时发现 Nasdaq、NYSE 和 NYSE American 的 active 与 delisted 普通股候选，不按“今天仍活跃”预先截断。标准化使用版本化的美股 regular-session 日历，不再从 bars 日期并集推断交易日；非 session bars 会被删除。合并 ticker alias 前还会检查同日价格冲突和相邻 session 的复权价数量级断裂，命中后隔离整个不可信身份。随后为每只证券恢复上市区间内的完整 session 网格，将有行情但缺失的 session 识别为推断停牌，再按当日可知的 20 日平均成交额动态选取最多 1000 只股票。
 
-当前账户实测可发现 6327 只 active、16418 只 delisted，合计 22745 个唯一候选。全量采集预计需要约 22745 次 EOD 请求；同时采集 splits/dividends 时约为 6.8 万次请求，因此 `probe` 只核对候选规模和单只历史格式，不会隐式启动全量下载。
+2026-07-24 的完整采集在衍生工具过滤后有 19,033 个候选，57,101 个 EOD/dividend/split 请求。候选规模会随供应商 metadata 更新而变化，因此 `probe` 只核对当次规模和单只历史格式，不会隐式启动全量下载。
 
 ```bash
 facdigger data probe --config configs/data/eodhd_historical_liquid.yaml
@@ -131,7 +131,13 @@ facdigger data probe --config configs/data/eodhd_historical_liquid.yaml
 facdigger data ingest --config configs/data/eodhd_historical_liquid.yaml
 facdigger data validate --config configs/datasets/eodhd_historical_liquid.yaml
 facdigger dataset build --config configs/datasets/eodhd_historical_liquid.yaml
+
+# 可选：检查来源硬门禁摘要
+jq '.quality.gate, .quality.calendar, .quality.corporate_actions' \
+  data/bronze/eodhd_us_historical_liquid/eodhd_ingestion_manifest.json
 ```
+
+historical 模式强制要求 manifest 中 `quality.gate.status=passed`，并校验 manifest 与当前 Parquet 的 SHA-256 绑定。旧 bronze、被替换的文件、缺失正式 session、残留非 session 日期或残留超过阈值的相邻复权价跳变都会被 `data validate`、snapshot build 和 M6 preflight 拒绝。若需要隔离的身份超过候选稳定身份的 10%，采集会在替换输出前失败，防止供应商格式变化造成静默的大面积删数。
 
 EODHD 当前套餐没有可靠的退市终值/原因。该配置采用可审计的保守插值：Nasdaq 为最后有效价格后的 `-55%`，NYSE/NYSE American 为 `-30%`，未知交易所为 `-50%`。这些值不是观测事实；`delistings.parquet`、source manifest 和训练 provenance 都会保留插值方法及警告。它修复了“跨退市样本静默丢失”的工程缺口，但不能替代 CRSP 等具有真实 delisting return 的数据源，也不能令数据自动达到正式研究标准。
 

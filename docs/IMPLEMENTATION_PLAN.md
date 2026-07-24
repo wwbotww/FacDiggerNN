@@ -250,6 +250,10 @@ EODHD 连接器位于 `data/providers/eodhd`，通过通用 `MarketDataProvider`
 - 所有成功响应进入内容寻址的本地 JSON 缓存；另用 UTC 日预算文件在发起请求前计数，保护免费版的每日调用额度。
 - EODHD 原始 OHLC 不复权，`adjusted_close` 同时包含拆股和分红调整。标准表保留原始 OHLC，并记录 `adj_factor=adjusted_close/close` 和调整口径。
 - `security_id` 优先由 ISIN 生成；缺少元数据时只能退化为 provider ticker，必须写入 `identity_quality` 和采集告警，不能宣称跨 ticker 变更稳定。
+- 历史模式使用版本化的 US regular-session calendar，禁止从 bars union 推断市场交易日；非 session 行必须在构建 ADV 和标签前删除。
+- alias 合并前检查同日价格冲突与相邻 session adjusted-price 数量级断裂；命中身份整条隔离，隔离比例超过配置上限时采集失败。
+- 公司行动先按经济条款去重，同一身份、除权日和类型的条款冲突整组排除；active alias 优先于 old delisted alias 决定身份生命周期。
+- historical manifest 必须包含通过的质量门禁，标准数据验证、快照构建与 M6 preflight 都拒绝没有该证明的旧 bronze。
 - EOD 日线不能还原历史停牌状态、历史行业或点时流通市值。首版只把存在有效 bar 的 session 标记为“推断可交易”，其余字段保持缺失并附质量标记。
 - 供应商的“已退市”标志不能替代退市收益或终值。没有可靠 terminal value 时，正式研究不得把估计值冒充观测值；工程阶段可按显式、版本化的保守政策生成 `is_imputed=true` 的 `delistings` 表，并必须在表、manifest 和训练 provenance 中记录方法、参数与限制。纳入退市证券历史行情与退市标签处理仍是两个独立能力。
 - 免费版约一年的历史只有约 252 个交易日，不足以形成 512 日上下文。免费配置只用于采集和短窗口管线冒烟；最终研究需要升级历史覆盖或导入合规的长期历史快照。

@@ -15,7 +15,6 @@ import polars as pl
 from facdigger.data.contracts import (
     table_audit,
     validate_bars,
-    validate_corporate_actions,
 )
 from facdigger.data.providers.base import ProviderIngestResult
 from facdigger.data.providers.eodhd.client import DailyCallBudget, EODHDClient, EODHDError
@@ -25,9 +24,20 @@ from facdigger.data.providers.eodhd.mapper import (
     build_metadata_index,
     build_universe,
     consolidate_bars,
+    consolidate_corporate_actions,
     filter_valid_eod_rows,
     map_corporate_actions,
     map_eod_bars,
+)
+from facdigger.data.providers.eodhd.market_calendar import (
+    CALENDAR_NAME,
+    CALENDAR_VERSION,
+    regular_session_frame,
+)
+from facdigger.data.providers.eodhd.quality import (
+    assert_historical_ingestion_quality,
+    filter_to_regular_sessions,
+    quarantine_suspicious_identities,
 )
 from facdigger.data.providers.eodhd.universe import (
     discover_historical_symbols,
@@ -215,6 +225,7 @@ class EODHDProvider:
                 "no delistings table is emitted without a reliable terminal return or value"
             )
         symbols, metadata, selection_audit = self._resolve_symbols_and_metadata(client, warnings)
+        market_calendar = regular_session_frame(start, end)
         eod_batch: dict[str, list[dict[str, Any]]] = {}
         dividend_batch: dict[str, list[dict[str, Any]]] = {}
         split_batch: dict[str, list[dict[str, Any]]] = {}
@@ -233,6 +244,7 @@ class EODHDProvider:
                     metadata,
                     source_revision=source_revision,
                     ingested_at=ingested_at,
+                    consolidate_aliases=False,
                 )
             )
             if self.config.include_corporate_actions:
@@ -273,8 +285,34 @@ class EODHDProvider:
         if not bar_parts:
             raise EODHDError("EODHD returned no usable EOD histories")
         combined_bars = pl.concat(bar_parts, how="vertical_relaxed")
-        bars = validate_bars(consolidate_bars(combined_bars))
-        overlap_rows_resolved = combined_bars.height - bars.height
+        session_bars, calendar_audit = filter_to_regular_sessions(
+            combined_bars,
+            market_calendar,
+        )
+        quality_audit: dict[str, Any] = {**calendar_audit}
+        if self.config.quality_gate.enabled:
+            gate = self.config.quality_gate
+            session_bars, identity_audit = quarantine_suspicious_identities(
+                session_bars,
+                market_calendar,
+                max_adjusted_price_ratio=gate.max_adjusted_price_ratio,
+                max_alias_overlap_relative_diff=gate.max_alias_overlap_relative_diff,
+                max_quarantined_security_fraction=gate.max_quarantined_security_fraction,
+            )
+            quality_audit.update(identity_audit)
+        else:
+            quality_audit.update(
+                {
+                    "quarantined_securities": 0,
+                    "quarantined_security_fraction": 0.0,
+                    "quarantined_bar_rows": 0,
+                    "quarantined_security_ids": [],
+                    "alias_overlap_conflict_groups": 0,
+                    "extreme_consecutive_return_rows": 0,
+                }
+            )
+        bars = validate_bars(consolidate_bars(session_bars))
+        overlap_rows_resolved = session_bars.height - bars.height
         selection_audit["overlapping_alias_rows_resolved"] = overlap_rows_resolved
         selection_audit["invalid_eod_rows_dropped"] = rejected_eod_rows
         selection_audit["invalid_eod_symbols"] = sorted(rejected_eod_symbols)
@@ -288,6 +326,18 @@ class EODHDProvider:
                 f"dropped {rejected_eod_rows} invalid provider OHLCV rows across "
                 f"{len(rejected_eod_symbols)} symbols; missing sessions remain explicit in universe"
             )
+        if quality_audit["off_calendar_rows_dropped"]:
+            warnings.append(
+                "dropped "
+                f"{quality_audit['off_calendar_rows_dropped']} bars on "
+                f"{quality_audit['off_calendar_dates_dropped']} non-session dates"
+            )
+        if quality_audit["quarantined_securities"]:
+            warnings.append(
+                "quarantined "
+                f"{quality_audit['quarantined_securities']} security identities with "
+                "incompatible alias prices or extreme consecutive adjusted returns"
+            )
         universe = build_universe(
             bars,
             min_listed_sessions=self.config.min_listed_sessions,
@@ -298,12 +348,54 @@ class EODHDProvider:
                 if self.config.universe.mode == "historical_liquid"
                 else None
             ),
+            calendar=market_calendar,
         )
-        actions = (
-            validate_corporate_actions(pl.concat(action_parts, how="vertical_relaxed"))
-            if action_parts
-            else None
-        )
+        action_audit = {
+            "exact_alias_rows_removed": 0,
+            "conflict_groups_dropped": 0,
+            "conflict_rows_dropped": 0,
+            "quarantined_identity_rows_dropped": 0,
+            "conflict_security_ids": [],
+            "conflict_examples": [],
+        }
+        actions = None
+        if action_parts:
+            raw_actions = pl.concat(action_parts, how="vertical_relaxed")
+            quarantined_ids = quality_audit["quarantined_security_ids"]
+            action_rows_before_quarantine = raw_actions.height
+            if quarantined_ids:
+                raw_actions = raw_actions.filter(
+                    ~pl.col("security_id").is_in(quarantined_ids)
+                )
+            actions, action_audit = consolidate_corporate_actions(raw_actions)
+            action_audit["quarantined_identity_rows_dropped"] = (
+                action_rows_before_quarantine - raw_actions.height
+            )
+            if action_audit["conflict_groups_dropped"]:
+                warnings.append(
+                    "dropped "
+                    f"{action_audit['conflict_groups_dropped']} conflicting corporate-action "
+                    "groups instead of selecting an arbitrary alias"
+                )
+        if self.config.universe.mode == "historical_liquid":
+            quality_audit["gate"] = assert_historical_ingestion_quality(
+                bars,
+                market_calendar,
+                max_adjusted_price_ratio=self.config.quality_gate.max_adjusted_price_ratio,
+            )
+        else:
+            quality_audit["gate"] = {
+                "status": "not_applicable",
+                "reason": "full-calendar coverage is required only for historical_liquid mode",
+            }
+        quality_audit["calendar"] = {
+            "name": CALENDAR_NAME,
+            "version": CALENDAR_VERSION,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "sessions": market_calendar.height,
+        }
+        quality_audit["corporate_actions"] = action_audit
         delistings = None
         if self.config.delisting_imputation.enabled:
             imputation = self.config.delisting_imputation
@@ -350,6 +442,7 @@ class EODHDProvider:
             "requests": client.request_log,
             "budget": client.budget.status(),
             "warnings": warnings,
+            "quality": quality_audit,
             "tables": {
                 name: {
                     **table_audit(
@@ -381,7 +474,8 @@ class EODHDProvider:
         manifest_path = output_dir / "eodhd_ingestion_manifest.json"
         temporary_manifest = output_dir / f".{manifest_path.name}.{uuid.uuid4().hex}.tmp"
         temporary_manifest.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+            + "\n",
             encoding="utf-8",
         )
         temporary_manifest.replace(manifest_path)

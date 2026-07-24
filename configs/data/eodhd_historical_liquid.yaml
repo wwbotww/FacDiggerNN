@@ -37,6 +37,15 @@ min_listed_sessions: 252
 min_price: 5.0
 min_adv20_usd: 1000000.0
 
+# These gates run before bronze output files are replaced. Non-session
+# bars are removed, incompatible alias/ticker histories are quarantined, and
+# systemic quarantine (>10% of identities) aborts ingestion for manual review.
+quality_gate:
+  enabled: true
+  max_adjusted_price_ratio: 10.0
+  max_alias_overlap_relative_diff: 0.05
+  max_quarantined_security_fraction: 0.10
+
 # EODHD does not supply a defensible terminal return/reason in this package.
 # These assumptions are explicit, versioned and retained in the source manifest.
 delisting_imputation:

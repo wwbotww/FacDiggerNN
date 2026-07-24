@@ -150,6 +150,7 @@ def map_eod_bars(
     *,
     source_revision: str,
     ingested_at: datetime,
+    consolidate_aliases: bool = True,
 ) -> pl.DataFrame:
     records: list[dict[str, Any]] = []
     for ticker, rows in rows_by_symbol.items():
@@ -186,7 +187,8 @@ def map_eod_bars(
             )
     if not records:
         raise ValueError("EODHD returned no usable EOD rows")
-    return validate_bars(consolidate_bars(pl.DataFrame(records)))
+    frame = pl.DataFrame(records)
+    return validate_bars(consolidate_bars(frame)) if consolidate_aliases else frame
 
 
 def build_universe(
@@ -196,11 +198,20 @@ def build_universe(
     min_price: float,
     min_adv20_usd: float,
     max_daily_symbols: int | None = None,
+    calendar: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
-    """Build a full security-session grid and optional daily dynamic-liquidity universe."""
+    """Build a full security-session grid and optional daily dynamic-liquidity universe.
+
+    Provider ingestion must pass an exchange calendar.  The bars-union fallback
+    remains available for provider-neutral unit tests and manually supplied data.
+    """
 
     ordered = bars.sort(["security_id", "trade_date"])
-    calendar = ordered.select("trade_date").unique().sort("trade_date")
+    calendar = (
+        calendar.select("trade_date").unique().sort("trade_date")
+        if calendar is not None
+        else ordered.select("trade_date").unique().sort("trade_date")
+    )
     maximum_date = calendar["trade_date"].max()
     next_sessions = calendar.with_columns(
         pl.col("trade_date").shift(-1).alias("_next_session")
@@ -218,7 +229,9 @@ def build_universe(
             .alias("_security_type_source"),
             pl.col("identity_quality").first().alias("identity_quality"),
             pl.col("provider_symbol").first().alias("provider_symbol"),
-            pl.col("is_delisted_source").max().alias("_eventually_delisted"),
+            # An active alias supersedes an old alias marked delisted.  Using
+            # max() here falsely delisted still-active identities after ticker changes.
+            pl.col("is_delisted_source").min().alias("_eventually_delisted"),
         )
         .join(
             next_sessions,
@@ -388,36 +401,23 @@ def build_imputed_delistings(
 ) -> pl.DataFrame | None:
     """Create explicitly marked, conservative delisting-return imputations."""
 
-    last_rows = (
-        bars.filter(pl.col("is_delisted_source"))
-        .sort(["security_id", "trade_date"])
-        .group_by("security_id", maintain_order=True)
-        .tail(1)
-        .select(
-            "security_id",
-            pl.col("trade_date").alias("last_trade_date"),
-        )
-    )
-    if last_rows.is_empty():
-        return None
-    delist_dates = (
-        universe.filter(pl.col("is_delisted"))
+    lifecycle = (
+        universe.filter(pl.col("_eventually_delisted"))
         .group_by("security_id")
         .agg(
-            pl.col("trade_date").min().alias("delist_date"),
+            pl.col("_last_trade_date").first().alias("last_trade_date"),
+            pl.col("trade_date")
+            .filter(pl.col("is_delisted"))
+            .min()
+            .alias("delist_date"),
             pl.col("exchange").first().alias("exchange"),
         )
+        .filter(pl.col("delist_date").is_not_null())
     )
-    rows = last_rows.join(
-        delist_dates,
-        on="security_id",
-        how="inner",
-        validate="1:1",
-    )
-    if rows.is_empty():
+    if lifecycle.is_empty():
         return None
     return validate_delistings(
-        rows.with_columns(
+        lifecycle.with_columns(
             pl.col("exchange")
             .replace_strict(exchange_returns, default=default_return)
             .cast(pl.Float64)
@@ -485,6 +485,9 @@ def map_corporate_actions(
                     "known_at_quality": (
                         "declaration_date" if known_at == declared else "ex_date_assumed"
                     ),
+                    "is_delisted_source": bool(
+                        (metadata.get(ticker) or {}).get("is_delisted", False)
+                    ),
                 }
             )
         for row in splits_by_symbol.get(ticker, []):
@@ -502,8 +505,80 @@ def map_corporate_actions(
                     "provider_symbol": ticker,
                     "currency": None,
                     "known_at_quality": "ex_date_assumed",
+                    "is_delisted_source": bool(
+                        (metadata.get(ticker) or {}).get("is_delisted", False)
+                    ),
                 }
             )
     if not records:
         return None
     return validate_corporate_actions(pl.DataFrame(records))
+
+
+def consolidate_corporate_actions(
+    frame: pl.DataFrame,
+) -> tuple[pl.DataFrame | None, dict[str, Any]]:
+    """Deduplicate alias copies and quarantine economically conflicting events.
+
+    Rows with the same stable identity, ex-date and action type are one candidate
+    event.  Equal economic terms are collapsed deterministically.  If terms
+    disagree, the entire event is excluded rather than guessing which alias is
+    correct.
+    """
+
+    if frame.is_empty():
+        return None, {
+            "exact_alias_rows_removed": 0,
+            "conflict_groups_dropped": 0,
+            "conflict_rows_dropped": 0,
+            "conflict_security_ids": [],
+            "conflict_examples": [],
+        }
+    event_key = ["security_id", "ex_date", "action_type"]
+    economic_terms = ["price_factor", "volume_factor", "cash_amount", "currency"]
+    ranked = frame.sort(
+        [
+            *event_key,
+            "is_delisted_source",
+            "known_at",
+            "provider_symbol",
+        ],
+        descending=[False, False, False, False, False, False],
+    )
+    semantic = ranked.unique(
+        subset=[*event_key, *economic_terms],
+        keep="first",
+        maintain_order=True,
+    )
+    exact_removed = frame.height - semantic.height
+    conflicts = (
+        semantic.group_by(event_key)
+        .agg(
+            pl.len().alias("_variants"),
+            pl.col("provider_symbol").alias("_provider_symbols"),
+            pl.col("price_factor").alias("_price_factors"),
+            pl.col("volume_factor").alias("_volume_factors"),
+            pl.col("cash_amount").alias("_cash_amounts"),
+        )
+        .filter(pl.col("_variants") > 1)
+    )
+    conflict_keys = conflicts.select(event_key)
+    conflict_rows = (
+        semantic.join(conflict_keys, on=event_key, how="semi")
+        if conflicts.height
+        else semantic.head(0)
+    )
+    clean = (
+        semantic.join(conflict_keys, on=event_key, how="anti")
+        if conflicts.height
+        else semantic
+    )
+    clean = clean.drop("is_delisted_source")
+    result = validate_corporate_actions(clean) if clean.height else None
+    return result, {
+        "exact_alias_rows_removed": exact_removed,
+        "conflict_groups_dropped": conflicts.height,
+        "conflict_rows_dropped": conflict_rows.height,
+        "conflict_security_ids": sorted(conflict_rows["security_id"].unique().to_list()),
+        "conflict_examples": conflicts.head(20).to_dicts(),
+    }
