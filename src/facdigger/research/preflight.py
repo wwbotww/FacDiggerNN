@@ -13,6 +13,38 @@ from facdigger.research.config import M6ResearchConfig
 from facdigger.research.folds import validate_model_config_paths
 
 
+def _quality_summary(quality: dict[str, Any]) -> dict[str, Any]:
+    """Keep preflight readable while the source manifest retains full evidence."""
+
+    summary = {
+        key: value
+        for key, value in quality.items()
+        if key
+        not in {
+            "alias_overlap_examples",
+            "extreme_return_examples",
+            "off_calendar_examples",
+            "quarantined_security_ids",
+        }
+    }
+    corporate_actions = summary.get("corporate_actions")
+    if isinstance(corporate_actions, dict):
+        summary["corporate_actions"] = {
+            key: value
+            for key, value in corporate_actions.items()
+            if key not in {"conflict_examples", "conflict_security_ids"}
+        }
+    return summary
+
+
+def _selection_summary(selection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in selection.items()
+        if key not in {"invalid_eod_symbols"}
+    }
+
+
 def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
     """Check frozen inputs and provenance without building datasets or training."""
 
@@ -36,12 +68,14 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
     if base.sources.source_manifest is not None and base.sources.source_manifest.is_file():
         payload = json.loads(base.sources.source_manifest.read_text(encoding="utf-8"))
         selection = payload.get("selection") or {}
+        quality = payload.get("quality") or {}
         provenance = {
             "available": True,
             "provider": payload.get("provider"),
             "source_revision": payload.get("source_revision"),
             "manifest_sha256": sha256_file(base.sources.source_manifest),
-            "selection": selection,
+            "selection": _selection_summary(selection),
+            "quality": _quality_summary(quality),
             "delistings": payload.get("delistings"),
             "research_ready": selection.get("research_ready"),
             "warnings": list(payload.get("warnings") or []),
@@ -56,12 +90,21 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
         universe_rows = dates.height
     required_end = max(fold.test_end for fold in config.folds)
     require_source_ready = config.decisions.require_source_research_ready
+    historical_eodhd = (
+        provenance.get("provider") == "eodhd"
+        and (provenance.get("selection") or {}).get("mode") == "historical_liquid"
+    )
+    source_quality_passed = (
+        not historical_eodhd
+        or ((provenance.get("quality") or {}).get("gate") or {}).get("status") == "passed"
+    )
     checks = {
         "source_files_exist": not missing_sources,
         "source_provenance_available": provenance["available"],
         "source_readiness_gate": (
             provenance["research_ready"] is True or not require_source_ready
         ),
+        "source_quality_gate": source_quality_passed,
         "universe_covers_final_fold": maximum_date is not None and maximum_date >= required_end,
         "model_configs_exist": len(model_paths) == 4,
         "three_or_more_folds": len(config.folds) >= 3,
@@ -74,6 +117,11 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
         blockers.append("source provenance manifest is unavailable")
     elif provenance["research_ready"] is not True and require_source_ready:
         blockers.append("source provenance explicitly does not declare research_ready=true")
+    if not source_quality_passed:
+        blockers.append(
+            "EODHD historical source has no passed quality gate; rebuild bronze with "
+            "the current adapter"
+        )
     if not checks["universe_covers_final_fold"]:
         blockers.append(
             f"universe maximum date {maximum_date} does not cover final fold end {required_end}"

@@ -1,4 +1,4 @@
-dataset_name: eodhd_us_historical_liquid_v1
+dataset_name: eodhd_us_historical_liquid_v2
 
 sources:
   bars: data/bronze/eodhd_us_historical_liquid/bars_daily.parquet

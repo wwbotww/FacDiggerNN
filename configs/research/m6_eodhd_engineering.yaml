@@ -1,5 +1,5 @@
 research_id: m6_eodhd_engineering
-base_dataset_config: configs/datasets/eodhd_all_world_pilot.yaml
+base_dataset_config: configs/datasets/eodhd_historical_liquid.yaml
 output_root: artifacts/research
 snapshot_output_root: data/walk_forward_snapshots
 seeds: [17, 42, 73]

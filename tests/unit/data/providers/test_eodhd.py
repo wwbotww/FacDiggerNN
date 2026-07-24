@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 import pytest
 
-from facdigger.data.contracts import validate_bars, validate_corporate_actions, validate_universe
+from facdigger.data.contracts import (
+    DataContractError,
+    validate_bars,
+    validate_corporate_actions,
+    validate_universe,
+)
 from facdigger.data.providers.eodhd.client import (
     DailyCallBudget,
     EODHDBudgetError,
@@ -19,11 +24,19 @@ from facdigger.data.providers.eodhd.mapper import (
     build_imputed_delistings,
     build_metadata_index,
     build_universe,
+    consolidate_corporate_actions,
+    filter_valid_eod_rows,
     map_corporate_actions,
     map_eod_bars,
     parse_split_ratio,
 )
+from facdigger.data.providers.eodhd.market_calendar import regular_session_frame, regular_sessions
 from facdigger.data.providers.eodhd.provider import EODHDProvider
+from facdigger.data.providers.eodhd.quality import (
+    assert_historical_ingestion_quality,
+    filter_to_regular_sessions,
+    quarantine_suspicious_identities,
+)
 from facdigger.data.providers.eodhd.universe import (
     discover_historical_symbols,
     select_top_liquid_symbols,
@@ -143,6 +156,73 @@ def test_eodhd_mapping_satisfies_standard_contracts() -> None:
     assert universe["eligible"].sum() == 9
 
 
+def test_eodhd_mapping_consolidates_overlapping_ticker_aliases() -> None:
+    metadata = build_metadata_index(
+        [
+            {
+                "Code": "NEW",
+                "Exchange": "NASDAQ",
+                "Type": "Common Stock",
+                "Isin": "US0000000001",
+                "_is_delisted": False,
+            },
+            {
+                "Code": "OLD",
+                "Exchange": "NASDAQ",
+                "Type": "Common Stock",
+                "Isin": "US0000000001",
+                "_is_delisted": True,
+            },
+        ],
+        "US",
+    )
+    old_rows = [{**EOD_ROWS[0], "volume": 10}, EOD_ROWS[1]]
+    new_rows = [{**EOD_ROWS[0], "volume": 20}, *EOD_ROWS[1:3]]
+
+    bars = map_eod_bars(
+        {"OLD.US": old_rows, "NEW.US": new_rows},
+        metadata,
+        source_revision="test-aliases",
+        ingested_at=datetime(2025, 2, 1, tzinfo=timezone.utc),
+    )
+
+    assert bars.height == 3
+    assert bars["security_id"].n_unique() == 1
+    assert bars.filter(pl.col("trade_date").dt.day() == 1).row(0, named=True)[
+        "provider_symbol"
+    ] == "NEW.US"
+    assert bars.filter(pl.col("trade_date").dt.day() == 1)["volume"].item() == 20
+
+
+def test_invalid_eodhd_placeholders_are_dropped_without_repairing_prices() -> None:
+    valid, rejected = filter_valid_eod_rows(
+        [
+            EOD_ROWS[0],
+            {
+                "date": "2025-01-02",
+                "open": 0,
+                "high": 0,
+                "low": 0,
+                "close": 0,
+                "adjusted_close": 0,
+                "volume": 0,
+            },
+            {
+                "date": "2025-01-03",
+                "open": 10.0,
+                "high": 10.1,
+                "low": 10.05,
+                "close": 10.0,
+                "adjusted_close": 10.0,
+                "volume": 100,
+            },
+        ]
+    )
+
+    assert valid == [EOD_ROWS[0]]
+    assert len(rejected) == 2
+
+
 def test_corporate_action_mapping_has_explicit_factor_semantics() -> None:
     metadata = build_metadata_index([], "US")
     actions = map_corporate_actions(
@@ -257,10 +337,28 @@ def test_top_liquid_config_disallows_demo_fallback_and_explicit_symbols() -> Non
 def test_historical_discovery_includes_active_and_delisted_without_current_ranking() -> None:
     active = [
         {"Code": "AAA", "Exchange": "NASDAQ", "Type": "Common Stock"},
+        {
+            "Code": "AAA-WT",
+            "Name": "Alpha Warrants",
+            "Exchange": "NASDAQ",
+            "Type": "Common Stock",
+        },
+        {
+            "Code": "AAGRW",
+            "Name": "A generic provider name",
+            "Exchange": "NASDAQ",
+            "Type": "Common Stock",
+        },
         {"Code": "ETF1", "Exchange": "NASDAQ", "Type": "ETF"},
     ]
     delisted = [
         {"Code": "OLD", "Exchange": "NYSE", "Type": "Common Stock"},
+        {
+            "Code": "OLDU",
+            "Name": "Old Acquisition Units",
+            "Exchange": "NYSE",
+            "Type": "Common Stock",
+        },
         {"Code": "OTC", "Exchange": "PINK", "Type": "Common Stock"},
     ]
     selection = EODHDConfig.model_validate(
@@ -285,6 +383,7 @@ def test_historical_discovery_includes_active_and_delisted_without_current_ranki
     }
     assert audit["selection_uses_current_liquidity"] is False
     assert audit["daily_max_symbols"] == 1000
+    assert audit["excluded_derivative_candidates"] == 3
 
 
 def test_dynamic_universe_grid_and_delisting_imputation_are_auditable() -> None:
@@ -415,3 +514,126 @@ def test_provider_discovers_paid_top_liquid_universe(tmp_path: Path) -> None:
     assert result.manifest["selection"]["research_ready"] is False
     assert result.manifest["budget"]["api_calls"] == 102
     assert pl.read_parquet(result.files["bars"])["security_id"][0] == ("eodhd:isin:US0000000001")
+
+
+def test_us_equity_calendar_excludes_recurring_and_ad_hoc_closures() -> None:
+    sessions = set(regular_sessions(date(2010, 1, 1), date(2025, 12, 31)))
+
+    assert len(sessions) == 4024
+    assert date(2024, 3, 29) not in sessions  # Good Friday
+    assert date(2012, 10, 29) not in sessions  # Hurricane Sandy
+    assert date(2025, 1, 9) not in sessions  # Carter national day of mourning
+    assert date(2024, 11, 29) in sessions  # Black Friday is a shortened session
+
+
+def test_source_quality_filters_phantom_sessions_and_quarantines_mixed_history() -> None:
+    calendar = regular_session_frame(date(2025, 1, 2), date(2025, 1, 6))
+    bars = pl.DataFrame(
+        {
+            "security_id": ["clean", "clean", "mixed", "mixed", "clean"],
+            "provider_symbol": ["C.US", "C.US", "M.US", "M.US", "C.US"],
+            "trade_date": [
+                date(2025, 1, 2),
+                date(2025, 1, 3),
+                date(2025, 1, 2),
+                date(2025, 1, 3),
+                date(2025, 1, 4),
+            ],
+            "close": [10.0, 10.1, 1.0, 100.0, 10.2],
+            "adj_factor": [1.0] * 5,
+        }
+    )
+
+    session_bars, calendar_audit = filter_to_regular_sessions(bars, calendar)
+    clean, identity_audit = quarantine_suspicious_identities(
+        session_bars,
+        calendar,
+        max_adjusted_price_ratio=10.0,
+        max_alias_overlap_relative_diff=0.05,
+        max_quarantined_security_fraction=1.0,
+    )
+
+    assert calendar_audit["off_calendar_rows_dropped"] == 1
+    assert identity_audit["quarantined_security_ids"] == ["mixed"]
+    assert clean["security_id"].unique().to_list() == ["clean"]
+    with pytest.raises(DataContractError, match="missing_market_sessions"):
+        assert_historical_ingestion_quality(
+            clean.filter(pl.col("trade_date") != date(2025, 1, 6)),
+            calendar,
+            max_adjusted_price_ratio=10.0,
+        )
+
+
+def test_active_alias_prevents_false_delisting_lifecycle() -> None:
+    metadata = build_metadata_index(
+        [
+            {
+                "Code": "OLD",
+                "Exchange": "NASDAQ",
+                "Type": "Common Stock",
+                "Isin": "US0000000099",
+                "_is_delisted": True,
+            },
+            {
+                "Code": "NEW",
+                "Exchange": "NASDAQ",
+                "Type": "Common Stock",
+                "Isin": "US0000000099",
+                "_is_delisted": False,
+            },
+        ],
+        "US",
+    )
+    bars = map_eod_bars(
+        {"OLD.US": EOD_ROWS[:2], "NEW.US": EOD_ROWS[1:4]},
+        metadata,
+        source_revision="test-active-alias",
+        ingested_at=datetime(2025, 2, 1, tzinfo=timezone.utc),
+    )
+    universe = build_universe(
+        bars,
+        min_listed_sessions=1,
+        min_price=1.0,
+        min_adv20_usd=1.0,
+    )
+
+    assert universe["_eventually_delisted"].unique().to_list() == [False]
+    assert not universe["is_delisted"].any()
+    assert (
+        build_imputed_delistings(
+            bars,
+            universe,
+            exchange_returns={"XNAS": -0.55},
+            default_return=-0.50,
+            source_revision="test-active-alias",
+        )
+        is None
+    )
+
+
+def test_corporate_actions_deduplicate_aliases_and_drop_conflicts() -> None:
+    frame = pl.DataFrame(
+        {
+            "security_id": ["same", "same", "same", "same"],
+            "ex_date": ["2025-01-03", "2025-01-03", "2025-01-10", "2025-01-10"],
+            "action_type": ["cash_dividend"] * 4,
+            "price_factor": [1.0] * 4,
+            "volume_factor": [1.0] * 4,
+            "cash_amount": [0.25, 0.25, 0.25, 1.50],
+            "known_at": ["2025-01-02"] * 4,
+            "source_revision": ["test"] * 4,
+            "provider_symbol": ["OLD.US", "NEW.US", "OLD.US", "NEW.US"],
+            "currency": ["USD"] * 4,
+            "known_at_quality": ["declaration_date"] * 4,
+            "is_delisted_source": [True, False, True, False],
+        }
+    )
+
+    clean, audit = consolidate_corporate_actions(validate_corporate_actions(frame))
+
+    assert clean is not None
+    assert clean.height == 1
+    assert clean["provider_symbol"].to_list() == ["NEW.US"]
+    assert audit["exact_alias_rows_removed"] == 1
+    assert audit["conflict_groups_dropped"] == 1
+    assert audit["conflict_rows_dropped"] == 2

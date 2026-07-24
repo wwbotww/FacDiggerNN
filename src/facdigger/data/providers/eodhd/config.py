@@ -45,6 +45,15 @@ class DelistingImputationConfig(StrictModel):
     default_return: float = Field(default=-0.50, ge=-1, le=0)
 
 
+class EODHDQualityGateConfig(StrictModel):
+    """Fail-closed source controls for known EODHD identity and calendar defects."""
+
+    enabled: bool = True
+    max_adjusted_price_ratio: float = Field(default=10.0, gt=1.0)
+    max_alias_overlap_relative_diff: float = Field(default=0.05, ge=0.0, le=1.0)
+    max_quarantined_security_fraction: float = Field(default=0.10, ge=0.0, le=1.0)
+
+
 class EODHDConfig(StrictModel):
     provider: Literal["eodhd"] = "eodhd"
     base_url: AnyHttpUrl = "https://eodhd.com/api"
@@ -74,6 +83,7 @@ class EODHDConfig(StrictModel):
     delisting_imputation: DelistingImputationConfig = Field(
         default_factory=DelistingImputationConfig
     )
+    quality_gate: EODHDQualityGateConfig = Field(default_factory=EODHDQualityGateConfig)
 
     @model_validator(mode="after")
     def validate_dates_and_symbols(self) -> EODHDConfig:
@@ -99,6 +109,8 @@ class EODHDConfig(StrictModel):
             raise ValueError(
                 "historical_liquid requires delisting_imputation.enabled=true"
             )
+        if self.universe.mode == "historical_liquid" and not self.quality_gate.enabled:
+            raise ValueError("historical_liquid requires quality_gate.enabled=true")
         if not self.universe.exchanges or not self.universe.security_types:
             raise ValueError("universe exchanges and security_types must not be empty")
         return self

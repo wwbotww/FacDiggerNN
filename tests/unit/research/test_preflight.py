@@ -87,3 +87,37 @@ split:
     engineering_report = research_preflight(engineering)
     assert engineering_report["ready"] is True
     assert engineering_report["research_mode"] == "engineering"
+
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "provider": "eodhd",
+                "selection": {
+                    "mode": "historical_liquid",
+                    "research_ready": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_report = research_preflight(engineering)
+    assert stale_report["ready"] is False
+    assert stale_report["checks"]["source_quality_gate"] is False
+    assert any("no passed quality gate" in blocker for blocker in stale_report["blockers"])
+
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "provider": "eodhd",
+                "selection": {
+                    "mode": "historical_liquid",
+                    "research_ready": False,
+                },
+                "quality": {"gate": {"status": "passed"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    remediated_report = research_preflight(engineering)
+    assert remediated_report["ready"] is True
+    assert remediated_report["checks"]["source_quality_gate"] is True
