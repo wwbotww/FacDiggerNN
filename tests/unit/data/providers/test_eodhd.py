@@ -285,6 +285,11 @@ def test_provider_writes_only_standard_boundary_files(tmp_path: Path) -> None:
     assert result.files["bars"].is_file()
     assert result.files["universe"].is_file()
     assert result.manifest["delistings"]["emitted"] is False
+    assert result.manifest["schema_version"] == 2
+    assert result.manifest["standardization"]["name"] == "facdigger.standard_parquet"
+    assert result.manifest["standardization"]["status"] == "passed"
+    assert result.manifest["standardization"]["research_ready"] is False
+    assert set(result.manifest["standardization"]["tables"]) == {"bars", "universe"}
     manifest_text = result.files["manifest"].read_text(encoding="utf-8")
     assert "super-secret" not in manifest_text
 

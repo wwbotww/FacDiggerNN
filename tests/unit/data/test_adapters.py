@@ -9,13 +9,12 @@ from facdigger.data.config import ParquetSourceConfig
 from facdigger.data.contracts import DataContractError
 
 
-def test_historical_eodhd_manifest_requires_passed_quality_gate(tmp_path) -> None:
+def test_source_manifest_requires_provider_neutral_standardization_contract(tmp_path) -> None:
     manifest = tmp_path / "source.json"
     manifest.write_text(
         json.dumps(
             {
-                "provider": "eodhd",
-                "selection": {"mode": "historical_liquid"},
+                "provider": "legacy-provider",
             }
         ),
         encoding="utf-8",
@@ -28,11 +27,11 @@ def test_historical_eodhd_manifest_requires_passed_quality_gate(tmp_path) -> Non
         )
     )
 
-    with pytest.raises(DataContractError, match="passed quality gate"):
+    with pytest.raises(DataContractError, match="no standardization contract"):
         adapter.load()
 
 
-def test_historical_eodhd_manifest_hash_binds_quality_proof_to_files(tmp_path) -> None:
+def test_standardization_contract_hash_binds_quality_proof_to_files(tmp_path) -> None:
     bars = tmp_path / "bars.parquet"
     universe = tmp_path / "universe.parquet"
     bars.write_bytes(b"changed-bars")
@@ -41,12 +40,19 @@ def test_historical_eodhd_manifest_hash_binds_quality_proof_to_files(tmp_path) -
     manifest.write_text(
         json.dumps(
             {
-                "provider": "eodhd",
-                "selection": {"mode": "historical_liquid"},
-                "quality": {"gate": {"status": "passed"}},
-                "tables": {
-                    "bars": {"sha256": "0" * 64},
-                    "universe": {"sha256": "0" * 64},
+                "provider": "test-provider",
+                "standardization": {
+                    "name": "facdigger.standard_parquet",
+                    "version": 1,
+                    "status": "passed",
+                    "research_ready": False,
+                    "tables": {
+                        "bars": {"file": "bars.parquet", "sha256": "0" * 64},
+                        "universe": {
+                            "file": "universe.parquet",
+                            "sha256": "0" * 64,
+                        },
+                    },
                 },
             }
         ),

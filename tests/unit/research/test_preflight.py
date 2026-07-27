@@ -5,6 +5,8 @@ from datetime import date
 
 import polars as pl
 
+from facdigger.data.provenance import build_standardization_contract
+from facdigger.data.snapshots import sha256_file
 from facdigger.research.config import M6ResearchConfig
 from facdigger.research.preflight import research_preflight
 
@@ -16,8 +18,26 @@ def test_preflight_blocks_source_not_marked_research_ready(tmp_path) -> None:
     source_manifest = tmp_path / "source.json"
     pl.DataFrame({"trade_date": calendar}).write_parquet(bars)
     pl.DataFrame({"trade_date": calendar}).write_parquet(universe)
+    table_evidence = {
+        "bars": {
+            "file": bars.name,
+            "sha256": sha256_file(bars),
+        },
+        "universe": {
+            "file": universe.name,
+            "sha256": sha256_file(universe),
+        },
+    }
     source_manifest.write_text(
-        json.dumps({"provider": "test", "selection": {"research_ready": False}}),
+        json.dumps(
+            {
+                "provider": "test",
+                "standardization": build_standardization_contract(
+                    table_evidence,
+                    research_ready=False,
+                ),
+            }
+        ),
         encoding="utf-8",
     )
     dataset_config = tmp_path / "dataset.yaml"
@@ -89,31 +109,22 @@ split:
     assert engineering_report["research_mode"] == "engineering"
 
     source_manifest.write_text(
-        json.dumps(
-            {
-                "provider": "eodhd",
-                "selection": {
-                    "mode": "historical_liquid",
-                    "research_ready": False,
-                },
-            }
-        ),
+        json.dumps({"provider": "legacy-provider"}),
         encoding="utf-8",
     )
     stale_report = research_preflight(engineering)
     assert stale_report["ready"] is False
     assert stale_report["checks"]["source_quality_gate"] is False
-    assert any("no passed quality gate" in blocker for blocker in stale_report["blockers"])
+    assert any("no standardization contract" in blocker for blocker in stale_report["blockers"])
 
     source_manifest.write_text(
         json.dumps(
             {
-                "provider": "eodhd",
-                "selection": {
-                    "mode": "historical_liquid",
-                    "research_ready": False,
-                },
-                "quality": {"gate": {"status": "passed"}},
+                "provider": "test",
+                "standardization": build_standardization_contract(
+                    table_evidence,
+                    research_ready=False,
+                ),
             }
         ),
         encoding="utf-8",

@@ -11,6 +11,10 @@ import numpy as np
 import polars as pl
 
 from facdigger.data.contracts import DataContractError
+from facdigger.data.provenance import (
+    read_source_provenance_manifest,
+    require_accepted_source,
+)
 from facdigger.data.snapshots import sha256_file
 from facdigger.evaluation.contracts import validate_predictions
 from facdigger.evaluation.neutralization import neutralize_predictions
@@ -110,18 +114,10 @@ def load_source_provenance(dataset_dir: Path, dataset_manifest: dict[str, Any]) 
     path = dataset_dir / str(filename)
     if not path.is_file():
         raise DataContractError(f"snapshot source provenance is missing: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    selection = payload.get("selection") or {}
-    return {
-        "available": True,
-        "provider": payload.get("provider"),
-        "source_revision": payload.get("source_revision"),
-        "manifest_sha256": sha256_file(path),
-        "selection": selection,
-        "delistings": payload.get("delistings"),
-        "research_ready": selection.get("research_ready"),
-        "warnings": list(payload.get("warnings") or []),
-    }
+    provenance = read_source_provenance_manifest(path)
+    require_accepted_source(provenance)
+    provenance["manifest_sha256"] = sha256_file(path)
+    return provenance
 
 
 def apply_source_readiness_gate(

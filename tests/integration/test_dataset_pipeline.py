@@ -14,7 +14,8 @@ from facdigger.data.contracts import (
     validate_delistings,
     validate_universe,
 )
-from facdigger.data.snapshots import build_dataset_snapshot
+from facdigger.data.provenance import build_standardization_contract
+from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
 from facdigger.datasets.splits import assign_chronological_splits
 from facdigger.features.price_volume import build_price_volume_features
 from facdigger.features.scaling import fit_train_robust_scaler
@@ -213,7 +214,28 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
     source_manifest_path = bronze / "source_manifest.json"
     bars.write_parquet(bars_path)
     universe.write_parquet(universe_path)
-    source_manifest_path.write_text('{"provider":"synthetic"}\n', encoding="utf-8")
+    source_manifest_path.write_text(
+        json.dumps(
+            {
+                "provider": "synthetic",
+                "standardization": build_standardization_contract(
+                    {
+                        "bars": {
+                            "file": bars_path.name,
+                            "sha256": sha256_file(bars_path),
+                        },
+                        "universe": {
+                            "file": universe_path.name,
+                            "sha256": sha256_file(universe_path),
+                        },
+                    },
+                    research_ready=True,
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     calendar = sessions(90)
     config = DatasetBuildConfig.model_validate(
         {

@@ -2,47 +2,20 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import polars as pl
 
 from facdigger.data.config import load_dataset_build_config
+from facdigger.data.contracts import DataContractError
+from facdigger.data.provenance import (
+    read_source_provenance_manifest,
+    require_accepted_source,
+    validate_source_table_bindings,
+)
 from facdigger.data.snapshots import sha256_file
 from facdigger.research.config import M6ResearchConfig
 from facdigger.research.folds import validate_model_config_paths
-
-
-def _quality_summary(quality: dict[str, Any]) -> dict[str, Any]:
-    """Keep preflight readable while the source manifest retains full evidence."""
-
-    summary = {
-        key: value
-        for key, value in quality.items()
-        if key
-        not in {
-            "alias_overlap_examples",
-            "extreme_return_examples",
-            "off_calendar_examples",
-            "quarantined_security_ids",
-        }
-    }
-    corporate_actions = summary.get("corporate_actions")
-    if isinstance(corporate_actions, dict):
-        summary["corporate_actions"] = {
-            key: value
-            for key, value in corporate_actions.items()
-            if key not in {"conflict_examples", "conflict_security_ids"}
-        }
-    return summary
-
-
-def _selection_summary(selection: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in selection.items()
-        if key not in {"invalid_eod_symbols"}
-    }
 
 
 def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
@@ -62,24 +35,33 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
     ]
     provenance: dict[str, Any] = {
         "available": False,
+        "standardization_accepted": False,
         "research_ready": None,
         "warnings": [],
     }
     if base.sources.source_manifest is not None and base.sources.source_manifest.is_file():
-        payload = json.loads(base.sources.source_manifest.read_text(encoding="utf-8"))
-        selection = payload.get("selection") or {}
-        quality = payload.get("quality") or {}
-        provenance = {
-            "available": True,
-            "provider": payload.get("provider"),
-            "source_revision": payload.get("source_revision"),
-            "manifest_sha256": sha256_file(base.sources.source_manifest),
-            "selection": _selection_summary(selection),
-            "quality": _quality_summary(quality),
-            "delistings": payload.get("delistings"),
-            "research_ready": selection.get("research_ready"),
-            "warnings": list(payload.get("warnings") or []),
-        }
+        try:
+            provenance = read_source_provenance_manifest(base.sources.source_manifest)
+            require_accepted_source(provenance)
+            validate_source_table_bindings(
+                provenance,
+                {
+                    "bars": base.sources.bars,
+                    "universe": base.sources.universe,
+                    "corporate_actions": base.sources.corporate_actions,
+                    "delistings": base.sources.delistings,
+                },
+            )
+            provenance["standardization_accepted"] = True
+        except DataContractError as exc:
+            provenance = {
+                "available": True,
+                "standardization_accepted": False,
+                "research_ready": None,
+                "warnings": [],
+                "contract_error": str(exc),
+            }
+        provenance["manifest_sha256"] = sha256_file(base.sources.source_manifest)
     maximum_date = None
     minimum_date = None
     universe_rows = None
@@ -90,14 +72,7 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
         universe_rows = dates.height
     required_end = max(fold.test_end for fold in config.folds)
     require_source_ready = config.decisions.require_source_research_ready
-    historical_eodhd = (
-        provenance.get("provider") == "eodhd"
-        and (provenance.get("selection") or {}).get("mode") == "historical_liquid"
-    )
-    source_quality_passed = (
-        not historical_eodhd
-        or ((provenance.get("quality") or {}).get("gate") or {}).get("status") == "passed"
-    )
+    source_quality_passed = provenance["standardization_accepted"]
     checks = {
         "source_files_exist": not missing_sources,
         "source_provenance_available": provenance["available"],
@@ -119,8 +94,8 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
         blockers.append("source provenance explicitly does not declare research_ready=true")
     if not source_quality_passed:
         blockers.append(
-            "EODHD historical source has no passed quality gate; rebuild bronze with "
-            "the current adapter"
+            "source standardization contract failed: "
+            + str(provenance.get("contract_error", "status is not passed"))
         )
     if not checks["universe_covers_final_fold"]:
         blockers.append(

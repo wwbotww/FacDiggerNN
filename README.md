@@ -5,7 +5,9 @@ FacDiggerNN 是面向美股日频数据的、强调 point-in-time 语义和可�
 新用户建议先阅读：
 
 - [中文开发文档](docs/开发文档.md)：工程架构、数据契约、模块、CLI、扩展和排错；
-- [中文实验设计文档](docs/实验设计文档.md)：研究问题、E0—E3、walk-forward、指标、统计和正式实验协议。
+- [中文实验设计文档](docs/实验设计文档.md)：研究问题、E0—E3、walk-forward、指标、统计和正式实验协议；
+- [贡献指南](CONTRIBUTING.md)：开发环境、本地验证、CI 和评审要求；
+- [安全策略](SECURITY.md)：秘密、外部数据和研究完整性问题的报告与处理。
 
 设计来源与实现过程见[原始设计（实现同步版）](docs/PatchTST迁移学习实现设计文档_AI版.md)和
 [详细实施计划](docs/IMPLEMENTATION_PLAN.md)。
@@ -15,7 +17,7 @@ FacDiggerNN 是面向美股日频数据的、强调 point-in-time 语义和可�
 推荐 Python 3.11，并使用独立虚拟环境。不要复用已有的全局 Conda 环境。
 
 ```bash
-uv sync --extra model --extra data --extra eodhd --extra baseline --extra dev
+uv sync --frozen --all-extras
 source .venv/bin/activate
 ```
 
@@ -132,12 +134,16 @@ facdigger data ingest --config configs/data/eodhd_historical_liquid.yaml
 facdigger data validate --config configs/datasets/eodhd_historical_liquid.yaml
 facdigger dataset build --config configs/datasets/eodhd_historical_liquid.yaml
 
-# 可选：检查来源硬门禁摘要
-jq '.quality.gate, .quality.calendar, .quality.corporate_actions' \
+# 可选：检查通用证明和 provider 专属审计
+jq '.standardization, .quality.gate, .quality.calendar, .quality.corporate_actions' \
   data/bronze/eodhd_us_historical_liquid/eodhd_ingestion_manifest.json
 ```
 
-historical 模式强制要求 manifest 中 `quality.gate.status=passed`，并校验 manifest 与当前 Parquet 的 SHA-256 绑定。旧 bronze、被替换的文件、缺失正式 session、残留非 session 日期或残留超过阈值的相邻复权价跳变都会被 `data validate`、snapshot build 和 M6 preflight 拒绝。若需要隔离的身份超过候选稳定身份的 10%，采集会在替换输出前失败，防止供应商格式变化造成静默的大面积删数。
+historical 模式在 EODHD provider 内强制 `quality.gate.status=passed`，成功后生成版本化的
+`standardization` 通用契约并绑定标准 Parquet SHA-256。`data validate`、snapshot build 和
+M6 preflight 只消费该通用契约，不解释 EODHD 专属字段。旧 bronze 缺少新契约，或文件被
+替换、来源标准化失败时都会被拒绝；需要重新 ingest，不能静默兼容。若需要隔离的身份超过
+候选稳定身份的 10%，采集会在替换输出前失败，防止供应商格式变化造成静默的大面积删数。
 
 EODHD 当前套餐没有可靠的退市终值/原因。该配置采用可审计的保守插值：Nasdaq 为最后有效价格后的 `-55%`，NYSE/NYSE American 为 `-30%`，未知交易所为 `-50%`。这些值不是观测事实；`delistings.parquet`、source manifest 和训练 provenance 都会保留插值方法及警告。它修复了“跨退市样本静默丢失”的工程缺口，但不能替代 CRSP 等具有真实 delisting return 的数据源，也不能令数据自动达到正式研究标准。
 
@@ -163,7 +169,7 @@ facdigger compare \
 
 ## M3 E1 随机 PatchTST
 
-E1 复用同一份不可变快照和 evaluator。窗口按需从列式特征读取，缺失值以零填充并单独传递 observed mask；模型为随机初始化的 PatchTST encoder 加 AlphaHead。训练 checkpoint 包含模型、optimizer、scheduler、GradScaler、epoch/global step、RNG 和按日期 sampler 状态。
+E1 复用同一份内容寻址快照和 evaluator。窗口按需从列式特征读取，缺失值以零填充并单独传递 observed mask；模型为随机初始化的 PatchTST encoder 加 AlphaHead。训练 checkpoint 包含模型、optimizer、scheduler、GradScaler、epoch/global step、RNG 和按日期 sampler 状态。
 
 ```bash
 facdigger train e1 \
@@ -310,7 +316,7 @@ facdigger evaluate \
   --output artifacts/evaluations/<evaluation_id>
 ```
 
-`factors.parquet` 保留 raw score、可用时的行业/市值中性分数、模型/checkpoint/dataset 血缘，以及 `after_close → next_session_open` 时点声明，但绝不包含 target。`evaluate` 会逐键核对不可变快照里的 target、强制覆盖率门禁，并独立生成 metrics、HTML report 与输入哈希清单。
+`factors.parquet` 保留 raw score、可用时的行业/市值中性分数、模型/checkpoint/dataset 血缘，以及 `after_close → next_session_open` 时点声明，但绝不包含 target。`evaluate` 会逐键核对内容寻址快照里的 target、强制覆盖率门禁，并独立生成 metrics、HTML report 与输入哈希清单。
 
 最低输入包括：
 
@@ -319,7 +325,7 @@ facdigger evaluate \
 - `corporate_actions`（可选）：ex-date、价格/成交量调整因子、现金金额和可知时间；
 - `delistings`（可选）：退市日、最后交易日、退市收益或终值。配置了文件时将严格校验，不能静默缺失终值。
 
-输出是以内容哈希命名的不可变目录，包含 `features.parquet`、`labels.parquet`、`sample_index.parquet`、`sample_metadata.parquet`、`inference_index.parquet`、只用 Train 区间拟合的 `scaler.json`、`audit.json` 和 `manifest.json`。移动相同输入文件或更换输出目录不会改变 `dataset_id`。
+输出是以内容哈希命名、生成后按协议不得修改的快照目录，包含 `features.parquet`、`labels.parquet`、`sample_index.parquet`、`sample_metadata.parquet`、`inference_index.parquet`、只用 Train 区间拟合的 `scaler.json`、`audit.json` 和 `manifest.json`。移动相同输入文件或更换输出目录不会改变 `dataset_id`；当前实现依靠内容寻址和调用方约束，不宣称具有文件系统或对象存储级写保护。
 
 探针只有同时满足以下条件才成功：
 

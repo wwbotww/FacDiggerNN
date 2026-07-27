@@ -16,6 +16,7 @@ from facdigger.data.contracts import (
     table_audit,
     validate_bars,
 )
+from facdigger.data.provenance import build_standardization_contract
 from facdigger.data.providers.base import ProviderIngestResult
 from facdigger.data.providers.eodhd.client import DailyCallBudget, EODHDClient, EODHDError
 from facdigger.data.providers.eodhd.config import EODHDConfig
@@ -429,8 +430,25 @@ class EODHDProvider:
             temporary.replace(final_path)
             files[name] = final_path
 
+        table_evidence = {
+            name: {
+                **table_audit(
+                    frame,
+                    (
+                        "ex_date"
+                        if name == "corporate_actions"
+                        else "delist_date"
+                        if name == "delistings"
+                        else "trade_date"
+                    ),
+                ),
+                "file": files[name].name,
+                "sha256": _sha256(files[name]),
+            }
+            for name, frame in frames.items()
+        }
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "provider": self.name,
             "ingested_at": ingested_at.isoformat(),
             "source_revision": source_revision,
@@ -443,23 +461,10 @@ class EODHDProvider:
             "budget": client.budget.status(),
             "warnings": warnings,
             "quality": quality_audit,
-            "tables": {
-                name: {
-                    **table_audit(
-                        frame,
-                        (
-                            "ex_date"
-                            if name == "corporate_actions"
-                            else "delist_date"
-                            if name == "delistings"
-                            else "trade_date"
-                        ),
-                    ),
-                    "file": files[name].name,
-                    "sha256": _sha256(files[name]),
-                }
-                for name, frame in frames.items()
-            },
+            "standardization": build_standardization_contract(
+                table_evidence,
+                research_ready=bool(selection_audit.get("research_ready", False)),
+            ),
             "delistings": {
                 "emitted": delistings is not None,
                 "rows": delistings.height if delistings is not None else 0,
