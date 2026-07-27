@@ -12,7 +12,7 @@ import yaml
 
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
-from facdigger.datasets.window import SnapshotWindowDataset
+from facdigger.datasets.window import SecurityFeatureStore, SnapshotWindowDataset
 from facdigger.environment import collect_environment
 from facdigger.evaluation.contracts import prediction_coverage
 from facdigger.evaluation.metrics import evaluate_predictions
@@ -95,13 +95,17 @@ def run_e1(
     if config.model.patch_length > context_length:
         raise DataContractError("E1 patch_length cannot exceed dataset context_length")
 
+    feature_store = SecurityFeatureStore(
+        features=frames.pop("features"),
+        channels=config.channels,
+    )
     protocol_index, selection_audit = split_supervised_training_index(
         frames["sample_index"],
         selection_fraction=config.selection_fraction,
     )
     training_datasets = {
         split: SnapshotWindowDataset(
-            features=frames["features"],
+            feature_store=feature_store,
             sample_index=protocol_index,
             channels=config.channels,
             context_length=context_length,
@@ -110,7 +114,7 @@ def run_e1(
         for split in {"train_fit", "inner_selection"}
     }
     evaluation_dataset = SnapshotWindowDataset(
-        features=frames["features"],
+        feature_store=feature_store,
         sample_index=frames["sample_index"],
         channels=config.channels,
         context_length=context_length,

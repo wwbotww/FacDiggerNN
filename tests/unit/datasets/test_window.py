@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 
 from facdigger.datasets.sampler import DateGroupedBatchSampler
-from facdigger.datasets.window import SnapshotWindowDataset
+from facdigger.datasets.window import SecurityFeatureStore, SnapshotWindowDataset
 
 
 def test_window_dataset_respects_snapshot_bounds_and_missing_mask() -> None:
@@ -43,6 +43,49 @@ def test_window_dataset_respects_snapshot_bounds_and_missing_mask() -> None:
     np.testing.assert_array_equal(sample["observed_mask"][:, 0], [True, False, True])
     assert sample["values"].shape == (3, 1)
     assert sample["target"] == np.float32(0.25)
+
+
+def test_split_datasets_share_one_feature_store() -> None:
+    dates = [date(2024, 1, 2) + timedelta(days=index) for index in range(5)]
+    features = pl.DataFrame(
+        {
+            "security_id": ["A"] * 5,
+            "trade_date": dates,
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+    sample_index = pl.DataFrame(
+        {
+            "sample_id": ["A|train", "A|valid"],
+            "security_id": ["A", "A"],
+            "symbol": ["A", "A"],
+            "asof_date": [dates[2], dates[4]],
+            "feature_start": [dates[1], dates[3]],
+            "split": ["train", "valid"],
+            "target": [0.1, 0.2],
+        }
+    )
+    store = SecurityFeatureStore(features=features, channels=["x"])
+    train = SnapshotWindowDataset(
+        feature_store=store,
+        sample_index=sample_index,
+        channels=["x"],
+        context_length=2,
+        split="train",
+    )
+    valid = SnapshotWindowDataset(
+        feature_store=store,
+        sample_index=sample_index,
+        channels=["x"],
+        context_length=2,
+        split="valid",
+    )
+
+    assert train.feature_store is store
+    assert valid.feature_store is store
+    assert train.blocks is valid.blocks
+    np.testing.assert_array_equal(train[0]["values"][:, 0], [2.0, 3.0])
+    np.testing.assert_array_equal(valid[0]["values"][:, 0], [4.0, 5.0])
 
 
 def test_date_grouped_sampler_is_deterministic_and_keeps_small_dates_whole() -> None:

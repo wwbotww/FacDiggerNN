@@ -15,10 +15,64 @@ from facdigger.data.contracts import DataContractError
 
 @dataclass(frozen=True)
 class SecurityFeatureBlock:
-    dates: list[Any]
+    dates: np.ndarray
     values: np.ndarray
     observed: np.ndarray
-    position_by_date: dict[Any, int]
+
+    def position(self, trade_date: Any) -> int | None:
+        target = np.datetime64(trade_date, "D")
+        index = int(np.searchsorted(self.dates, target))
+        if index >= len(self.dates) or self.dates[index] != target:
+            return None
+        return index
+
+
+class SecurityFeatureStore:
+    """One immutable feature representation shared by multiple split views."""
+
+    def __init__(self, *, features: pl.DataFrame, channels: list[str]) -> None:
+        missing = [channel for channel in channels if channel not in features.columns]
+        if missing:
+            raise DataContractError(f"features missing requested channels: {missing}")
+        self.channels = tuple(channels)
+        self.blocks: dict[str, SecurityFeatureBlock] = {}
+        self._security_ids: list[str] = []
+        self._block_index_by_security: dict[str, int] = {}
+
+        ordered = features.sort(["security_id", "trade_date"])
+        observed_columns = [f"observed_{channel}" for channel in channels]
+        has_observed_columns = all(column in ordered.columns for column in observed_columns)
+        for block in ordered.partition_by("security_id", maintain_order=True):
+            security_id = str(block["security_id"][0])
+            raw_values = block.select(channels).to_numpy().astype(np.float32)
+            finite = np.isfinite(raw_values)
+            if has_observed_columns:
+                source_observed = block.select(observed_columns).to_numpy().astype(bool)
+                observed = finite & source_observed
+            else:
+                observed = finite
+            values = np.where(observed, raw_values, 0.0).astype(np.float32)
+            dates = np.asarray(block["trade_date"].to_numpy(), dtype="datetime64[D]")
+            self._block_index_by_security[security_id] = len(self._security_ids)
+            self._security_ids.append(security_id)
+            self.blocks[security_id] = SecurityFeatureBlock(
+                dates=dates,
+                values=values,
+                observed=observed,
+            )
+
+    def locate(self, security_id: str, trade_date: Any) -> tuple[int, int] | None:
+        block_index = self._block_index_by_security.get(security_id)
+        if block_index is None:
+            return None
+        block = self.blocks[self._security_ids[block_index]]
+        position = block.position(trade_date)
+        if position is None:
+            return None
+        return block_index, position
+
+    def block_at(self, index: int) -> SecurityFeatureBlock:
+        return self.blocks[self._security_ids[index]]
 
 
 class SnapshotWindowDataset:
@@ -27,7 +81,8 @@ class SnapshotWindowDataset:
     def __init__(
         self,
         *,
-        features: pl.DataFrame,
+        features: pl.DataFrame | None = None,
+        feature_store: SecurityFeatureStore | None = None,
         sample_index: pl.DataFrame,
         channels: list[str],
         context_length: int,
@@ -35,54 +90,48 @@ class SnapshotWindowDataset:
     ) -> None:
         if context_length < 1:
             raise ValueError("context_length must be positive")
-        missing = [channel for channel in channels if channel not in features.columns]
-        if missing:
-            raise DataContractError(f"features missing requested channels: {missing}")
+        if feature_store is None:
+            if features is None:
+                raise ValueError("features or feature_store is required")
+            feature_store = SecurityFeatureStore(features=features, channels=channels)
+        elif features is not None:
+            raise ValueError("features and feature_store are mutually exclusive")
+        if tuple(channels) != feature_store.channels:
+            raise DataContractError(
+                f"window channels must exactly match feature store channels: "
+                f"{list(feature_store.channels)}"
+            )
         self.channels = list(channels)
         self.context_length = context_length
         self.split = split
+        self.feature_store = feature_store
+        self.blocks = feature_store.blocks
         self.sample_rows = sample_index.filter(pl.col("split") == split).sort(
             ["asof_date", "security_id"]
         )
         if self.sample_rows.is_empty():
             raise DataContractError(f"sample_index has no rows for split={split!r}")
-        self.blocks: dict[str, SecurityFeatureBlock] = {}
-        ordered = features.sort(["security_id", "trade_date"])
-        for block in ordered.partition_by("security_id", maintain_order=True):
-            security_id = str(block["security_id"][0])
-            raw_values = block.select(channels).to_numpy().astype(np.float32)
-            finite = np.isfinite(raw_values)
-            observed_columns = [f"observed_{channel}" for channel in channels]
-            if all(column in block.columns for column in observed_columns):
-                source_observed = block.select(observed_columns).to_numpy().astype(bool)
-                observed = finite & source_observed
-            else:
-                observed = finite
-            values = np.where(observed, raw_values, 0.0).astype(np.float32)
-            dates = block["trade_date"].to_list()
-            self.blocks[security_id] = SecurityFeatureBlock(
-                dates=dates,
-                values=values,
-                observed=observed,
-                position_by_date={trade_date: index for index, trade_date in enumerate(dates)},
-            )
-        self._locations: list[tuple[str, int]] = []
-        for row in self.sample_rows.iter_rows(named=True):
+        self._block_indices = np.empty(self.sample_rows.height, dtype=np.int32)
+        self._starts = np.empty(self.sample_rows.height, dtype=np.int32)
+        for index, row in enumerate(self.sample_rows.iter_rows(named=True)):
             security_id = str(row["security_id"])
-            block = self.blocks.get(security_id)
-            if block is None or row["asof_date"] not in block.position_by_date:
+            location = feature_store.locate(security_id, row["asof_date"])
+            if location is None:
                 raise DataContractError(f"sample has no matching feature row: {row['sample_id']}")
-            end = block.position_by_date[row["asof_date"]]
+            block_index, end = location
+            block = feature_store.block_at(block_index)
             start = end - context_length + 1
             if "feature_end" in row and row["feature_end"] != row["asof_date"]:
                 raise DataContractError(
                     f"sample feature_end must equal asof_date: {row['sample_id']}"
                 )
-            if start < 0 or block.dates[start] != row["feature_start"]:
+            feature_start = np.datetime64(row["feature_start"], "D")
+            if start < 0 or block.dates[start] != feature_start:
                 raise DataContractError(
                     f"sample window bounds disagree with snapshot index: {row['sample_id']}"
                 )
-            self._locations.append((security_id, start))
+            self._block_indices[index] = block_index
+            self._starts[index] = start
 
     @classmethod
     def from_snapshot(
@@ -114,11 +163,11 @@ class SnapshotWindowDataset:
         return self.sample_rows["asof_date"].to_list()
 
     def __len__(self) -> int:
-        return len(self._locations)
+        return len(self._starts)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        security_id, start = self._locations[index]
-        block = self.blocks[security_id]
+        start = int(self._starts[index])
+        block = self.feature_store.block_at(int(self._block_indices[index]))
         stop = start + self.context_length
         return {
             "values": block.values[start:stop],
@@ -161,8 +210,8 @@ class SnapshotInferenceWindowDataset(SnapshotWindowDataset):
         )
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        security_id, start = self._locations[index]
-        block = self.blocks[security_id]
+        start = int(self._starts[index])
+        block = self.feature_store.block_at(int(self._block_indices[index]))
         stop = start + self.context_length
         return {
             "values": block.values[start:stop],

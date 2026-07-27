@@ -6,6 +6,7 @@ FacDiggerNN 是面向美股日频数据的、强调 point-in-time 语义和可�
 
 - [中文开发文档](docs/开发文档.md)：工程架构、数据契约、模块、CLI、扩展和排错；
 - [中文实验设计文档](docs/实验设计文档.md)：研究问题、E0—E3、walk-forward、指标、统计和正式实验协议；
+- [Windows RTX 训练指南](docs/RTX2070_Windows训练指南.md)：WSL2、CUDA 验证、数据迁移和首轮训练；
 - [贡献指南](CONTRIBUTING.md)：开发环境、本地验证、CI 和评审要求；
 - [安全策略](SECURITY.md)：秘密、外部数据和研究完整性问题的报告与处理。
 
@@ -21,7 +22,7 @@ uv sync --frozen --all-extras
 source .venv/bin/activate
 ```
 
-Windows PowerShell：
+Windows 上的开发/CPU 环境可使用 PowerShell：
 
 ```powershell
 py -3.11 -m venv .venv
@@ -32,6 +33,11 @@ python -m pip install -e . --no-deps
 ```
 
 `uv.lock` 是首选的跨平台锁文件；`requirements-lock.txt` 由同一锁文件导出。当前已在 macOS/CPU 上验证 PyTorch 2.13.0 与 Transformers 4.57.6 的 checkpoint 加载、前反向和恢复。Windows + RTX 2070 Super 仍需补跑 CUDA/FP16 冒烟。
+
+正式 GPU 训练推荐使用 Windows 主机上的 WSL2 Ubuntu。当前锁文件的 Linux x86-64
+PyTorch 路径包含 CUDA 运行依赖，而原生 Windows wheel 不能直接作为本项目的 CUDA
+门禁；不要在原生 PowerShell 执行一次普通安装后就假定 GPU 已启用。完整步骤见
+[Windows RTX 训练指南](docs/RTX2070_Windows训练指南.md)。
 
 ### 本地目录管理
 
