@@ -11,7 +11,11 @@ import numpy as np
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--train-x", type=Path, required=True)
+    parser.add_argument("--train-y", type=Path, required=True)
+    parser.add_argument("--valid-x", type=Path, required=True)
+    parser.add_argument("--valid-y", type=Path, required=True)
+    parser.add_argument("--evaluation-x", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--scores", type=Path, required=True)
@@ -26,10 +30,13 @@ def main() -> None:
     payload = json.loads(args.config.read_text(encoding="utf-8"))
     config = payload["model"]
     seed = int(payload["seed"])
-    arrays = np.load(args.input)
-    train_data = lgb.Dataset(arrays["train_x"], label=arrays["train_y"], free_raw_data=False)
+    train_x = np.load(args.train_x, mmap_mode="r")
+    train_y = np.load(args.train_y, mmap_mode="r")
+    valid_x = np.load(args.valid_x, mmap_mode="r")
+    valid_y = np.load(args.valid_y, mmap_mode="r")
+    train_data = lgb.Dataset(train_x, label=train_y, free_raw_data=True)
     valid_data = lgb.Dataset(
-        arrays["valid_x"], label=arrays["valid_y"], reference=train_data, free_raw_data=False
+        valid_x, label=valid_y, reference=train_data, free_raw_data=True
     )
     model = lgb.train(
         {
@@ -51,8 +58,10 @@ def main() -> None:
         valid_names=["valid"],
         callbacks=[lgb.early_stopping(config["early_stopping_rounds"], verbose=False)],
     )
+    del train_x, train_y, valid_x, valid_y
     model.save_model(str(args.checkpoint))
-    scores = model.predict(arrays["evaluation_x"], num_iteration=model.best_iteration)
+    evaluation_x = np.load(args.evaluation_x, mmap_mode="r")
+    scores = model.predict(evaluation_x, num_iteration=model.best_iteration)
     np.save(args.scores, np.asarray(scores, dtype=np.float64))
     args.audit.write_text(
         json.dumps(

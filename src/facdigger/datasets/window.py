@@ -30,7 +30,13 @@ class SecurityFeatureBlock:
 class SecurityFeatureStore:
     """One immutable feature representation shared by multiple split views."""
 
-    def __init__(self, *, features: pl.DataFrame, channels: list[str]) -> None:
+    def __init__(
+        self,
+        *,
+        features: pl.DataFrame,
+        channels: list[str],
+        presorted: bool = False,
+    ) -> None:
         missing = [channel for channel in channels if channel not in features.columns]
         if missing:
             raise DataContractError(f"features missing requested channels: {missing}")
@@ -39,10 +45,10 @@ class SecurityFeatureStore:
         self._security_ids: list[str] = []
         self._block_index_by_security: dict[str, int] = {}
 
-        ordered = features.sort(["security_id", "trade_date"])
+        ordered = features if presorted else features.sort(["security_id", "trade_date"])
         observed_columns = [f"observed_{channel}" for channel in channels]
         has_observed_columns = all(column in ordered.columns for column in observed_columns)
-        for block in ordered.partition_by("security_id", maintain_order=True):
+        for _, block in ordered.group_by("security_id", maintain_order=True):
             security_id = str(block["security_id"][0])
             raw_values = block.select(channels).to_numpy().astype(np.float32)
             finite = np.isfinite(raw_values)
@@ -87,6 +93,7 @@ class SnapshotWindowDataset:
         channels: list[str],
         context_length: int,
         split: str,
+        retained_columns: list[str] | None = None,
     ) -> None:
         if context_length < 1:
             raise ValueError("context_length must be positive")
@@ -106,8 +113,29 @@ class SnapshotWindowDataset:
         self.split = split
         self.feature_store = feature_store
         self.blocks = feature_store.blocks
-        self.sample_rows = sample_index.filter(pl.col("split") == split).sort(
-            ["asof_date", "security_id"]
+        selected_columns = (
+            retained_columns
+            if retained_columns is not None
+            else [
+                "sample_id",
+                "security_id",
+                "symbol",
+                "asof_date",
+                "feature_start",
+                "feature_end",
+                "split",
+                "target",
+            ]
+        )
+        retained_columns = [
+            column
+            for column in selected_columns
+            if column in sample_index.columns
+        ]
+        self.sample_rows = (
+            sample_index.filter(pl.col("split") == split)
+            .select(retained_columns)
+            .sort(["asof_date", "security_id"])
         )
         if self.sample_rows.is_empty():
             raise DataContractError(f"sample_index has no rows for split={split!r}")
@@ -207,6 +235,19 @@ class SnapshotInferenceWindowDataset(SnapshotWindowDataset):
             channels=channels,
             context_length=context_length,
             split="inference",
+            retained_columns=[
+                "sample_id",
+                "security_id",
+                "symbol",
+                "asof_date",
+                "feature_start",
+                "feature_end",
+                "split",
+                "eligible",
+                "industry_code",
+                "float_market_cap",
+                "log_float_market_cap",
+            ],
         )
 
     def __getitem__(self, index: int) -> dict[str, Any]:

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import polars as pl
 import yaml
 
 from facdigger.data.contracts import DataContractError
@@ -21,6 +22,7 @@ from facdigger.experiments.manifest import collect_git_state, sha256_json
 from facdigger.training.common import (
     apply_source_readiness_gate,
     build_prediction_frame,
+    load_required_snapshot_features,
     load_source_provenance,
     load_training_snapshot,
     split_supervised_training_index,
@@ -84,7 +86,7 @@ def run_e1(
     resume_from: str | Path | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     dataset_path = Path(dataset_dir).resolve()
-    dataset_manifest, frames = load_training_snapshot(dataset_path)
+    dataset_manifest, frames = load_training_snapshot(dataset_path, include_features=False)
     dataset_config = dataset_manifest["config"]
     context_length = int(dataset_config["features"]["context_length"])
     dataset_channels = list(dataset_config["features"]["channels"])
@@ -95,13 +97,29 @@ def run_e1(
     if config.model.patch_length > context_length:
         raise DataContractError("E1 patch_length cannot exceed dataset context_length")
 
-    feature_store = SecurityFeatureStore(
-        features=frames.pop("features"),
-        channels=config.channels,
-    )
     protocol_index, selection_audit = split_supervised_training_index(
         frames["sample_index"],
         selection_fraction=config.selection_fraction,
+    )
+    required_rows = pl.concat(
+        [
+            protocol_index.filter(
+                pl.col("split").is_in(["train_fit", "inner_selection"])
+            ).select("security_id", "feature_start", "asof_date"),
+            frames["sample_index"]
+            .filter(pl.col("split") == config.evaluation_split)
+            .select("security_id", "feature_start", "asof_date"),
+        ],
+        how="vertical",
+    )
+    feature_store = SecurityFeatureStore(
+        features=load_required_snapshot_features(
+            dataset_path,
+            dataset_manifest,
+            required_rows,
+        ),
+        channels=config.channels,
+        presorted=True,
     )
     training_datasets = {
         split: SnapshotWindowDataset(

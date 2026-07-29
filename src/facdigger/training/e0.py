@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import shutil
 import uuid
@@ -24,12 +25,13 @@ from facdigger.models.baselines import (
     TabularPreprocessor,
     build_multiscale_features,
     predict_mlp,
-    train_lightgbm,
+    train_lightgbm_from_files,
     train_mlp,
 )
 from facdigger.training.common import (
     apply_source_readiness_gate,
     build_prediction_frame,
+    load_required_snapshot_features,
     load_source_provenance,
     load_training_snapshot,
     split_supervised_training_index,
@@ -44,7 +46,7 @@ def run_e0(
     repository_root: str | Path,
 ) -> tuple[Path, dict[str, Any]]:
     dataset_path = Path(dataset_dir).resolve()
-    dataset_manifest, frames = load_training_snapshot(dataset_path)
+    dataset_manifest, frames = load_training_snapshot(dataset_path, include_features=False)
     dataset_config = dataset_manifest["config"]
     context_length = int(dataset_config["features"]["context_length"])
     dataset_channels = list(dataset_config["features"]["channels"])
@@ -56,8 +58,24 @@ def run_e0(
         frames["sample_index"],
         selection_fraction=config.selection_fraction,
     )
+    required_rows = pl.concat(
+        [
+            protocol_index.filter(
+                pl.col("split").is_in(["train_fit", "inner_selection"])
+            ).select("security_id", "feature_start", "asof_date"),
+            frames["sample_index"]
+            .filter(pl.col("split") == config.evaluation_split)
+            .select("security_id", "feature_start", "asof_date"),
+        ],
+        how="vertical",
+    )
+    features = load_required_snapshot_features(
+        dataset_path,
+        dataset_manifest,
+        required_rows,
+    )
     tabular, feature_columns = build_multiscale_features(
-        frames["features"],
+        features,
         protocol_index,
         channels=config.channels,
         windows=config.windows,
@@ -72,11 +90,19 @@ def run_e0(
         )
 
     preprocessor = TabularPreprocessor.fit(train_rows, feature_columns)
-    train_x = preprocessor.transform(train_rows)
-    valid_x = preprocessor.transform(valid_rows)
-    evaluation_x = preprocessor.transform(evaluation_rows)
-    train_y = train_rows["target"].to_numpy().astype(np.float64)
-    valid_y = valid_rows["target"].to_numpy().astype(np.float64)
+    prediction_rows = evaluation_rows.select(
+        "sample_id",
+        "security_id",
+        "symbol",
+        "asof_date",
+        "split",
+        "target",
+    )
+    row_counts = {
+        "train_fit": train_rows.height,
+        "inner_selection": valid_rows.height,
+        "evaluation": evaluation_rows.height,
+    }
 
     created_at = datetime.now(timezone.utc)
     config_payload = config.model_dump(mode="json")
@@ -96,6 +122,11 @@ def run_e0(
         checkpoint_name = "best.pt" if config.model_type == "mlp" else "best.txt"
         checkpoint_path = temporary_dir / "checkpoints" / checkpoint_name
         if config.model_type == "mlp":
+            train_x = preprocessor.transform(train_rows)
+            valid_x = preprocessor.transform(valid_rows)
+            evaluation_x = preprocessor.transform(evaluation_rows)
+            train_y = train_rows["target"].to_numpy().astype(np.float64)
+            valid_y = valid_rows["target"].to_numpy().astype(np.float64)
             model, training_audit = train_mlp(
                 train_x,
                 train_y,
@@ -108,17 +139,34 @@ def run_e0(
             )
             scores = predict_mlp(model, evaluation_x, training_audit["device"])
         else:
-            scores, training_audit = train_lightgbm(
-                train_x,
-                train_y,
-                valid_x,
-                valid_y,
-                evaluation_x,
+            matrix_dir = temporary_dir / ".matrices"
+            matrix_dir.mkdir()
+            paths = {
+                "train_x": preprocessor.transform_to_npy(
+                    train_rows, matrix_dir / "train_x.npy"
+                ),
+                "valid_x": preprocessor.transform_to_npy(
+                    valid_rows, matrix_dir / "valid_x.npy"
+                ),
+                "evaluation_x": preprocessor.transform_to_npy(
+                    evaluation_rows, matrix_dir / "evaluation_x.npy"
+                ),
+                "train_y": matrix_dir / "train_y.npy",
+                "valid_y": matrix_dir / "valid_y.npy",
+            }
+            np.save(paths["train_y"], train_rows["target"].to_numpy().astype(np.float64))
+            np.save(paths["valid_y"], valid_rows["target"].to_numpy().astype(np.float64))
+            del tabular, train_rows, valid_rows, evaluation_rows, protocol_index
+            del features
+            gc.collect()
+            scores, training_audit = train_lightgbm_from_files(
+                **paths,
                 config=config.lightgbm,
                 seed=config.seed,
                 checkpoint_path=checkpoint_path,
                 preprocessing=preprocessor.to_dict(),
             )
+            shutil.rmtree(matrix_dir)
         checkpoint_hash = sha256_file(checkpoint_path)
         preprocessing_artifact = None
         if config.model_type == "lightgbm":
@@ -128,7 +176,7 @@ def run_e0(
                 "sha256": sha256_file(preprocessing_path),
             }
         predictions, neutralization_audit = build_prediction_frame(
-            evaluation_rows,
+            prediction_rows,
             frames["sample_metadata"],
             scores,
             model_id=config.experiment_id,
@@ -180,11 +228,9 @@ def run_e0(
             "evaluation_split": config.evaluation_split,
             "test_unlocked": config.unlock_test,
             "feature_columns": feature_columns,
-            "input_dimensions_with_masks": train_x.shape[1],
+            "input_dimensions_with_masks": len(feature_columns) * 2,
             "row_counts": {
-                "train_fit": train_rows.height,
-                "inner_selection": valid_rows.height,
-                "evaluation": evaluation_rows.height,
+                **row_counts,
             },
             "supervised_selection_audit": selection_audit,
             "checkpoint": {

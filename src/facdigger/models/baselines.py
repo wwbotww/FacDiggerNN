@@ -25,6 +25,8 @@ def build_multiscale_features(
     windows: list[int],
     context_length: int,
 ) -> tuple[pl.DataFrame, list[str]]:
+    """Build tabular features one security at a time and retain only sample rows."""
+
     usable_windows = [window for window in windows if window <= context_length]
     if not usable_windows:
         raise ValueError("at least one statistics window must fit within context_length")
@@ -32,7 +34,7 @@ def build_multiscale_features(
     feature_columns: list[str] = []
     for channel in channels:
         last_name = f"{channel}__last"
-        expressions.append(pl.col(channel).alias(last_name))
+        expressions.append(pl.col(channel).cast(pl.Float32).alias(last_name))
         feature_columns.append(last_name)
         for window in usable_windows:
             for statistic in ("mean", "std", "min", "max"):
@@ -46,32 +48,49 @@ def build_multiscale_features(
                     expression = source.rolling_min(window, min_samples=window)
                 else:
                     expression = source.rolling_max(window, min_samples=window)
-                expressions.append(expression.over("security_id").alias(name))
+                expressions.append(expression.cast(pl.Float32).alias(name))
                 feature_columns.append(name)
-    tabular = (
-        features.sort(["security_id", "trade_date"])
-        .with_columns(expressions)
-        .select(
-            "security_id",
-            pl.col("trade_date").alias("asof_date"),
-            *feature_columns,
-        )
-        .join(
-            sample_index.select(
-                "sample_id",
+
+    sample_columns = [
+        "sample_id",
+        "security_id",
+        "symbol",
+        "asof_date",
+        "split",
+        "target",
+    ]
+    samples = sample_index.select(sample_columns)
+    sample_groups = {
+        str(group["security_id"][0]): group
+        for _, group in samples.group_by("security_id", maintain_order=True)
+    }
+    relevant = features.filter(pl.col("security_id").is_in(list(sample_groups))).select(
+        "security_id", "trade_date", *channels
+    )
+    parts: list[pl.DataFrame] = []
+    for _, block in relevant.group_by("security_id", maintain_order=True):
+        security_id = str(block["security_id"][0])
+        security_samples = sample_groups[security_id]
+        statistics = (
+            block.sort("trade_date")
+            .with_columns(expressions)
+            .select(
                 "security_id",
-                "symbol",
-                "asof_date",
-                "split",
-                "target",
-            ),
+                pl.col("trade_date").alias("asof_date"),
+                *feature_columns,
+            )
+        )
+        selected = security_samples.join(
+            statistics,
             on=["security_id", "asof_date"],
             how="inner",
             validate="1:1",
         )
-        .sort(["asof_date", "security_id"])
-    )
-    return tabular, feature_columns
+        if selected.height:
+            parts.append(selected)
+    if not parts:
+        return samples.head(0), feature_columns
+    return pl.concat(parts, how="vertical", rechunk=False), feature_columns
 
 
 def build_multiscale_inference_features(
@@ -108,26 +127,64 @@ class TabularPreprocessor:
 
     @classmethod
     def fit(cls, frame: pl.DataFrame, feature_columns: list[str]) -> TabularPreprocessor:
-        values = frame.select(feature_columns).to_numpy().astype(np.float64)
-        means: list[float] = []
-        scales: list[float] = []
-        for column in values.T:
-            observed = column[np.isfinite(column)]
-            if not len(observed):
-                means.append(0.0)
-                scales.append(1.0)
-                continue
-            means.append(float(np.mean(observed)))
-            scale = float(np.std(observed))
-            scales.append(scale if scale > 1e-12 else 1.0)
+        expressions: list[pl.Expr] = []
+        for column in feature_columns:
+            finite = pl.col(column).filter(pl.col(column).is_finite())
+            expressions.extend(
+                [
+                    finite.mean().alias(f"{column}__mean"),
+                    finite.std(ddof=0).alias(f"{column}__std"),
+                ]
+            )
+        statistics = frame.select(expressions).row(0, named=True)
+        means = []
+        scales = []
+        for column in feature_columns:
+            mean = statistics[f"{column}__mean"]
+            scale = statistics[f"{column}__std"]
+            means.append(float(mean) if mean is not None else 0.0)
+            numeric_scale = float(scale) if scale is not None else 0.0
+            scales.append(numeric_scale if numeric_scale > 1e-12 else 1.0)
         return cls(feature_columns, means, scales)
 
+    def _fill(self, frame: pl.DataFrame, destination: np.ndarray) -> None:
+        expected = (frame.height, len(self.feature_columns) * 2)
+        if destination.shape != expected or destination.dtype != np.float32:
+            raise ValueError(
+                f"preprocessing destination must be float32 with shape {expected}"
+            )
+        width = len(self.feature_columns)
+        for index, (name, mean, scale) in enumerate(
+            zip(self.feature_columns, self.means, self.scales, strict=True)
+        ):
+            values = frame[name].to_numpy()
+            observed = np.isfinite(values)
+            normalized = destination[:, index]
+            np.subtract(values, mean, out=normalized, casting="unsafe")
+            np.divide(normalized, scale, out=normalized)
+            normalized[~observed] = 0.0
+            destination[:, width + index] = observed
+
     def transform(self, frame: pl.DataFrame) -> np.ndarray:
-        values = frame.select(self.feature_columns).to_numpy().astype(np.float64)
-        observed = np.isfinite(values)
-        normalized = (values - np.asarray(self.means)) / np.asarray(self.scales)
-        normalized = np.where(observed, normalized, 0.0)
-        return np.concatenate([normalized, observed.astype(np.float64)], axis=1).astype(np.float32)
+        result = np.empty(
+            (frame.height, len(self.feature_columns) * 2),
+            dtype=np.float32,
+        )
+        self._fill(frame, result)
+        return result
+
+    def transform_to_npy(self, frame: pl.DataFrame, path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        result = np.lib.format.open_memmap(
+            path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(frame.height, len(self.feature_columns) * 2),
+        )
+        self._fill(frame, result)
+        result.flush()
+        del result
+        return path
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -357,21 +414,54 @@ def train_lightgbm(
     checkpoint_path: Path,
     preprocessing: dict[str, Any],
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Train in a clean process to isolate native OpenMP runtimes on macOS."""
+    """Compatibility wrapper that delegates file-backed matrices to the worker."""
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="facdigger-lgb-train-") as temporary:
+        root = Path(temporary)
+        paths = {
+            "train_x": root / "train_x.npy",
+            "train_y": root / "train_y.npy",
+            "valid_x": root / "valid_x.npy",
+            "valid_y": root / "valid_y.npy",
+            "evaluation_x": root / "evaluation_x.npy",
+        }
+        for name, values in {
+            "train_x": train_x,
+            "train_y": train_y,
+            "valid_x": valid_x,
+            "valid_y": valid_y,
+            "evaluation_x": evaluation_x,
+        }.items():
+            np.save(paths[name], values)
+        return train_lightgbm_from_files(
+            **paths,
+            config=config,
+            seed=seed,
+            checkpoint_path=checkpoint_path,
+            preprocessing=preprocessing,
+        )
+
+
+def train_lightgbm_from_files(
+    *,
+    train_x: Path,
+    train_y: Path,
+    valid_x: Path,
+    valid_y: Path,
+    evaluation_x: Path,
+    config: LightGBMBaselineConfig,
+    seed: int,
+    checkpoint_path: Path,
+    preprocessing: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Train in a clean process without duplicating input matrices in the parent."""
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    input_path = checkpoint_path.with_suffix(".input.npz")
     scores_path = checkpoint_path.with_suffix(".scores.npy")
     audit_path = checkpoint_path.with_suffix(".audit.json")
     config_path = checkpoint_path.with_suffix(".config.json")
-    np.savez_compressed(
-        input_path,
-        train_x=train_x,
-        train_y=train_y,
-        valid_x=valid_x,
-        valid_y=valid_y,
-        evaluation_x=evaluation_x,
-    )
     config_path.write_text(
         json.dumps({"model": config.model_dump(), "seed": seed}, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -382,8 +472,16 @@ def train_lightgbm(
                 sys.executable,
                 "-m",
                 "facdigger.models.lightgbm_worker",
-                "--input",
-                str(input_path),
+                "--train-x",
+                str(train_x),
+                "--train-y",
+                str(train_y),
+                "--valid-x",
+                str(valid_x),
+                "--valid-y",
+                str(valid_y),
+                "--evaluation-x",
+                str(evaluation_x),
                 "--config",
                 str(config_path),
                 "--checkpoint",
@@ -405,7 +503,7 @@ def train_lightgbm(
         scores = np.load(scores_path).astype(np.float64)
         audit = json.loads(audit_path.read_text(encoding="utf-8"))
     finally:
-        for temporary in [input_path, scores_path, audit_path, config_path]:
+        for temporary in [scores_path, audit_path, config_path]:
             temporary.unlink(missing_ok=True)
     checkpoint_path.with_suffix(".preprocessing.json").write_text(
         json.dumps(preprocessing, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

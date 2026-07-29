@@ -94,13 +94,59 @@ def load_training_snapshot(
         "sample_index": "sample_index.parquet",
         "sample_metadata": "sample_metadata.parquet",
     }
-    inference_filename = manifest.get("artifacts", {}).get("inference_index")
-    if inference_filename:
-        filenames["inference_index"] = str(inference_filename)
     if include_features:
-        filenames["features"] = "features.parquet"
-    frames = {name: pl.read_parquet(dataset_dir / filename) for name, filename in filenames.items()}
+        filenames["features"] = str(
+            manifest.get("artifacts", {}).get("features", "features.parquet")
+        )
+    frames = {
+        name: pl.read_parquet(dataset_dir / filename)
+        for name, filename in filenames.items()
+    }
     return manifest, frames
+
+
+def load_required_snapshot_features(
+    dataset_dir: Path,
+    dataset_manifest: dict[str, Any],
+    required_rows: pl.DataFrame,
+) -> pl.DataFrame:
+    """Read only feature columns and security/date ranges used by one run."""
+
+    required_columns = {"security_id", "feature_start", "asof_date"}
+    missing = sorted(required_columns - set(required_rows.columns))
+    if missing:
+        raise DataContractError(f"required feature rows missing columns: {missing}")
+    if required_rows.is_empty():
+        raise DataContractError("cannot load features for an empty sample selection")
+    feature_config = dataset_manifest["config"]["features"]
+    channels = list(feature_config["channels"])
+    observed = [f"observed_{channel}" for channel in channels]
+    bounds = (
+        required_rows.select("security_id", "feature_start", "asof_date")
+        .group_by("security_id")
+        .agg(
+            pl.col("feature_start").min().alias("_required_start"),
+            pl.col("asof_date").max().alias("_required_end"),
+        )
+    )
+    filename = str(
+        dataset_manifest.get("artifacts", {}).get("features", "features.parquet")
+    )
+    path = dataset_dir / filename
+    if not path.is_file():
+        raise FileNotFoundError(f"Snapshot features do not exist: {path}")
+    return (
+        pl.scan_parquet(path)
+        .select("security_id", "trade_date", *channels, *observed)
+        .join(bounds.lazy(), on="security_id", how="inner")
+        .filter(
+            (pl.col("trade_date") >= pl.col("_required_start"))
+            & (pl.col("trade_date") <= pl.col("_required_end"))
+        )
+        .drop("_required_start", "_required_end")
+        .collect()
+        .sort(["security_id", "trade_date"])
+    )
 
 
 def load_source_provenance(dataset_dir: Path, dataset_manifest: dict[str, Any]) -> dict[str, Any]:

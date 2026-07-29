@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 from facdigger.models.baselines import TabularPreprocessor, build_multiscale_features
@@ -50,6 +52,7 @@ def test_multiscale_features_use_only_past_and_append_missing_masks() -> None:
     )
     assert original.select(columns).to_dicts() == changed.select(columns).to_dicts()
     assert original["x__mean_3"][0] == 3.0
+    assert all(original.schema[column] == pl.Float32 for column in columns)
 
     with_missing = original.with_columns(pl.lit(None).cast(pl.Float64).alias(columns[0]))
     preprocessor = TabularPreprocessor.fit(original, columns)
@@ -60,3 +63,21 @@ def test_multiscale_features_use_only_past_and_append_missing_masks() -> None:
 
     restored = TabularPreprocessor.from_dict(preprocessor.to_dict())
     assert restored == preprocessor
+
+
+def test_preprocessor_writes_float32_file_backed_matrix(tmp_path: Path) -> None:
+    frame = pl.DataFrame(
+        {
+            "x": [1.0, 2.0, None],
+            "y": [5.0, 5.0, 5.0],
+        }
+    )
+    preprocessor = TabularPreprocessor.fit(frame, ["x", "y"])
+
+    path = preprocessor.transform_to_npy(frame, tmp_path / "matrix.npy")
+    matrix = np.load(path, mmap_mode="r")
+
+    assert isinstance(matrix, np.memmap)
+    assert matrix.dtype == np.float32
+    assert matrix.shape == (3, 4)
+    np.testing.assert_array_equal(matrix[:, 2], [1.0, 1.0, 0.0])

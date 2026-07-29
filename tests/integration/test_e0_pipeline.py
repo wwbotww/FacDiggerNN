@@ -27,7 +27,10 @@ def sessions(count: int) -> list[date]:
     return result
 
 
-def test_e0_mlp_train_predict_report_pipeline(tmp_path) -> None:
+@pytest.mark.parametrize("model_type", ["mlp", "lightgbm"])
+def test_e0_train_predict_report_pipeline(tmp_path, model_type: str) -> None:
+    if model_type == "lightgbm":
+        pytest.importorskip("lightgbm")
     calendar = sessions(85)
     bars: list[dict] = []
     universe: list[dict] = []
@@ -92,7 +95,8 @@ def test_e0_mlp_train_predict_report_pipeline(tmp_path) -> None:
     snapshot_dir, _ = build_dataset_snapshot(dataset_config)
     experiment = E0ExperimentConfig.model_validate(
         {
-            "experiment_id": "e0-test",
+            "experiment_id": f"e0-{model_type}-test",
+            "model_type": model_type,
             "output_root": tmp_path / "runs",
             "windows": [5, 20],
             "mlp": {
@@ -103,19 +107,27 @@ def test_e0_mlp_train_predict_report_pipeline(tmp_path) -> None:
                 "batch_size": 64,
                 "device": "cpu",
             },
+            "lightgbm": {
+                "n_estimators": 8,
+                "learning_rate": 0.1,
+                "num_leaves": 4,
+                "min_child_samples": 2,
+                "early_stopping_rounds": 3,
+            },
         }
     )
     run_dir, metrics = run_e0(experiment, snapshot_dir, repository_root=tmp_path)
 
     assert metrics["coverage"]["coverage"] == 1.0
     assert metrics["evaluation_split"] == "valid"
+    checkpoint_name = "best.pt" if model_type == "mlp" else "best.txt"
     for filename in [
         "manifest.json",
         "resolved_config.yaml",
         "predictions.parquet",
         "metrics.json",
         "report.html",
-        "checkpoints/best.pt",
+        f"checkpoints/{checkpoint_name}",
     ]:
         assert (run_dir / filename).is_file()
     predictions = pl.read_parquet(run_dir / "predictions.parquet")

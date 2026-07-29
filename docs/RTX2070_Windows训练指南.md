@@ -24,12 +24,15 @@ WSL2 Ubuntu 中运行工程实验。目标环境是 Python 3.11、单张 8 GB NV
 | 资源 | 要求 |
 |---|---|
 | GPU | RTX 2070 Super 8 GB |
-| 系统 RAM | 至少 32 GB，64 GB 更稳妥 |
+| 系统 RAM | 16 GB 可做优化版实测；32 GB 以上仍更稳妥 |
 | 可用磁盘 | 至少 30 GB，建议 50 GB |
 | 系统 | Windows 11 或支持 WSL2 的 Windows 10 |
 
-共享 `SecurityFeatureStore` 已消除 E1/E2 三份、E3 五份完整特征块复制，但 snapshot
-构建和首次 store 构造仍有一次性内存峰值。16 GB RAM 不建议启动全量 M6。
+2026-07-29 的内存优化除共享 `SecurityFeatureStore` 外，还加入训练窗口范围裁剪、
+索引列裁剪、snapshot 分阶段释放，以及 E0 逐证券 Float32 统计和 LightGBM mmap 输入。
+这移除了已知的 P0 级内存放大，但 16 GB 目标机尚未完成全 M6 峰值验收。16 GB 机器应先
+运行单个 E1/E0 cell，确认系统未进入持续 swap 后再运行完整 M6；不要一开始并行训练多个
+cell。32 GB 以上仍是更稳妥的正式实验配置。
 
 ## 3. 安装 WSL2 和驱动
 

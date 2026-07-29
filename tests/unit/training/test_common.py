@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
+from pathlib import Path
 
 import polars as pl
 
 from facdigger.training.common import (
     apply_source_readiness_gate,
+    load_required_snapshot_features,
+    load_training_snapshot,
     split_supervised_training_index,
 )
 
@@ -74,3 +78,59 @@ def test_supervised_selection_is_inside_train_and_purges_label_overlap() -> None
     assert audit["purged_rows"] == 4
     assert audit["fit_max_label_end"] < audit["selection_min_asof_date"]
     assert audit["outer_validation_rows_used_for_checkpoint_selection"] == 0
+
+
+def test_training_snapshot_can_skip_features_and_never_loads_inference_index(
+    tmp_path: Path,
+) -> None:
+    manifest = {
+        "schema_version": 3,
+        "config": {"features": {"channels": ["x"]}},
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    pl.DataFrame({"sample_id": ["sample"]}).write_parquet(
+        tmp_path / "sample_index.parquet"
+    )
+    pl.DataFrame({"sample_id": ["sample"]}).write_parquet(
+        tmp_path / "sample_metadata.parquet"
+    )
+    pl.DataFrame({"sample_id": ["future"]}).write_parquet(
+        tmp_path / "inference_index.parquet"
+    )
+
+    _, frames = load_training_snapshot(tmp_path, include_features=False)
+
+    assert set(frames) == {"sample_index", "sample_metadata"}
+
+
+def test_required_feature_loader_projects_channels_and_window_ranges(
+    tmp_path: Path,
+) -> None:
+    dates = [date(2024, 1, 1) + timedelta(days=index) for index in range(6)]
+    features = pl.DataFrame(
+        {
+            "security_id": ["A"] * 6 + ["B"] * 6,
+            "trade_date": dates * 2,
+            "x": [float(index) for index in range(12)],
+            "observed_x": [True] * 12,
+            "unused": [999.0] * 12,
+        }
+    )
+    features.write_parquet(tmp_path / "features.parquet")
+    manifest = {
+        "config": {"features": {"channels": ["x"]}},
+        "artifacts": {"features": "features.parquet"},
+    }
+    required_rows = pl.DataFrame(
+        {
+            "security_id": ["A", "A"],
+            "feature_start": [dates[1], dates[2]],
+            "asof_date": [dates[3], dates[4]],
+        }
+    )
+
+    selected = load_required_snapshot_features(tmp_path, manifest, required_rows)
+
+    assert selected.columns == ["security_id", "trade_date", "x", "observed_x"]
+    assert selected["security_id"].unique().to_list() == ["A"]
+    assert selected["trade_date"].to_list() == dates[1:5]

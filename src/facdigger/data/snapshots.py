@@ -99,90 +99,117 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
         manifest = json.loads((final_dir / "manifest.json").read_text(encoding="utf-8"))
         return final_dir, manifest
 
-    raw_features = build_price_volume_features(bundle.bars, bundle.universe)
-    scaler = fit_train_robust_scaler(
-        raw_features,
-        config.features.channels,
-        config.split.train_end,
-        winsor_lower=config.features.winsor_lower,
-        winsor_upper=config.features.winsor_upper,
-    )
-    features = apply_robust_scaler(raw_features, scaler)
-    labels = build_forward_excess_return_labels(
-        bundle.bars,
-        bundle.universe,
-        delistings=bundle.delistings,
-        execution_lag=config.label.execution_lag,
-        horizon=config.label.horizon,
-    )
-    calendar = bundle.universe["trade_date"].unique().sort().to_list()
-    labels = assign_chronological_splits(labels, calendar, config.split)
-    sample_index = build_sample_index(
-        features,
-        labels,
-        bundle.universe,
-        context_length=config.features.context_length,
-    )
-    inference_index = build_inference_index(
-        features,
-        bundle.universe,
-        context_length=config.features.context_length,
-    )
-    sample_metadata = _build_sample_metadata(sample_index, bundle.universe)
-    split_counts = {
-        row["split"]: row["len"]
-        for row in sample_index.group_by("split").len().sort("split").to_dicts()
-    }
-    audit = {
-        "sources": adapter.audit(bundle),
-        "features": _feature_audit(features),
-        "labels": {
-            "rows": labels.height,
-            "target_non_null": labels["target"].is_not_null().sum(),
-            "crosses_delisting": labels["crosses_delisting"].sum(),
-        },
-        "sample_index": {
-            "rows": sample_index.height,
-            "split_counts": split_counts,
-        },
-        "inference_index": {
-            "rows": inference_index.height,
-            "minimum_asof_date": inference_index["asof_date"].min().isoformat(),
-            "maximum_asof_date": inference_index["asof_date"].max().isoformat(),
-            "latest_cross_section_rows": inference_index.filter(
-                pl.col("asof_date") == inference_index["asof_date"].max()
-            ).height,
-            "contains_target": "target" in inference_index.columns,
-        },
-    }
-    manifest = {
-        **identity,
-        "dataset_id": dataset_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "source_paths": source_paths,
-        "artifacts": {
-            "features": "features.parquet",
-            "labels": "labels.parquet",
-            "sample_index": "sample_index.parquet",
-            "sample_metadata": "sample_metadata.parquet",
-            "inference_index": "inference_index.parquet",
-            "audit": "audit.json",
-            "scaler": "scaler.json",
-            "source_manifest": (
-                "source_manifest.json" if config.sources.source_manifest is not None else None
-            ),
-        },
-    }
-
     output_root.mkdir(parents=True, exist_ok=True)
     temporary_dir = output_root / f".tmp-{dataset_id[:12]}-{uuid.uuid4().hex}"
     temporary_dir.mkdir(parents=False, exist_ok=False)
     try:
-        features.write_parquet(temporary_dir / "features.parquet")
+        source_audit = adapter.audit(bundle)
+        bars = bundle.bars
+        universe = bundle.universe
+        delistings = bundle.delistings
+        del bundle
+
+        raw_features = build_price_volume_features(bars, universe)
+        scaler = fit_train_robust_scaler(
+            raw_features,
+            config.features.channels,
+            config.split.train_end,
+            winsor_lower=config.features.winsor_lower,
+            winsor_upper=config.features.winsor_upper,
+        )
+        features = apply_robust_scaler(raw_features, scaler)
+        del raw_features
+
+        labels = build_forward_excess_return_labels(
+            bars,
+            universe,
+            delistings=delistings,
+            execution_lag=config.label.execution_lag,
+            horizon=config.label.horizon,
+        )
+        del bars, delistings
+        calendar = universe["trade_date"].unique().sort().to_list()
+        labels = assign_chronological_splits(labels, calendar, config.split)
+        del calendar
+
+        sample_index = build_sample_index(
+            features,
+            labels,
+            universe,
+            context_length=config.features.context_length,
+        )
+        labels_audit = {
+            "rows": labels.height,
+            "target_non_null": labels["target"].is_not_null().sum(),
+            "crosses_delisting": labels["crosses_delisting"].sum(),
+        }
         labels.write_parquet(temporary_dir / "labels.parquet")
-        sample_index.write_parquet(temporary_dir / "sample_index.parquet")
+        del labels
+
+        sample_metadata = _build_sample_metadata(sample_index, universe)
         sample_metadata.write_parquet(temporary_dir / "sample_metadata.parquet")
+        del sample_metadata
+
+        inference_index = build_inference_index(
+            features,
+            universe,
+            context_length=config.features.context_length,
+        )
+        maximum_inference_date = inference_index["asof_date"].max()
+        inference_audit = {
+            "rows": inference_index.height,
+            "minimum_asof_date": inference_index["asof_date"].min().isoformat(),
+            "maximum_asof_date": maximum_inference_date.isoformat(),
+            "latest_cross_section_rows": inference_index.filter(
+                pl.col("asof_date") == maximum_inference_date
+            ).height,
+            "contains_target": "target" in inference_index.columns,
+        }
         inference_index.write_parquet(temporary_dir / "inference_index.parquet")
+        del inference_index, universe
+
+        features_audit = _feature_audit(features)
+        features.write_parquet(temporary_dir / "features.parquet")
+        del features
+
+        split_counts = {
+            row["split"]: row["len"]
+            for row in sample_index.group_by("split").len().sort("split").to_dicts()
+        }
+        sample_index_audit = {
+            "rows": sample_index.height,
+            "split_counts": split_counts,
+        }
+        sample_index.write_parquet(temporary_dir / "sample_index.parquet")
+        del sample_index
+
+        audit = {
+            "sources": source_audit,
+            "features": features_audit,
+            "labels": labels_audit,
+            "sample_index": sample_index_audit,
+            "inference_index": inference_audit,
+        }
+        manifest = {
+            **identity,
+            "dataset_id": dataset_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source_paths": source_paths,
+            "artifacts": {
+                "features": "features.parquet",
+                "labels": "labels.parquet",
+                "sample_index": "sample_index.parquet",
+                "sample_metadata": "sample_metadata.parquet",
+                "inference_index": "inference_index.parquet",
+                "audit": "audit.json",
+                "scaler": "scaler.json",
+                "source_manifest": (
+                    "source_manifest.json"
+                    if config.sources.source_manifest is not None
+                    else None
+                ),
+            },
+        }
         (temporary_dir / "audit.json").write_text(
             json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

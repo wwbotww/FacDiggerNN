@@ -6,7 +6,11 @@ import numpy as np
 import polars as pl
 
 from facdigger.datasets.sampler import DateGroupedBatchSampler
-from facdigger.datasets.window import SecurityFeatureStore, SnapshotWindowDataset
+from facdigger.datasets.window import (
+    SecurityFeatureStore,
+    SnapshotInferenceWindowDataset,
+    SnapshotWindowDataset,
+)
 
 
 def test_window_dataset_respects_snapshot_bounds_and_missing_mask() -> None:
@@ -86,6 +90,43 @@ def test_split_datasets_share_one_feature_store() -> None:
     assert train.blocks is valid.blocks
     np.testing.assert_array_equal(train[0]["values"][:, 0], [2.0, 3.0])
     np.testing.assert_array_equal(valid[0]["values"][:, 0], [4.0, 5.0])
+
+
+def test_inference_dataset_retains_target_free_factor_metadata() -> None:
+    dates = [date(2024, 1, 2) + timedelta(days=index) for index in range(3)]
+    features = pl.DataFrame(
+        {
+            "security_id": ["A"] * 3,
+            "trade_date": dates,
+            "x": [1.0, 2.0, 3.0],
+        }
+    )
+    inference_index = pl.DataFrame(
+        {
+            "sample_id": ["A|latest"],
+            "security_id": ["A"],
+            "symbol": ["A"],
+            "asof_date": [dates[2]],
+            "feature_start": [dates[1]],
+            "feature_end": [dates[2]],
+            "eligible": [True],
+            "industry_code": ["technology"],
+            "float_market_cap": [1_000_000.0],
+            "log_float_market_cap": [13.8155],
+        }
+    )
+
+    dataset = SnapshotInferenceWindowDataset(
+        features=features,
+        inference_index=inference_index,
+        channels=["x"],
+        context_length=2,
+    )
+
+    assert "target" not in dataset.sample_rows.columns
+    assert dataset.sample_rows["eligible"].to_list() == [True]
+    assert dataset.sample_rows["industry_code"].to_list() == ["technology"]
+    assert dataset.sample_rows["log_float_market_cap"].to_list() == [13.8155]
 
 
 def test_date_grouped_sampler_is_deterministic_and_keeps_small_dates_whole() -> None:
