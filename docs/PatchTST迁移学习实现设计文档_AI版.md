@@ -232,7 +232,10 @@ score_time = close(t)
 earliest_execution = open(t+1)
 ```
 
-使用5日标签会造成相邻日期标签重叠。训练可以保留重叠样本，但统计显著性和最终检验应增加非重叠周频抽样或使用适当的自相关稳健估计；文档首版以样本外 Rank IC 序列稳定性为主。
+使用5日标签会造成相邻日期标签重叠。训练可以保留重叠样本；M6 先在同一 fold/date 对固定
+seed 求均值，再以不跨 fold 的单侧 Newey–West/HAC 检验作为主推断，并以固定 offset 的
+非重叠样本复核方向。HAC lags 不得短于标签 horizon。E1−E0、E2−E1、E3−E2 三个归因
+问题组成固定 Holm family；均值为正但不显著、长期方差不可估计或样本不完整时均为 no-go。
 
 标签的 `t+1` 和 `t+5` 必须按全市场交易日历计算，不能对每只证券的实际 bar 直接 shift，否则停牌会把期限错误推迟。跨退市窗口优先使用可验证的 terminal value 或 delisting return。当前 EODHD 套餐缺少该字段，工程配置采用显式保守插值：Nasdaq `-55%`、NYSE/NYSE American `-30%`、未知交易所 `-50%`；每行写入 `is_imputed=true` 和 `imputation_method`。这些参数是假设，不是观测事实，正式研究需做敏感性分析并最终替换真实退市收益。
 
@@ -412,8 +415,10 @@ finetune:
 5.  运行E0/E1：完成传统基线与随机初始化 PatchTST。
 6.  运行E2：加载ETTh1编码器，保存权重加载报告后渐进解冻。
 7.  运行E3：仅在 Train 上继续预训练，再以同一 inner-selection 微调协议训练。
-8.  M6 walk-forward：先 preflight，再运行 validation 矩阵并冻结配置和报告哈希。
-9.  独立回放与评价：从 checkpoint 重建模型；test/final holdout 仅在冻结后显式解封。
+8.  M6 walk-forward：先 preflight，再运行 validation 矩阵，验证日期/样本数/seed 完整性，
+    执行单侧 HAC、Holm 和非重叠稳健性门禁，最后冻结配置、报告哈希与 holdout eligibility。
+9.  独立回放与评价：从 checkpoint 重建模型；test/final holdout 仅在 validation `go`、冻结
+    哈希复核通过且显式解封后执行。
 
 # 9. 评估与模型选择
 

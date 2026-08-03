@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import Field, model_validator
@@ -22,7 +23,14 @@ class ResearchModelConfigs(StrictModel):
 
 
 class ResearchDecisionConfig(StrictModel):
-    minimum_positive_cell_ratio: float = Field(default=0.5, ge=0, le=1)
+    minimum_positive_cell_ratio: float = Field(default=2 / 3, ge=0, le=1)
+    minimum_mean_rank_ic_delta: float = 0.0
+    significance_alpha: float = Field(default=0.05, gt=0, lt=0.5)
+    multiple_comparison_method: Literal["holm"] = "holm"
+    minimum_daily_observations_per_fold: int = Field(default=120, ge=2)
+    minimum_non_overlapping_observations_per_fold: int = Field(default=24, ge=2)
+    require_non_overlapping_positive: bool = True
+    require_validation_go_before_holdout: bool = True
     cost_bps: float = Field(default=20.0, ge=0)
     require_neutralized_positive: bool = True
     require_source_research_ready: bool = True

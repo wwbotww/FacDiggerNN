@@ -132,3 +132,8 @@ split:
     remediated_report = research_preflight(engineering)
     assert remediated_report["ready"] is True
     assert remediated_report["checks"]["source_quality_gate"] is True
+
+    short_hac_report = research_preflight(engineering.model_copy(update={"hac_lags": 4}))
+    assert short_hac_report["ready"] is False
+    assert short_hac_report["checks"]["hac_lags_cover_label_horizon"] is False
+    assert any("shorter than label horizon" in item for item in short_hac_report["blockers"])

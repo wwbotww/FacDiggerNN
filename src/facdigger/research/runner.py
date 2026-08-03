@@ -29,6 +29,10 @@ SnapshotBuilder = Callable[[M6ResearchConfig], list[dict[str, Any]]]
 CellExecutor = Callable[..., Path]
 
 
+class HoldoutEligibilityError(ValueError):
+    """Raised when a frozen validation decision forbids reading the holdout."""
+
+
 def _write_json(path: Path, payload: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -352,7 +356,7 @@ def run_m6_research(
             write_research_report(validation_result, validation_dir)
             validation_matrix_hash = sha256_json(validation_cells)
             freeze = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "frozen_at": datetime.now(timezone.utc).isoformat(),
                 "config_hash": manifest["config_hash"],
                 "folds_sha256": sha256_file(run_dir / "folds.json"),
@@ -360,6 +364,10 @@ def run_m6_research(
                 "validation_research_sha256": sha256_file(
                     validation_dir / "research.json"
                 ),
+                "validation_decision_status": validation_result["decisions"]["overall_e3"][
+                    "status"
+                ],
+                "holdout_eligible": validation_result["holdout_eligibility"]["eligible"],
                 "final_holdout_fold": config.folds[-1].fold_id,
                 "holdout_has_been_read": False,
             }
@@ -377,7 +385,10 @@ def run_m6_research(
 
         if not unlock_final_holdout:
             return run_dir, manifest
-        freeze = _load_json(run_dir / "freeze.json")
+        freeze_path = run_dir / "freeze.json"
+        if manifest.get("freeze_sha256") != sha256_file(freeze_path):
+            raise ValueError("research freeze changed after validation completion")
+        freeze = _load_json(freeze_path)
         if freeze["config_hash"] != manifest["config_hash"]:
             raise ValueError("frozen research config hash does not match")
         if freeze["validation_matrix_hash"] != sha256_json(matrix["validation"]):
@@ -386,6 +397,19 @@ def run_m6_research(
             run_dir / "validation" / "research.json"
         ):
             raise ValueError("validation research report changed after freeze")
+        validation_result = _load_json(run_dir / "validation" / "research.json")
+        holdout_eligibility = validation_result.get("holdout_eligibility", {})
+        if freeze.get("holdout_eligible") != holdout_eligibility.get("eligible"):
+            raise ValueError("frozen holdout eligibility does not match validation report")
+        if (
+            config.decisions.require_validation_go_before_holdout
+            and holdout_eligibility.get("eligible") is not True
+        ):
+            reasons = holdout_eligibility.get("reasons") or ["validation decision did not pass"]
+            raise HoldoutEligibilityError(
+                "validation decision does not permit final holdout: "
+                + "; ".join(str(reason) for reason in reasons)
+            )
         final_fold = fold_plans[-1]
         if final_fold["fold_id"] != freeze["final_holdout_fold"]:
             raise ValueError("final fold differs from frozen holdout fold")
@@ -439,6 +463,8 @@ def run_m6_research(
             }
         )
         _write_json(run_dir / "manifest.json", manifest)
+    except HoldoutEligibilityError:
+        raise
     except Exception as exc:
         phase = str(manifest.get("phase", "validation"))
         manifest.update(

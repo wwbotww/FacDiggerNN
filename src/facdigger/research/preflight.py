@@ -84,6 +84,7 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
         "model_configs_exist": len(model_paths) == 4,
         "three_or_more_folds": len(config.folds) >= 3,
         "three_or_more_seeds": len(config.seeds) >= 3,
+        "hac_lags_cover_label_horizon": config.hac_lags >= base.label.horizon,
     }
     blockers: list[str] = []
     if missing_sources:
@@ -100,6 +101,10 @@ def research_preflight(config: M6ResearchConfig) -> dict[str, Any]:
     if not checks["universe_covers_final_fold"]:
         blockers.append(
             f"universe maximum date {maximum_date} does not cover final fold end {required_end}"
+        )
+    if not checks["hac_lags_cover_label_horizon"]:
+        blockers.append(
+            f"hac_lags={config.hac_lags} is shorter than label horizon={base.label.horizon}"
         )
     return {
         "ready": all(checks.values()),
