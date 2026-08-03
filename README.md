@@ -267,14 +267,14 @@ facdigger research run \
   --config configs/research/m6_eodhd_engineering.yaml \
   --resume-run artifacts/research/<research_run_id>
 
-# 仅在审阅 validation/research.html 后执行；只解封最后一折的 test
+# 仅在审阅 validation/research.html 后执行；先用截至 2024 年数据 refit，再读 2025 test
 facdigger research run \
   --config configs/research/m6_eodhd_engineering.yaml \
   --resume-run artifacts/research/<research_run_id> \
   --unlock-final-holdout
 ```
 
-validation 完成后会固化配置、fold 计划、完整 cell 矩阵和研究报告哈希。解封 holdout 前这些哈希必须完全一致，而且冻结的 `overall_e3` 必须通过；显式 unlock 不能绕过 validation `no_go`。统计报告先验证预测日期、逐日样本数和 seed 完整性，再按 fold/date 对 seed 求均值；单侧 Newey–West/HAC 是主检验，固定 offset 非重叠样本用于方向稳健性，三个归因问题使用 Holm 校正。20 bps 组合结果保留为参考评价，不作为因子排序主门禁。
+validation 完成后会固化配置、fold 计划、完整 cell 矩阵、研究报告哈希和 final-refit 协议。解封 holdout 前这些哈希必须完全一致，而且冻结的 `overall_e3` 必须通过；显式 unlock 不能绕过 validation `no_go`。通过后 runner 不会复用只训练到 2022 年的 wf3 模型，而会创建新的内容寻址快照：official Train 和 scaler-fit 截止 2024-12-31，outer validation 为空，训练器仍只在 Train 内做 checkpoint selection；随后重新训练 E0—E3 的 3 个 seeds，并且仅对与原 wf3 完全相同的 2025 test 键评价。统计报告先验证预测日期、逐日样本数和 seed 完整性，再按 fold/date 对 seed 求均值；单侧 Newey–West/HAC 是主检验，固定 offset 非重叠样本用于方向稳健性，三个归因问题使用 Holm 校正。20 bps 组合结果保留为参考评价，不作为因子排序主门禁。
 
 当前数据只有静态行业，且没有点时流通市值，因此无法可信完成“点时行业 + 流通市值”中性化。`m6_eodhd_engineering.yaml` 明确关闭 `require_source_research_ready` 和 `require_neutralized_positive` 两个硬门禁；preflight 会标记 `research_mode=engineering`，允许验证完整训练、回放和报告链路，但不会把缺失中性化伪装成通过。正式研究配置必须重新开启这两个门禁，并提供点时行业、流通市值以及真实退市收益后，才能据此作出 `go/no_go` 研究结论。
 

@@ -38,3 +38,10 @@ def test_m6_requires_three_unique_seeds_and_expanding_folds() -> None:
     reversed_folds["folds"][1]["train_end"] = date(2019, 1, 1)
     with pytest.raises(ValidationError, match="strictly expand"):
         M6ResearchConfig.model_validate(reversed_folds)
+
+    empty_outer_validation = _payload()
+    empty_outer_validation["folds"][0]["valid_end"] = empty_outer_validation["folds"][
+        0
+    ]["train_end"]
+    with pytest.raises(ValidationError, match="research folds require"):
+        M6ResearchConfig.model_validate(empty_outer_validation)

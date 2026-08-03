@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
 from facdigger.environment import collect_environment
 from facdigger.experiments.manifest import collect_git_state, sha256_json
@@ -21,11 +22,16 @@ from facdigger.research.aggregate import (
 )
 from facdigger.research.config import M6ResearchConfig
 from facdigger.research.folds import (
+    build_final_refit_snapshot,
     build_walk_forward_snapshots,
+    final_refit_protocol,
     validate_model_config_paths,
 )
 
 SnapshotBuilder = Callable[[M6ResearchConfig], list[dict[str, Any]]]
+FinalRefitSnapshotBuilder = Callable[
+    [M6ResearchConfig, dict[str, Any]], dict[str, Any]
+]
 CellExecutor = Callable[..., Path]
 
 
@@ -161,7 +167,7 @@ def _new_research_run(
     _write_json(run_dir / "manifest.json", manifest)
     _write_json(
         run_dir / "matrix.json",
-        {"schema_version": 1, "validation": [], "holdout": []},
+        {"schema_version": 2, "validation": [], "final_refit": []},
     )
     return run_dir, manifest
 
@@ -185,6 +191,18 @@ def _cell_identity(
     *, fold_id: str, seed: int, model_key: str, evaluation_split: str
 ) -> tuple[str, int, str, str]:
     return fold_id, seed, model_key, evaluation_split
+
+
+def _validate_completed_cell(cell: dict[str, Any]) -> None:
+    run_dir = Path(str(cell.get("run_dir", "")))
+    metrics_path = run_dir / "metrics.json"
+    predictions_path = run_dir / "predictions.parquet"
+    if not metrics_path.is_file() or not predictions_path.is_file():
+        raise DataContractError(f"completed research cell artifacts are missing: {run_dir}")
+    if cell.get("metrics_sha256") != sha256_file(metrics_path):
+        raise DataContractError(f"completed research cell metrics changed: {run_dir}")
+    if cell.get("predictions_sha256") != sha256_file(predictions_path):
+        raise DataContractError(f"completed research cell predictions changed: {run_dir}")
 
 
 def _run_matrix_phase(
@@ -221,6 +239,7 @@ def _run_matrix_phase(
                 )
                 existing = indexed.get(identity)
                 if existing is not None and existing.get("status") == "complete":
+                    _validate_completed_cell(existing)
                     continue
                 output_root = (
                     run_dir
@@ -300,6 +319,7 @@ def run_m6_research(
     resume_run: str | Path | None = None,
     unlock_final_holdout: bool = False,
     snapshot_builder: SnapshotBuilder | None = None,
+    final_refit_snapshot_builder: FinalRefitSnapshotBuilder | None = None,
     cell_executor: CellExecutor | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     repository = Path(repository_root).resolve()
@@ -307,6 +327,7 @@ def run_m6_research(
         raise ValueError("final holdout requires --resume-run after validation freeze")
     model_paths = validate_model_config_paths(config)
     builder = snapshot_builder or build_walk_forward_snapshots
+    refit_builder = final_refit_snapshot_builder or build_final_refit_snapshot
     executor = cell_executor or _default_cell_executor
     if resume_run is None:
         run_dir, manifest = _new_research_run(config, repository)
@@ -327,6 +348,21 @@ def run_m6_research(
         run_dir, manifest = _resume_research_run(Path(resume_run), config)
         fold_plans = _load_json(run_dir / "folds.json")
     matrix = _load_json(run_dir / "matrix.json")
+    if manifest["status"] in {"validation_complete", "holdout_failed"}:
+        existing_freeze = _load_json(run_dir / "freeze.json")
+        if int(existing_freeze.get("schema_version", 0)) < 3:
+            raise ValueError(
+                "frozen research predates the final-refit protocol; start a new research run"
+            )
+    if int(matrix.get("schema_version", 0)) < 2:
+        if matrix.get("holdout"):
+            raise ValueError("legacy research matrix already contains holdout observations")
+        matrix = {
+            "schema_version": 2,
+            "validation": matrix.get("validation", []),
+            "final_refit": [],
+        }
+        _write_json(run_dir / "matrix.json", matrix)
     try:
         if manifest["status"] not in {"validation_complete", "holdout_failed"}:
             manifest.update(
@@ -355,8 +391,9 @@ def run_m6_research(
             validation_dir = run_dir / "validation"
             write_research_report(validation_result, validation_dir)
             validation_matrix_hash = sha256_json(validation_cells)
+            refit_protocol = final_refit_protocol(config)
             freeze = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "frozen_at": datetime.now(timezone.utc).isoformat(),
                 "config_hash": manifest["config_hash"],
                 "folds_sha256": sha256_file(run_dir / "folds.json"),
@@ -368,6 +405,7 @@ def run_m6_research(
                     "status"
                 ],
                 "holdout_eligible": validation_result["holdout_eligibility"]["eligible"],
+                "final_refit_protocol": refit_protocol,
                 "final_holdout_fold": config.folds[-1].fold_id,
                 "holdout_has_been_read": False,
             }
@@ -413,18 +451,65 @@ def run_m6_research(
         final_fold = fold_plans[-1]
         if final_fold["fold_id"] != freeze["final_holdout_fold"]:
             raise ValueError("final fold differs from frozen holdout fold")
+        expected_refit_protocol = final_refit_protocol(config)
+        if freeze.get("final_refit_protocol") != expected_refit_protocol:
+            raise ValueError("final refit protocol differs from the frozen plan")
         manifest.update(
             {
                 "status": "running",
-                "phase": "final_holdout",
+                "phase": "final_refit",
                 "holdout_unlocked": True,
                 "holdout_unlocked_at": datetime.now(timezone.utc).isoformat(),
             }
         )
+        if not freeze.get("holdout_has_been_read", False):
+            freeze.update(
+                {
+                    "holdout_has_been_read": True,
+                    "holdout_read_started_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            _write_json(freeze_path, freeze)
+            manifest["freeze_sha256"] = sha256_file(freeze_path)
+        _write_json(run_dir / "manifest.json", manifest)
+        final_refit_plan = refit_builder(config, final_fold)
+        if final_refit_plan.get("protocol_hash") != expected_refit_protocol[
+            "protocol_hash"
+        ]:
+            raise ValueError("built final refit snapshot does not match frozen protocol")
+        if final_refit_plan.get("fold_id") != final_fold["fold_id"]:
+            raise ValueError("built final refit snapshot has the wrong fold identity")
+        if final_refit_plan.get("training_data_end") != str(
+            config.folds[-1].valid_end
+        ):
+            raise ValueError("built final refit snapshot has the wrong training boundary")
+        if final_refit_plan.get("outer_validation_is_empty") is not True:
+            raise ValueError("built final refit snapshot must have empty outer validation")
+        if final_refit_plan.get("dataset_id") == final_fold["dataset_id"]:
+            raise ValueError("final holdout must use a newly refitted dataset snapshot")
+        final_refit_path = run_dir / "final_refit.json"
+        _write_json(final_refit_path, final_refit_plan)
+        freeze.update(
+            {
+                "final_refit_plan_sha256": sha256_file(final_refit_path),
+                "final_refit_dataset_id": final_refit_plan["dataset_id"],
+            }
+        )
+        _write_json(freeze_path, freeze)
+        manifest.update(
+            {
+                "final_refit_dataset_id": final_refit_plan["dataset_id"],
+                "final_refit_training_data_end": final_refit_plan[
+                    "training_data_end"
+                ],
+                "final_refit_plan_sha256": sha256_file(final_refit_path),
+                "freeze_sha256": sha256_file(freeze_path),
+            }
+        )
         _write_json(run_dir / "manifest.json", manifest)
         holdout_cells = _run_matrix_phase(
-            phase="holdout",
-            fold_plans=[final_fold],
+            phase="final_refit",
+            fold_plans=[final_refit_plan],
             config=config,
             model_paths=model_paths,
             run_dir=run_dir,
@@ -440,12 +525,26 @@ def run_m6_research(
             evaluation_split="test",
             fold_ids=[final_fold["fold_id"]],
         )
+        holdout_result["final_refit"] = {
+            "dataset_id": final_refit_plan["dataset_id"],
+            "dataset_manifest_sha256": final_refit_plan[
+                "dataset_manifest_sha256"
+            ],
+            "protocol_hash": final_refit_plan["protocol_hash"],
+            "training_data_end": final_refit_plan["training_data_end"],
+            "outer_validation_is_empty": True,
+            "source_validation_dataset_id": final_refit_plan[
+                "source_validation_dataset_id"
+            ],
+        }
         write_research_report(holdout_result, run_dir / "holdout")
         freeze.update(
             {
                 "holdout_has_been_read": True,
-                "holdout_read_at": datetime.now(timezone.utc).isoformat(),
+                "holdout_read_completed_at": datetime.now(timezone.utc).isoformat(),
                 "holdout_matrix_hash": sha256_json(holdout_cells),
+                "final_refit_plan_sha256": sha256_file(final_refit_path),
+                "final_refit_dataset_id": final_refit_plan["dataset_id"],
                 "holdout_research_sha256": sha256_file(
                     run_dir / "holdout" / "research.json"
                 ),
@@ -469,7 +568,7 @@ def run_m6_research(
         phase = str(manifest.get("phase", "validation"))
         manifest.update(
             {
-                "status": "holdout_failed" if phase == "final_holdout" else "failed",
+                "status": "holdout_failed" if phase == "final_refit" else "failed",
                 "failed_at": datetime.now(timezone.utc).isoformat(),
                 "error": {"type": type(exc).__name__, "message": str(exc)},
             }

@@ -57,6 +57,8 @@ class M6ResearchConfig(StrictModel):
             raise ValueError("research fold_id values must be unique")
         if self.non_overlapping_offset >= self.non_overlapping_stride:
             raise ValueError("non_overlapping_offset must be smaller than stride")
+        if any(fold.train_end >= fold.valid_end for fold in self.folds):
+            raise ValueError("research folds require train_end < valid_end")
         for previous, current in zip(self.folds, self.folds[1:], strict=False):
             if not previous.train_end < current.train_end:
                 raise ValueError("fold train_end values must strictly expand")

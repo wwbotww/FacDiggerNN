@@ -158,6 +158,26 @@ def test_embargo_skips_configured_sessions() -> None:
     ).is_empty()
 
 
+def test_equal_train_and_valid_boundary_creates_final_refit_split() -> None:
+    bars, universe = synthetic_frames(70)
+    labels = build_forward_excess_return_labels(
+        validate_bars(bars), validate_universe(universe), horizon=5
+    )
+    calendar = sessions(70)
+    split = SplitConfig(
+        train_end=calendar[45],
+        valid_end=calendar[45],
+        test_end=calendar[65],
+        embargo_sessions=2,
+    )
+
+    assigned = assign_chronological_splits(labels, calendar, split)
+
+    assert assigned.filter(pl.col("split") == "valid").is_empty()
+    assert assigned.filter(pl.col("split") == "train")["label_end"].max() <= calendar[45]
+    assert assigned.filter(pl.col("split") == "test")["asof_date"].min() == calendar[48]
+
+
 def test_delisting_return_is_included_in_overlapping_label() -> None:
     bars, universe = synthetic_frames(30)
     calendar = sessions(30)

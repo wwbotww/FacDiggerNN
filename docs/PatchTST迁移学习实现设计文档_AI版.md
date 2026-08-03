@@ -417,8 +417,11 @@ finetune:
 7.  运行E3：仅在 Train 上继续预训练，再以同一 inner-selection 微调协议训练。
 8.  M6 walk-forward：先 preflight，再运行 validation 矩阵，验证日期/样本数/seed 完整性，
     执行单侧 HAC、Holm 和非重叠稳健性门禁，最后冻结配置、报告哈希与 holdout eligibility。
-9.  独立回放与评价：从 checkpoint 重建模型；test/final holdout 仅在 validation `go`、冻结
-    哈希复核通过且显式解封后执行。
+9.  Final refit 与评价：仅在 validation `go`、冻结哈希复核通过且显式解封后，使用截至最后
+    validation 边界的全部 official Train 重新拟合 scaler 和 E0—E3；refit snapshot 的 outer
+    validation 为空，Train 内 selection 规则不变，且 final holdout 样本键必须与冻结 fold
+    完全一致。
+10. 独立回放：从 final-refit checkpoint 重建模型并核对 score、dataset 和配置哈希。
 
 # 9. 评估与模型选择
 

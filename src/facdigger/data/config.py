@@ -64,8 +64,8 @@ class SplitConfig(StrictModel):
 
     @model_validator(mode="after")
     def dates_are_chronological(self) -> SplitConfig:
-        if not self.train_end < self.valid_end < self.test_end:
-            raise ValueError("split dates must satisfy train_end < valid_end < test_end")
+        if not self.train_end <= self.valid_end < self.test_end:
+            raise ValueError("split dates must satisfy train_end <= valid_end < test_end")
         return self
 
 

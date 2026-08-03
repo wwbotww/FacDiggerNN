@@ -8,7 +8,11 @@ import polars as pl
 import yaml
 
 from facdigger.research.config import M6ResearchConfig
-from facdigger.research.folds import build_walk_forward_snapshots
+from facdigger.research.folds import (
+    build_final_refit_snapshot,
+    build_walk_forward_snapshots,
+    final_refit_protocol,
+)
 
 
 def _sessions(count: int) -> list[date]:
@@ -119,3 +123,24 @@ def test_walk_forward_rebuilds_fold_specific_content_addressed_snapshots(tmp_pat
         manifest = json.loads((root / "manifest.json").read_text())
         assert manifest["config"]["split"]["train_end"] == configured.train_end.isoformat()
         assert (root / "scaler.json").is_file()
+
+    protocol = final_refit_protocol(config)
+    refit = build_final_refit_snapshot(config, first[-1])
+    refit_root = Path(refit["dataset_path"])
+    refit_manifest = json.loads((refit_root / "manifest.json").read_text())
+
+    assert refit["protocol_hash"] == protocol["protocol_hash"]
+    assert refit["dataset_id"] != first[-1]["dataset_id"]
+    assert refit["training_data_end"] == config.folds[-1].valid_end.isoformat()
+    assert refit["outer_validation_is_empty"] is True
+    assert refit["split_counts"].get("valid", 0) == 0
+    validation_test_rows = pl.read_parquet(
+        Path(first[-1]["dataset_path"]) / "sample_index.parquet"
+    ).filter(pl.col("split") == "test").height
+    assert refit["holdout_rows"] == validation_test_rows
+    assert refit_manifest["config"]["split"]["train_end"] == refit[
+        "training_data_end"
+    ]
+    assert refit_manifest["config"]["split"]["valid_end"] == refit[
+        "training_data_end"
+    ]
