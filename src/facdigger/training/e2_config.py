@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
 
 from facdigger.data.config import DEFAULT_CHANNELS, StrictModel
 from facdigger.training.e1_config import RandomPatchTSTConfig
+from facdigger.training.ranking import CrossSectionalRankingConfig
 
 
 class E2SourceConfig(StrictModel):
@@ -35,6 +36,9 @@ class E2FineTuneConfig(StrictModel):
     device: Literal["auto", "cpu", "cuda"] = "auto"
     precision: Literal["fp32", "fp16"] = "fp16"
     num_workers: int = Field(default=0, ge=0)
+    objective: CrossSectionalRankingConfig = Field(
+        default_factory=CrossSectionalRankingConfig
+    )
 
     @model_validator(mode="after")
     def validate_stages(self) -> E2FineTuneConfig:
@@ -44,6 +48,10 @@ class E2FineTuneConfig(StrictModel):
             raise ValueError("minimum_epochs must include at least one FT-1 epoch")
         if self.minimum_epochs > self.max_epochs:
             raise ValueError("minimum_epochs cannot exceed max_epochs")
+        if self.objective.minimum_cross_section_size > (self.batch_size + 1) // 2:
+            raise ValueError(
+                "minimum_cross_section_size cannot exceed half of training batch_size"
+            )
         return self
 
 

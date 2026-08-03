@@ -83,6 +83,11 @@ def _config(tmp_path) -> E1ExperimentConfig:
                 "gradient_accumulation_steps": 2,
                 "device": "cpu",
                 "precision": "fp32",
+                "objective": {
+                    "minimum_cross_section_size": 2,
+                    "minimum_selection_dates": 2,
+                    "minimum_selection_coverage": 1.0,
+                },
             },
         }
     )
@@ -125,3 +130,33 @@ def test_epoch_resume_matches_uninterrupted_training(tmp_path) -> None:
     assert resumed_audit["resumed_from_epoch"] == 1
     for name, value in full["model_state"].items():
         torch.testing.assert_close(value, resumed["model_state"][name], rtol=0, atol=0)
+
+
+def test_huber_checkpoint_cannot_resume_into_ranking_protocol(tmp_path) -> None:
+    train_dataset, valid_dataset = _datasets()
+    config = _config(tmp_path)
+    checkpoint_dir = tmp_path / "legacy"
+    train_e1(
+        config,
+        train_dataset=train_dataset,
+        valid_dataset=valid_dataset,
+        dataset_id="tiny-dataset",
+        checkpoint_dir=checkpoint_dir,
+        stop_after_epoch=1,
+    )
+    legacy = torch.load(
+        checkpoint_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+    legacy["schema_version"] = 1
+    legacy.pop("objective")
+    torch.save(legacy, checkpoint_dir / "legacy.pt")
+
+    with pytest.raises(ValueError, match="predates the cross-sectional ranking"):
+        train_e1(
+            config,
+            train_dataset=train_dataset,
+            valid_dataset=valid_dataset,
+            dataset_id="tiny-dataset",
+            checkpoint_dir=checkpoint_dir,
+            resume_from=checkpoint_dir / "legacy.pt",
+        )

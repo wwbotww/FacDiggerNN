@@ -57,3 +57,9 @@ training:
   device: auto
   precision: fp16
   num_workers: 0
+  objective:
+    name: cross_sectional_rank_correlation_surrogate_v1
+    epsilon: 0.000001
+    minimum_cross_section_size: 32
+    minimum_selection_dates: 20
+    minimum_selection_coverage: 0.99

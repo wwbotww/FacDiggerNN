@@ -393,10 +393,10 @@ window_length == 512
 
 ### 8.2 两种采样器
 
-- `SequenceSampler`：随机抽股票—日期，供 masked pretraining 和 Huber 预热使用；
-- `DateGroupedSampler`：先抽日期，再抽该日股票，供横截面 Rank IC loss 使用。
+- `SequenceSampler`：随机抽股票—日期，只供 masked reconstruction 使用；
+- `DateGroupedSampler`：按日期分组并均衡切块，任何 batch 不得跨日期，用于横截面 Rank IC 代理。
 
-横截面 loss 的 batch 中必须有足够股票。若某日有效样本少于 `min_cross_section=64`，该日不进入 rank loss，但可以进入 Huber loss。
+正式监督配置要求 `minimum_cross_section_size=32`。日期不足门槛时明确失败；大日期均衡切成不超过 64 只股票的块，不丢弃余数，也不与下一日期拼接。
 
 ## 9. 模型实现
 
@@ -508,19 +508,14 @@ checkpoint 选择分两层：重建 loss 用于训练早停；在固定的小型
 | FT-1 | 解冻最后 1 block | 训练 | 10—20 epoch，encoder 1e-5 / head 3e-4 |
 | FT-2 | 全解冻 | 训练 | 仅验证集持续改善时启用，encoder 5e-6 |
 
-MVP loss：
+当前监督 loss：
 
 ```text
-L = Huber(y_hat, y)
+target_rank = average_rank_percentile_by_date(y) mapped to [-1, 1]
+L = 1 - Pearson(score, target_rank)
 ```
 
-闭环稳定后的第二实验：
-
-```text
-L = 0.5 * Huber + 0.5 * (1 - differentiable_corr_by_date)
-```
-
-不建议一开始直接优化 Spearman 排名：排序不可微近似更复杂，也更依赖日期分组 batch，容易把数据/训练问题混在一起。
+预测分数不做硬排序，以保留梯度；相关性在 Float32 中计算。训练 loss 是小横截面代理，checkpoint 选择独立使用完整 inner-selection 的日期等权真实 Spearman Rank IC。E3 masked reconstruction 的 Huber/MSE 保留，不能与下游监督目标混淆。
 
 ## 10. 实验矩阵
 

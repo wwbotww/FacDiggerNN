@@ -14,7 +14,18 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+from facdigger.datasets.sampler import DateGroupedBatchSampler
 from facdigger.training.e0_config import LightGBMBaselineConfig, MLPBaselineConfig
+from facdigger.training.ranking import (
+    RANKING_OBJECTIVE,
+    TARGET_TRANSFORM,
+    CrossSectionalRankingConfig,
+    contiguous_group_sizes,
+    cross_sectional_rank_correlation_loss,
+    cross_sectional_rank_targets,
+    grouped_rank_ic_audit,
+    lightgbm_relevance_grades,
+)
 
 
 def build_multiscale_features(
@@ -239,14 +250,16 @@ def train_mlp(
     train_y: np.ndarray,
     valid_x: np.ndarray,
     valid_y: np.ndarray,
+    train_dates: list[Any],
+    valid_dates: list[Any],
     *,
     config: MLPBaselineConfig,
+    objective: CrossSectionalRankingConfig,
     seed: int,
     checkpoint_path: Path,
     preprocessing: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
     import torch
-    from torch import nn
     from torch.utils.data import DataLoader, TensorDataset
 
     random.seed(seed)
@@ -264,44 +277,76 @@ def train_mlp(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
-    loss_function = nn.HuberLoss()
-    generator = torch.Generator().manual_seed(seed)
-    loader = DataLoader(
-        TensorDataset(torch.from_numpy(train_x), torch.from_numpy(train_y.astype(np.float32))),
+    train_target_ranks = cross_sectional_rank_targets(
+        train_y,
+        train_dates,
+        minimum_cross_section_size=objective.minimum_cross_section_size,
+    )
+    sampler = DateGroupedBatchSampler(
+        train_dates,
         batch_size=config.batch_size,
         shuffle=True,
-        generator=generator,
+        seed=seed,
+        minimum_group_size=objective.minimum_cross_section_size,
+    )
+    loader = DataLoader(
+        TensorDataset(torch.from_numpy(train_x), torch.from_numpy(train_target_ranks)),
+        batch_sampler=sampler,
         num_workers=0,
     )
     valid_features = torch.from_numpy(valid_x).to(device)
-    valid_targets = torch.from_numpy(valid_y.astype(np.float32)).to(device)
-    best_loss = float("inf")
+    best_rank_ic = float("-inf")
+    best_selection_audit: dict[str, Any] = {}
     best_epoch = 0
     best_state: dict[str, Any] | None = None
     history: list[dict[str, float | int]] = []
     stale_epochs = 0
     for epoch in range(1, config.max_epochs + 1):
+        sampler.set_epoch(epoch)
         model.train()
         total_loss = 0.0
-        total_rows = 0
-        for batch_x, batch_y in loader:
+        total_batches = 0
+        total_score_std = 0.0
+        for batch_x, batch_target_rank in loader:
             batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
+            batch_target_rank = batch_target_rank.to(device)
             optimizer.zero_grad(set_to_none=True)
             prediction = model(batch_x).squeeze(-1)
-            loss = loss_function(prediction, batch_y)
+            loss = cross_sectional_rank_correlation_loss(
+                prediction, batch_target_rank, epsilon=objective.epsilon
+            )
             loss.backward()
             optimizer.step()
-            total_loss += float(loss.detach().cpu()) * len(batch_y)
-            total_rows += len(batch_y)
+            total_loss += float(loss.detach().cpu())
+            total_batches += 1
+            total_score_std += float(prediction.detach().float().std(unbiased=False).cpu())
         model.eval()
         with torch.no_grad():
             valid_prediction = model(valid_features).squeeze(-1)
-            valid_loss = float(loss_function(valid_prediction, valid_targets).cpu())
-        train_loss = total_loss / max(total_rows, 1)
-        history.append({"epoch": epoch, "train_loss": train_loss, "valid_loss": valid_loss})
-        if valid_loss < best_loss - 1e-12:
-            best_loss = valid_loss
+        selection = grouped_rank_ic_audit(
+            valid_prediction.detach().float().cpu().numpy(),
+            valid_y,
+            valid_dates,
+            minimum_cross_section_size=objective.minimum_cross_section_size,
+            minimum_dates=objective.minimum_selection_dates,
+            minimum_coverage=objective.minimum_selection_coverage,
+        )
+        selection_rank_ic = float(selection["mean_rank_ic"])
+        train_loss = total_loss / max(total_batches, 1)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_score_std": total_score_std / max(total_batches, 1),
+                "selection_mean_rank_ic": selection_rank_ic,
+                "selection_valid_dates": selection["valid_dates"],
+                "selection_skipped_dates": selection["skipped_dates"],
+                "selection_score_std": selection["score_std"],
+            }
+        )
+        if selection_rank_ic > best_rank_ic + 1e-12:
+            best_rank_ic = selection_rank_ic
+            best_selection_audit = selection
             best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
             stale_epochs = 0
@@ -315,22 +360,29 @@ def train_mlp(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            "schema_version": 2,
             "model_type": "mlp",
+            "objective": RANKING_OBJECTIVE,
+            "target_transform": TARGET_TRANSFORM,
             "input_dim": train_x.shape[1],
             "hidden_dims": config.hidden_dims,
             "dropout": config.dropout,
             "state_dict": best_state,
             "preprocessing": preprocessing,
             "best_epoch": best_epoch,
-            "best_valid_loss": best_loss,
+            "best_selection_rank_ic": best_rank_ic,
+            "best_selection_audit": best_selection_audit,
             "seed": seed,
         },
         checkpoint_path,
     )
     return model, {
         "device": device,
+        "objective": RANKING_OBJECTIVE,
+        "target_transform": TARGET_TRANSFORM,
         "best_epoch": best_epoch,
-        "best_valid_loss": best_loss,
+        "best_selection_rank_ic": best_rank_ic,
+        "best_selection_audit": best_selection_audit,
         "epochs_ran": len(history),
         "history": history,
     }
@@ -408,6 +460,8 @@ def train_lightgbm(
     valid_x: np.ndarray,
     valid_y: np.ndarray,
     evaluation_x: np.ndarray,
+    train_dates: list[Any] | None = None,
+    valid_dates: list[Any] | None = None,
     *,
     config: LightGBMBaselineConfig,
     seed: int,
@@ -420,12 +474,28 @@ def train_lightgbm(
 
     with tempfile.TemporaryDirectory(prefix="facdigger-lgb-train-") as temporary:
         root = Path(temporary)
+        resolved_train_dates = train_dates or ["train"] * len(train_y)
+        resolved_valid_dates = valid_dates or ["valid"] * len(valid_y)
+        train_target_rank_values = cross_sectional_rank_targets(
+            train_y,
+            resolved_train_dates,
+            minimum_cross_section_size=2,
+        )
+        valid_target_rank_values = cross_sectional_rank_targets(
+            valid_y,
+            resolved_valid_dates,
+            minimum_cross_section_size=2,
+        )
         paths = {
             "train_x": root / "train_x.npy",
             "train_y": root / "train_y.npy",
             "valid_x": root / "valid_x.npy",
             "valid_y": root / "valid_y.npy",
             "evaluation_x": root / "evaluation_x.npy",
+            "train_target_rank": root / "train_target_rank.npy",
+            "valid_target_rank": root / "valid_target_rank.npy",
+            "train_group": root / "train_group.npy",
+            "valid_group": root / "valid_group.npy",
         }
         for name, values in {
             "train_x": train_x,
@@ -433,8 +503,24 @@ def train_lightgbm(
             "valid_x": valid_x,
             "valid_y": valid_y,
             "evaluation_x": evaluation_x,
+            "train_target_rank": train_target_rank_values,
+            "valid_target_rank": valid_target_rank_values,
+            "train_group": contiguous_group_sizes(resolved_train_dates),
+            "valid_group": contiguous_group_sizes(resolved_valid_dates),
         }.items():
             np.save(paths[name], values)
+        np.save(
+            paths["train_y"],
+            lightgbm_relevance_grades(
+                train_target_rank_values, bins=config.relevance_bins
+            ),
+        )
+        np.save(
+            paths["valid_y"],
+            lightgbm_relevance_grades(
+                valid_target_rank_values, bins=config.relevance_bins
+            ),
+        )
         return train_lightgbm_from_files(
             **paths,
             config=config,
@@ -450,6 +536,10 @@ def train_lightgbm_from_files(
     train_y: Path,
     valid_x: Path,
     valid_y: Path,
+    train_target_rank: Path,
+    valid_target_rank: Path,
+    train_group: Path,
+    valid_group: Path,
     evaluation_x: Path,
     config: LightGBMBaselineConfig,
     seed: int,
@@ -480,6 +570,14 @@ def train_lightgbm_from_files(
                 str(valid_x),
                 "--valid-y",
                 str(valid_y),
+                "--train-target-rank",
+                str(train_target_rank),
+                "--valid-target-rank",
+                str(valid_target_rank),
+                "--train-group",
+                str(train_group),
+                "--valid-group",
+                str(valid_group),
                 "--evaluation-x",
                 str(evaluation_x),
                 "--config",

@@ -30,12 +30,14 @@ def test_lightgbm_checkpoint_replay_matches_training_scores(tmp_path: Path) -> N
         early_stopping_rounds=3,
     )
 
-    original, _ = train_lightgbm(
+    original, audit = train_lightgbm(
         train_x,
         train_y,
         valid_x,
         valid_y,
         evaluation_x,
+        train_dates=[f"d{index // 10}" for index in range(len(train_y))],
+        valid_dates=[f"v{index // 4}" for index in range(len(valid_y))],
         config=config,
         seed=42,
         checkpoint_path=checkpoint,
@@ -48,3 +50,7 @@ def test_lightgbm_checkpoint_replay_matches_training_scores(tmp_path: Path) -> N
     replayed = predict_lightgbm_checkpoint(checkpoint, evaluation_x)
 
     np.testing.assert_allclose(replayed, original, rtol=0, atol=0)
+    assert audit["objective"] == "lambdarank"
+    assert audit["checkpoint_metric"] == "mean_daily_spearman_rank_ic"
+    assert audit["train_groups"] == 4
+    assert audit["valid_groups"] == 3

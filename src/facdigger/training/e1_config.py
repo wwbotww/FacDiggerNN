@@ -9,6 +9,7 @@ import yaml
 from pydantic import Field, model_validator
 
 from facdigger.data.config import DEFAULT_CHANNELS, StrictModel
+from facdigger.training.ranking import CrossSectionalRankingConfig
 
 
 class RandomPatchTSTConfig(StrictModel):
@@ -48,6 +49,9 @@ class E1TrainingConfig(StrictModel):
     precision: Literal["fp32", "fp16"] = "fp16"
     num_workers: int = Field(default=0, ge=0)
     minimum_epochs: int = Field(default=1, ge=1)
+    objective: CrossSectionalRankingConfig = Field(
+        default_factory=CrossSectionalRankingConfig
+    )
 
 
 class E1ExperimentConfig(StrictModel):
@@ -69,6 +73,12 @@ class E1ExperimentConfig(StrictModel):
             raise ValueError("evaluation_split=test requires unlock_test=true")
         if self.training.minimum_epochs > self.training.max_epochs:
             raise ValueError("minimum_epochs cannot exceed max_epochs")
+        if self.training.objective.minimum_cross_section_size > (
+            self.training.batch_size + 1
+        ) // 2:
+            raise ValueError(
+                "minimum_cross_section_size cannot exceed half of training batch_size"
+            )
         if any(cost < 0 for cost in self.costs_bps):
             raise ValueError("costs_bps cannot be negative")
         return self

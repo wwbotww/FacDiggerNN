@@ -289,7 +289,7 @@ model = FinancialAlphaModel(target_backbone, AlphaHead(...))
 
 ## 5.4 Alpha微调
 
-AlphaHead 对编码器输出做patch维平均池化，再做通道融合，最后由两层MLP输出单个分数。首版先用Huber回归保证训练稳定；第二阶段再增加按日期分组的Rank IC损失。
+AlphaHead 对编码器输出做patch维平均池化，再做通道融合，最后由两层MLP输出单个分数。当前监督协议直接面向横截面排序：完整日期内 target 先按 average ties 映射为 `[-1, 1]` 的 percentile rank，训练优化 `1 - corr(score, target_rank)`；batch 不得混合日期，best checkpoint 按完整 inner-selection 的逐日真实 Spearman Rank IC 均值选择。该损失是可微 Rank IC 代理，不对预测分数做不可导硬排序。
 
 ```pseudocode
 encoder output: H in [B, C, N_patch, D] (adapter also accepts [B, N_patch, D])
@@ -395,7 +395,8 @@ pretrain:
   learning_rate: 1.0e-4
 finetune:
   horizon: 5
-  loss: huber
+  objective: cross_sectional_rank_correlation_surrogate_v1
+  minimum_cross_section_size: 32
   selection_fraction: 0.10
   encoder_learning_rate: 1.0e-5
   head_learning_rate: 3.0e-4
@@ -420,7 +421,7 @@ finetune:
 
 | **层级** | **指标**                                | **用途**                             |
 |----------|-----------------------------------------|--------------------------------------|
-| 训练     | masked reconstruction loss / Huber loss | 诊断优化是否正常，不作为最终结论     |
+| 训练     | masked reconstruction / rank-correlation surrogate | 诊断优化是否正常，不作为最终结论 |
 | 预测     | MAE、MSE、方向准确率                    | 辅助观察；金融收益尺度下不可单独决策 |
 | 因子     | Daily IC、Rank IC、ICIR、正IC占比       | 主要模型选择指标                     |
 | 分层     | Q5-Q1收益、单调性、覆盖率               | 验证分数是否具有经济排序意义         |

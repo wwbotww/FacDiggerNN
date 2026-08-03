@@ -16,19 +16,35 @@ class DateGroupedBatchSampler:
         batch_size: int,
         shuffle: bool,
         seed: int,
+        minimum_group_size: int = 1,
         drop_last: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        if minimum_group_size < 1:
+            raise ValueError("minimum_group_size must be positive")
+        if minimum_group_size > (batch_size + 1) // 2:
+            raise ValueError(
+                "minimum_group_size cannot exceed half of batch_size for balanced chunks"
+            )
+        if drop_last:
+            raise ValueError("DateGroupedBatchSampler cannot drop cross-sectional rows")
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = seed
+        self.minimum_group_size = minimum_group_size
         self.drop_last = drop_last
         self.epoch = 0
         grouped: OrderedDict[Any, list[int]] = OrderedDict()
         for index, asof_date in enumerate(asof_dates):
             grouped.setdefault(asof_date, []).append(index)
         self.groups = list(grouped.values())
+        undersized = [len(group) for group in self.groups if len(group) < minimum_group_size]
+        if undersized:
+            raise ValueError(
+                "date group is smaller than minimum_group_size: "
+                f"{min(undersized)} < {minimum_group_size}"
+            )
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -47,22 +63,20 @@ class DateGroupedBatchSampler:
             for group in groups:
                 generator.shuffle(group)
         batches: list[list[int]] = []
-        current: list[int] = []
         for group in groups:
-            chunks = [
-                group[start : start + self.batch_size]
-                for start in range(0, len(group), self.batch_size)
-            ]
-            for chunk in chunks:
-                if current and len(current) + len(chunk) > self.batch_size:
-                    batches.append(current)
-                    current = []
-                current.extend(chunk)
-                if len(current) == self.batch_size:
-                    batches.append(current)
-                    current = []
-        if current and not self.drop_last:
-            batches.append(current)
+            chunk_count = (len(group) + self.batch_size - 1) // self.batch_size
+            base_size, larger_chunks = divmod(len(group), chunk_count)
+            if base_size < self.minimum_group_size:
+                raise ValueError(
+                    "date group cannot be split without exceeding batch_size or violating "
+                    "minimum_group_size"
+                )
+            start = 0
+            for chunk_index in range(chunk_count):
+                size = base_size + (1 if chunk_index < larger_chunks else 0)
+                chunk = group[start : start + size]
+                start += size
+                batches.append(chunk)
         return batches
 
     def __iter__(self) -> Iterator[list[int]]:

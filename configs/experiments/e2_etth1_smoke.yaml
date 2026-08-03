@@ -55,3 +55,9 @@ training:
   device: cpu
   precision: fp32
   num_workers: 0
+  objective:
+    name: cross_sectional_rank_correlation_surrogate_v1
+    epsilon: 0.000001
+    minimum_cross_section_size: 2
+    minimum_selection_dates: 2
+    minimum_selection_coverage: 1.0

@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch import nn
 
 from facdigger.datasets.sampler import DateGroupedBatchSampler
 from facdigger.datasets.window import SnapshotWindowDataset
@@ -22,11 +21,16 @@ from facdigger.training.e1_engine import (
     _loader,
     _restore_rng_state,
     _rng_state,
-    evaluate_e1_loss,
+    evaluate_e1_selection,
     seed_everything,
     select_device,
 )
 from facdigger.training.e2_config import E2ExperimentConfig
+from facdigger.training.ranking import (
+    RANKING_OBJECTIVE,
+    TARGET_TRANSFORM,
+    cross_sectional_rank_targets,
+)
 
 Initializer = Callable[[], tuple[PatchTSTAlphaModel, dict[str, Any]]]
 
@@ -83,7 +87,8 @@ def _save_checkpoint(
     scaler: torch.amp.GradScaler,
     epoch: int,
     global_step: int,
-    best_valid_loss: float,
+    best_selection_rank_ic: float,
+    best_selection_audit: dict[str, Any],
     best_epoch: int,
     stale_epochs: int,
     history: list[dict[str, Any]],
@@ -98,15 +103,18 @@ def _save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "experiment_family": "e2",
+            "objective": RANKING_OBJECTIVE,
+            "target_transform": TARGET_TRANSFORM,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "scaler_state": scaler.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
-            "best_valid_loss": best_valid_loss,
+            "best_selection_rank_ic": best_selection_rank_ic,
+            "best_selection_audit": best_selection_audit,
             "best_epoch": best_epoch,
             "stale_epochs": stale_epochs,
             "history": history,
@@ -172,19 +180,23 @@ def train_e2(
         shuffle=True,
         seed=config.seed,
         num_workers=config.training.num_workers,
+        minimum_group_size=config.training.objective.minimum_cross_section_size,
     )
-    valid_loader, _ = _loader(
-        valid_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        seed=config.seed,
-        num_workers=config.training.num_workers,
+    train_target_ranks = torch.from_numpy(
+        cross_sectional_rank_targets(
+            train_dataset.sample_rows["target"].to_numpy(),
+            train_dataset.asof_dates,
+            minimum_cross_section_size=(
+                config.training.objective.minimum_cross_section_size
+            ),
+        )
     )
     config_payload = config.model_dump(mode="json")
     protocol_hash = sha256_json(config_payload)
     start_epoch = 1
     global_step = 0
-    best_valid_loss = float("inf")
+    best_selection_rank_ic = float("-inf")
+    best_selection_audit: dict[str, Any] = {}
     best_epoch = 0
     stale_epochs = 0
     history: list[dict[str, Any]] = []
@@ -192,6 +204,12 @@ def train_e2(
     resumed_from_epoch: int | None = None
     if resume_from is not None:
         checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
+        if checkpoint.get("schema_version") != 2 or checkpoint.get("objective") != (
+            RANKING_OBJECTIVE
+        ):
+            raise ValueError(
+                "resume checkpoint predates the cross-sectional ranking protocol"
+            )
         if checkpoint.get("experiment_family") != "e2":
             raise ValueError("resume checkpoint is not an E2 checkpoint")
         if checkpoint["dataset_id"] != dataset_id:
@@ -207,7 +225,8 @@ def train_e2(
         scaler.load_state_dict(checkpoint["scaler_state"])
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(checkpoint["global_step"])
-        best_valid_loss = float(checkpoint["best_valid_loss"])
+        best_selection_rank_ic = float(checkpoint["best_selection_rank_ic"])
+        best_selection_audit = dict(checkpoint["best_selection_audit"])
         best_epoch = int(checkpoint["best_epoch"])
         stale_epochs = int(checkpoint["stale_epochs"])
         history = list(checkpoint["history"])
@@ -216,7 +235,6 @@ def train_e2(
         _restore_rng_state(checkpoint["rng_state"])
         resumed_from_epoch = int(checkpoint["epoch"])
 
-    loss_function = nn.HuberLoss()
     last_checkpoint = checkpoint_dir / "last.pt"
     best_checkpoint = checkpoint_dir / "best.pt"
     for epoch in range(start_epoch, config.training.max_epochs + 1):
@@ -229,18 +247,21 @@ def train_e2(
         stage_step_captured = False
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
-        total_rows = 0
+        total_batches = 0
+        total_score_std = 0.0
         for batch_index, batch in enumerate(train_loader, start=1):
-            _, loss = _forward_loss(
+            score, loss = _forward_loss(
                 model,
                 batch,
                 device=device,
-                loss_function=loss_function,
+                target_rank_lookup=train_target_ranks,
+                epsilon=config.training.objective.epsilon,
                 amp_enabled=amp_enabled,
             )
             scaler.scale(loss / config.training.gradient_accumulation_steps).backward()
-            total_loss += float(loss.detach().cpu()) * len(batch["target"])
-            total_rows += len(batch["target"])
+            total_loss += float(loss.detach().cpu())
+            total_batches += 1
+            total_score_std += float(score.detach().float().std(unbiased=False).cpu())
             should_step = (
                 batch_index % config.training.gradient_accumulation_steps == 0
                 or batch_index == len(train_loader)
@@ -279,12 +300,26 @@ def train_e2(
                     }
                     stage_step_captured = True
 
-        train_loss = total_loss / max(total_rows, 1)
-        valid_loss = evaluate_e1_loss(model, valid_loader, device=device, amp_enabled=amp_enabled)
+        train_loss = total_loss / max(total_batches, 1)
+        selection = evaluate_e1_selection(
+            model,
+            valid_dataset,
+            batch_size=config.training.batch_size,
+            device=device,
+            precision=config.training.precision,
+            num_workers=config.training.num_workers,
+            minimum_cross_section_size=(
+                config.training.objective.minimum_cross_section_size
+            ),
+            minimum_dates=config.training.objective.minimum_selection_dates,
+            minimum_coverage=config.training.objective.minimum_selection_coverage,
+        )
+        selection_rank_ic = float(selection["mean_rank_ic"])
         scheduler.step()
-        improved = valid_loss < best_valid_loss - 1e-12
+        improved = selection_rank_ic > best_selection_rank_ic + 1e-12
         if improved:
-            best_valid_loss = valid_loss
+            best_selection_rank_ic = selection_rank_ic
+            best_selection_audit = selection
             best_epoch = epoch
             stale_epochs = 0
         else:
@@ -294,7 +329,11 @@ def train_e2(
                 "epoch": epoch,
                 "stage": stage_name,
                 "train_loss": train_loss,
-                "valid_loss": valid_loss,
+                "train_score_std": total_score_std / max(total_batches, 1),
+                "selection_mean_rank_ic": selection_rank_ic,
+                "selection_valid_dates": selection["valid_dates"],
+                "selection_skipped_dates": selection["skipped_dates"],
+                "selection_score_std": selection["score_std"],
                 "encoder_learning_rate": optimizer.param_groups[0]["lr"],
                 "head_learning_rate": optimizer.param_groups[1]["lr"],
                 "global_step": global_step,
@@ -309,7 +348,8 @@ def train_e2(
             "scaler": scaler,
             "epoch": epoch,
             "global_step": global_step,
-            "best_valid_loss": best_valid_loss,
+            "best_selection_rank_ic": best_selection_rank_ic,
+            "best_selection_audit": best_selection_audit,
             "best_epoch": best_epoch,
             "stale_epochs": stale_epochs,
             "history": history,
@@ -338,8 +378,11 @@ def train_e2(
         "device": device,
         "amp_enabled": amp_enabled,
         "precision": "fp16" if amp_enabled else "fp32",
+        "objective": RANKING_OBJECTIVE,
+        "target_transform": TARGET_TRANSFORM,
         "best_epoch": best_epoch,
-        "best_valid_loss": best_valid_loss,
+        "best_selection_rank_ic": best_selection_rank_ic,
+        "best_selection_audit": best_selection_audit,
         "epochs_completed": history[-1]["epoch"] if history else start_epoch - 1,
         "global_step": global_step,
         "resumed_from_epoch": resumed_from_epoch,

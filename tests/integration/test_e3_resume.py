@@ -92,6 +92,11 @@ def _config(tmp_path) -> E3ExperimentConfig:
                 "minimum_epochs": 2,
                 "head_only_epochs": 1,
                 "unfreeze_last_n_blocks": 1,
+                "objective": {
+                    "minimum_cross_section_size": 2,
+                    "minimum_selection_dates": 2,
+                    "minimum_selection_coverage": 1.0,
+                },
             },
         }
     )

@@ -9,6 +9,7 @@ import yaml
 from pydantic import Field, model_validator
 
 from facdigger.data.config import DEFAULT_CHANNELS, StrictModel
+from facdigger.training.ranking import CrossSectionalRankingConfig
 
 
 class MLPBaselineConfig(StrictModel):
@@ -29,6 +30,8 @@ class LightGBMBaselineConfig(StrictModel):
     min_child_samples: int = Field(default=20, ge=1)
     reg_lambda: float = Field(default=1.0, ge=0)
     early_stopping_rounds: int = Field(default=30, ge=1)
+    relevance_bins: int = Field(default=20, ge=2, le=256)
+    truncation_level: int = Field(default=100, ge=2)
 
 
 class E0ExperimentConfig(StrictModel):
@@ -45,6 +48,9 @@ class E0ExperimentConfig(StrictModel):
     costs_bps: list[float] = Field(default_factory=lambda: [0.0, 10.0, 20.0, 50.0])
     mlp: MLPBaselineConfig = Field(default_factory=MLPBaselineConfig)
     lightgbm: LightGBMBaselineConfig = Field(default_factory=LightGBMBaselineConfig)
+    objective: CrossSectionalRankingConfig = Field(
+        default_factory=CrossSectionalRankingConfig
+    )
 
     @model_validator(mode="after")
     def validate_protocol(self) -> E0ExperimentConfig:
@@ -56,6 +62,10 @@ class E0ExperimentConfig(StrictModel):
             raise ValueError("windows must be sorted and unique")
         if any(cost < 0 for cost in self.costs_bps):
             raise ValueError("costs_bps cannot be negative")
+        if self.objective.minimum_cross_section_size > (self.mlp.batch_size + 1) // 2:
+            raise ValueError(
+                "minimum_cross_section_size cannot exceed half of MLP batch_size"
+            )
         return self
 
 

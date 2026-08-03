@@ -149,6 +149,11 @@ def test_e2_runner_writes_transfer_training_and_evaluation_artifacts(tmp_path) -
                 "unfreeze_last_n_blocks": 1,
                 "device": "cpu",
                 "precision": "fp32",
+                "objective": {
+                    "minimum_cross_section_size": 2,
+                    "minimum_selection_dates": 2,
+                    "minimum_selection_coverage": 1.0,
+                },
             },
         }
     )

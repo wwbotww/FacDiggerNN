@@ -83,6 +83,11 @@ def _config(tmp_path) -> E2ExperimentConfig:
                 "encoder_learning_rate": 0.0001,
                 "device": "cpu",
                 "precision": "fp32",
+                "objective": {
+                    "minimum_cross_section_size": 2,
+                    "minimum_selection_dates": 2,
+                    "minimum_selection_coverage": 1.0,
+                },
             },
         }
     )

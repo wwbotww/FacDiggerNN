@@ -6,7 +6,7 @@ from datetime import date, timedelta
 import pytest
 
 pl = pytest.importorskip("polars")
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
 from facdigger.data.config import DatasetBuildConfig  # noqa: E402
@@ -111,6 +111,11 @@ def test_e1_run_can_be_reloaded_for_bitwise_replay(tmp_path) -> None:
                 "patience": 1,
                 "device": "cpu",
                 "precision": "fp32",
+                "objective": {
+                    "minimum_cross_section_size": 2,
+                    "minimum_selection_dates": 2,
+                    "minimum_selection_coverage": 1.0,
+                },
             },
         }
     )
@@ -119,6 +124,14 @@ def test_e1_run_can_be_reloaded_for_bitwise_replay(tmp_path) -> None:
     assert run_manifest["supervised_selection_audit"][
         "outer_validation_rows_used_for_checkpoint_selection"
     ] == 0
+    checkpoint = torch.load(
+        run_dir / "checkpoints" / "best.pt", map_location="cpu", weights_only=False
+    )
+    assert checkpoint["schema_version"] == 2
+    assert checkpoint["objective"] == "cross_sectional_rank_correlation_surrogate_v1"
+    assert "best_selection_rank_ic" in checkpoint
+    assert "best_valid_loss" not in checkpoint
+    assert run_manifest["training"]["objective"] == checkpoint["objective"]
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"

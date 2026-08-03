@@ -130,6 +130,11 @@ def _experiment(tmp_path) -> E3ExperimentConfig:
                 "unfreeze_last_n_blocks": 1,
                 "device": "cpu",
                 "precision": "fp32",
+                "objective": {
+                    "minimum_cross_section_size": 2,
+                    "minimum_selection_dates": 2,
+                    "minimum_selection_coverage": 1.0,
+                },
             },
         }
     )

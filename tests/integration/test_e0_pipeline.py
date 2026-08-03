@@ -99,6 +99,11 @@ def test_e0_train_predict_report_pipeline(tmp_path, model_type: str) -> None:
             "model_type": model_type,
             "output_root": tmp_path / "runs",
             "windows": [5, 20],
+            "objective": {
+                "minimum_cross_section_size": 2,
+                "minimum_selection_dates": 2,
+                "minimum_selection_coverage": 1.0,
+            },
             "mlp": {
                 "hidden_dims": [16],
                 "dropout": 0.0,
@@ -138,6 +143,16 @@ def test_e0_train_predict_report_pipeline(tmp_path, model_type: str) -> None:
         "outer_validation_rows_used_for_checkpoint_selection"
     ] == 0
     assert run_manifest["row_counts"]["inner_selection"] > 0
+    assert run_manifest["training"]["objective"] in {
+        "cross_sectional_rank_correlation_surrogate_v1",
+        "lambdarank",
+    }
+    if model_type == "mlp":
+        assert "best_selection_rank_ic" in run_manifest["training"]
+    else:
+        assert run_manifest["training"]["checkpoint_metric"] == (
+            "mean_daily_spearman_rank_ic"
+        )
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"

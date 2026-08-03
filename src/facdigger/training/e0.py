@@ -37,6 +37,11 @@ from facdigger.training.common import (
     split_supervised_training_index,
 )
 from facdigger.training.e0_config import E0ExperimentConfig
+from facdigger.training.ranking import (
+    contiguous_group_sizes,
+    cross_sectional_rank_targets,
+    lightgbm_relevance_grades,
+)
 
 
 def run_e0(
@@ -81,6 +86,7 @@ def run_e0(
         windows=config.windows,
         context_length=context_length,
     )
+    tabular = tabular.sort(["asof_date", "security_id"])
     train_rows = tabular.filter(pl.col("split") == "train_fit")
     valid_rows = tabular.filter(pl.col("split") == "inner_selection")
     evaluation_rows = tabular.filter(pl.col("split") == config.evaluation_split)
@@ -132,7 +138,10 @@ def run_e0(
                 train_y,
                 valid_x,
                 valid_y,
+                train_rows["asof_date"].to_list(),
+                valid_rows["asof_date"].to_list(),
                 config=config.mlp,
+                objective=config.objective,
                 seed=config.seed,
                 checkpoint_path=checkpoint_path,
                 preprocessing=preprocessor.to_dict(),
@@ -153,9 +162,39 @@ def run_e0(
                 ),
                 "train_y": matrix_dir / "train_y.npy",
                 "valid_y": matrix_dir / "valid_y.npy",
+                "train_target_rank": matrix_dir / "train_target_rank.npy",
+                "valid_target_rank": matrix_dir / "valid_target_rank.npy",
+                "train_group": matrix_dir / "train_group.npy",
+                "valid_group": matrix_dir / "valid_group.npy",
             }
-            np.save(paths["train_y"], train_rows["target"].to_numpy().astype(np.float64))
-            np.save(paths["valid_y"], valid_rows["target"].to_numpy().astype(np.float64))
+            train_dates = train_rows["asof_date"].to_list()
+            valid_dates = valid_rows["asof_date"].to_list()
+            train_target_rank = cross_sectional_rank_targets(
+                train_rows["target"].to_numpy(),
+                train_dates,
+                minimum_cross_section_size=config.objective.minimum_cross_section_size,
+            )
+            valid_target_rank = cross_sectional_rank_targets(
+                valid_rows["target"].to_numpy(),
+                valid_dates,
+                minimum_cross_section_size=config.objective.minimum_cross_section_size,
+            )
+            np.save(
+                paths["train_y"],
+                lightgbm_relevance_grades(
+                    train_target_rank, bins=config.lightgbm.relevance_bins
+                ),
+            )
+            np.save(
+                paths["valid_y"],
+                lightgbm_relevance_grades(
+                    valid_target_rank, bins=config.lightgbm.relevance_bins
+                ),
+            )
+            np.save(paths["train_target_rank"], train_target_rank)
+            np.save(paths["valid_target_rank"], valid_target_rank)
+            np.save(paths["train_group"], contiguous_group_sizes(train_dates))
+            np.save(paths["valid_group"], contiguous_group_sizes(valid_dates))
             del tabular, train_rows, valid_rows, evaluation_rows, protocol_index
             del features
             gc.collect()

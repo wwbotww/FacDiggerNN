@@ -175,7 +175,7 @@ facdigger compare \
 
 ## M3 E1 随机 PatchTST
 
-E1 复用同一份内容寻址快照和 evaluator。窗口按需从列式特征读取，缺失值以零填充并单独传递 observed mask；模型为随机初始化的 PatchTST encoder 加 AlphaHead。训练 checkpoint 包含模型、optimizer、scheduler、GradScaler、epoch/global step、RNG 和按日期 sampler 状态。
+E1 复用同一份内容寻址快照和 evaluator。窗口按需从列式特征读取，缺失值以零填充并单独传递 observed mask；模型为随机初始化的 PatchTST encoder 加 AlphaHead。E0—E3 的监督阶段统一优化同日横截面的 `1 - corr(score, target_rank)`，其中 target rank 先在完整交易日内按 average ties 映射到 `[-1, 1]`；训练 batch 禁止混合日期，best checkpoint 按完整 inner selection 的逐日真实 Spearman Rank IC 均值选择。E3 的 masked reconstruction 仍使用独立的 Huber/MSE 重建目标。训练 checkpoint 包含模型、optimizer、scheduler、GradScaler、epoch/global step、RNG 和按日期 sampler 状态。
 
 ```bash
 facdigger train e1 \

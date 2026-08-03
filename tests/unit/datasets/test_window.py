@@ -129,7 +129,7 @@ def test_inference_dataset_retains_target_free_factor_metadata() -> None:
     assert dataset.sample_rows["log_float_market_cap"].to_list() == [13.8155]
 
 
-def test_date_grouped_sampler_is_deterministic_and_keeps_small_dates_whole() -> None:
+def test_date_grouped_sampler_is_deterministic_and_never_mixes_dates() -> None:
     dates = ["d1", "d1", "d2", "d2", "d2", "d3"]
     sampler = DateGroupedBatchSampler(dates, batch_size=4, shuffle=True, seed=17)
     sampler.set_epoch(3)
@@ -139,10 +139,26 @@ def test_date_grouped_sampler_is_deterministic_and_keeps_small_dates_whole() -> 
     assert first == second
     for indices in first:
         represented = {dates[index] for index in indices}
-        for value in represented:
-            full_group = {index for index, date_value in enumerate(dates) if date_value == value}
-            assert full_group.issubset(indices)
+        assert len(represented) == 1
 
     restored = DateGroupedBatchSampler(dates, batch_size=4, shuffle=True, seed=17)
     restored.load_state_dict(sampler.state_dict())
     assert list(restored) == first
+
+
+def test_date_grouped_sampler_balances_large_dates_without_dropping_rows() -> None:
+    dates = ["d1"] * 1000 + ["d2"] * 65
+    sampler = DateGroupedBatchSampler(
+        dates,
+        batch_size=64,
+        shuffle=False,
+        seed=17,
+        minimum_group_size=32,
+    )
+    batches = list(sampler)
+
+    assert sorted(index for batch in batches for index in batch) == list(range(len(dates)))
+    assert max(map(len, batches)) <= 64
+    assert min(map(len, batches)) >= 32
+    assert {len(batch) for batch in batches[:16]} == {62, 63}
+    assert [len(batch) for batch in batches[16:]] == [33, 32]
