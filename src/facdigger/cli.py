@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shlex
 from pathlib import Path
 from typing import Annotated
 
@@ -11,7 +10,6 @@ import typer
 
 from facdigger.config import load_project_config
 from facdigger.environment import collect_environment, environment_is_healthy
-from facdigger.experiments.manifest import create_run_manifest
 from facdigger.models.patchtst_probe import PatchTSTProbeError, run_patchtst_probe
 
 app = typer.Typer(
@@ -42,26 +40,6 @@ def doctor(
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     if not environment_is_healthy(report, require_model=require_model):
         raise typer.Exit(code=1)
-
-
-@app.command("manifest")
-def manifest_command(
-    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
-    output: Annotated[Path, typer.Option(help="Root directory for generated run artifacts")],
-) -> None:
-    """Resolve configuration and create a reproducible run manifest."""
-
-    project_config = load_project_config(config)
-    command = shlex.join(
-        ["facdigger", "manifest", "--config", str(config), "--output", str(output)]
-    )
-    run_dir, _ = create_run_manifest(
-        config=project_config,
-        output_root=output,
-        repository_root=Path.cwd(),
-        command=command,
-    )
-    typer.echo(str(run_dir))
 
 
 @app.command("probe-patchtst")

@@ -1,7 +1,10 @@
 # FacDiggerNN Windows RTX 2070 Super 训练指南
 
+> **现行平台操作指南**。文档职责和项目状态见[文档中心](README.md)。
+
 本文用于把 macOS 上已经标准化的 EODHD 数据迁移到 Windows + RTX 2070 Super，并在
 WSL2 Ubuntu 中运行工程实验。目标环境是 Python 3.11、单张 8 GB NVIDIA GPU、FP16。
+历史 bronze 曾在项目机器上完成，但它是本地资产，不会随 Git clone 出现。
 
 ## 1. 迁移结论
 
@@ -72,8 +75,12 @@ sudo apt install -y git curl build-essential
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source ~/.local/bin/env
 
-git clone -b develop git@github.com:wwbotww/FacDiggerNN.git
+git clone git@github.com:wwbotww/FacDiggerNN.git
 cd FacDiggerNN
+
+# 当前排序目标、显著性门禁和 final-refit 协议所在分支；合并后应改用审阅过的冻结 commit。
+git switch codex/rank-objective
+git rev-parse HEAD
 
 uv python install 3.11
 uv sync --frozen --all-extras
@@ -81,7 +88,8 @@ uv lock --check
 ```
 
 若 WSL 尚未配置 GitHub SSH key，可以先配置 SSH，或在仓库允许 HTTPS 访问时改用 HTTPS
-clone URL。
+clone URL。不要盲目固定使用旧 `develop`：正式实验必须记录并 checkout 已审阅、包含当前
+排序目标、统计门禁和 final-refit 的确切 commit；分支后续合并时以冻结 commit 为准。
 
 ## 5. 验证 CUDA
 
@@ -187,6 +195,10 @@ uv run facdigger research run \
 ```
 
 不要在 validation 完成前使用 `--unlock-final-holdout`。
+
+旧 Huber 监督目标或旧 holdout 协议生成的 checkpoint/artifacts 不能恢复到当前 run，也不能
+与当前 Rank IC 目标结果比较；迁移机器时只保留它们作为历史证据，当前实验使用新的
+`research_id`。
 
 ## 9. 首轮停止条件
 

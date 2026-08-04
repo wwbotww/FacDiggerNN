@@ -2,7 +2,8 @@
 
 本文面向人类贡献者，说明开发环境、变更流程、CI 和提交前检查。项目使用和研究协议分别以
 `README.md`、`docs/开发文档.md` 和 `docs/实验设计文档.md` 为准；coding agent 的持久指令
-位于 `AGENTS.md`；安全与密钥要求见 `SECURITY.md`。
+位于 `AGENTS.md`；安全与密钥要求见 `SECURITY.md`；文档职责与历史归档见
+`docs/README.md`。
 
 ## 开发环境
 

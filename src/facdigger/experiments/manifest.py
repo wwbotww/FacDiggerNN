@@ -1,18 +1,12 @@
-"""Create a self-contained, machine-readable run manifest."""
+"""Shared hashing and Git-state primitives for experiment manifests."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-import yaml
-
-from facdigger.config import ProjectConfig
-from facdigger.environment import collect_environment
 
 
 def canonical_json(value: Any) -> str:
@@ -49,45 +43,3 @@ def collect_git_state(cwd: str | Path) -> dict[str, Any]:
         "dirty": bool(status) if status is not None else None,
         "status_porcelain": status,
     }
-
-
-def create_run_manifest(
-    config: ProjectConfig,
-    output_root: str | Path,
-    repository_root: str | Path,
-    command: str,
-    now: datetime | None = None,
-) -> tuple[Path, dict[str, Any]]:
-    """Create an immutable run directory with resolved config and manifest files."""
-
-    created_at = now or datetime.now(timezone.utc)
-    config_payload = config.model_dump(mode="json")
-    config_hash = sha256_json(config_payload)
-    run_id = f"{created_at.strftime('%Y%m%dT%H%M%SZ')}-{config_hash[:10]}"
-    run_dir = Path(output_root).resolve() / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
-
-    manifest = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "created_at": created_at.isoformat(),
-        "command": command,
-        "config_hash": config_hash,
-        "git": collect_git_state(repository_root),
-        "environment": collect_environment(include_model_dependencies=True),
-        "dataset_id": None,
-        "source_checkpoint": config.model.source.model_dump(mode="json"),
-        "seed": config.seed,
-    }
-
-    resolved_config_path = run_dir / "resolved_config.yaml"
-    manifest_path = run_dir / "manifest.json"
-    resolved_config_path.write_text(
-        yaml.safe_dump(config_payload, allow_unicode=True, sort_keys=True),
-        encoding="utf-8",
-    )
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return run_dir, manifest

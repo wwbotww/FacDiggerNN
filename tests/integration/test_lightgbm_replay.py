@@ -9,9 +9,14 @@ pytest.importorskip("lightgbm")
 
 from facdigger.models.baselines import (  # noqa: E402
     predict_lightgbm_checkpoint,
-    train_lightgbm,
+    train_lightgbm_from_files,
 )
 from facdigger.training.e0_config import LightGBMBaselineConfig  # noqa: E402
+from facdigger.training.ranking import (  # noqa: E402
+    contiguous_group_sizes,
+    cross_sectional_rank_targets,
+    lightgbm_relevance_grades,
+)
 
 
 def test_lightgbm_checkpoint_replay_matches_training_scores(tmp_path: Path) -> None:
@@ -29,15 +34,37 @@ def test_lightgbm_checkpoint_replay_matches_training_scores(tmp_path: Path) -> N
         min_child_samples=2,
         early_stopping_rounds=3,
     )
+    train_dates = [f"d{index // 10}" for index in range(len(train_y))]
+    valid_dates = [f"v{index // 4}" for index in range(len(valid_y))]
+    train_target_rank = cross_sectional_rank_targets(
+        train_y, train_dates, minimum_cross_section_size=2
+    )
+    valid_target_rank = cross_sectional_rank_targets(
+        valid_y, valid_dates, minimum_cross_section_size=2
+    )
+    matrices = {
+        "train_x": train_x,
+        "train_y": lightgbm_relevance_grades(
+            train_target_rank, bins=config.relevance_bins
+        ),
+        "valid_x": valid_x,
+        "valid_y": lightgbm_relevance_grades(
+            valid_target_rank, bins=config.relevance_bins
+        ),
+        "evaluation_x": evaluation_x,
+        "train_target_rank": train_target_rank,
+        "valid_target_rank": valid_target_rank,
+        "train_group": contiguous_group_sizes(train_dates),
+        "valid_group": contiguous_group_sizes(valid_dates),
+    }
+    paths: dict[str, Path] = {}
+    for name, values in matrices.items():
+        path = tmp_path / f"{name}.npy"
+        np.save(path, values)
+        paths[name] = path
 
-    original, audit = train_lightgbm(
-        train_x,
-        train_y,
-        valid_x,
-        valid_y,
-        evaluation_x,
-        train_dates=[f"d{index // 10}" for index in range(len(train_y))],
-        valid_dates=[f"v{index // 4}" for index in range(len(valid_y))],
+    original, audit = train_lightgbm_from_files(
+        **paths,
         config=config,
         seed=42,
         checkpoint_path=checkpoint,

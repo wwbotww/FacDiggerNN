@@ -20,11 +20,9 @@ from facdigger.training.ranking import (
     RANKING_OBJECTIVE,
     TARGET_TRANSFORM,
     CrossSectionalRankingConfig,
-    contiguous_group_sizes,
     cross_sectional_rank_correlation_loss,
     cross_sectional_rank_targets,
     grouped_rank_ic_audit,
-    lightgbm_relevance_grades,
 )
 
 
@@ -452,82 +450,6 @@ def predict_lightgbm_checkpoint(
             final_line = detail[-1] if detail else "unknown worker failure"
             raise RuntimeError(f"isolated LightGBM prediction failed: {final_line}")
         return np.load(output_path).astype(np.float64)
-
-
-def train_lightgbm(
-    train_x: np.ndarray,
-    train_y: np.ndarray,
-    valid_x: np.ndarray,
-    valid_y: np.ndarray,
-    evaluation_x: np.ndarray,
-    train_dates: list[Any] | None = None,
-    valid_dates: list[Any] | None = None,
-    *,
-    config: LightGBMBaselineConfig,
-    seed: int,
-    checkpoint_path: Path,
-    preprocessing: dict[str, Any],
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Compatibility wrapper that delegates file-backed matrices to the worker."""
-
-    import tempfile
-
-    with tempfile.TemporaryDirectory(prefix="facdigger-lgb-train-") as temporary:
-        root = Path(temporary)
-        resolved_train_dates = train_dates or ["train"] * len(train_y)
-        resolved_valid_dates = valid_dates or ["valid"] * len(valid_y)
-        train_target_rank_values = cross_sectional_rank_targets(
-            train_y,
-            resolved_train_dates,
-            minimum_cross_section_size=2,
-        )
-        valid_target_rank_values = cross_sectional_rank_targets(
-            valid_y,
-            resolved_valid_dates,
-            minimum_cross_section_size=2,
-        )
-        paths = {
-            "train_x": root / "train_x.npy",
-            "train_y": root / "train_y.npy",
-            "valid_x": root / "valid_x.npy",
-            "valid_y": root / "valid_y.npy",
-            "evaluation_x": root / "evaluation_x.npy",
-            "train_target_rank": root / "train_target_rank.npy",
-            "valid_target_rank": root / "valid_target_rank.npy",
-            "train_group": root / "train_group.npy",
-            "valid_group": root / "valid_group.npy",
-        }
-        for name, values in {
-            "train_x": train_x,
-            "train_y": train_y,
-            "valid_x": valid_x,
-            "valid_y": valid_y,
-            "evaluation_x": evaluation_x,
-            "train_target_rank": train_target_rank_values,
-            "valid_target_rank": valid_target_rank_values,
-            "train_group": contiguous_group_sizes(resolved_train_dates),
-            "valid_group": contiguous_group_sizes(resolved_valid_dates),
-        }.items():
-            np.save(paths[name], values)
-        np.save(
-            paths["train_y"],
-            lightgbm_relevance_grades(
-                train_target_rank_values, bins=config.relevance_bins
-            ),
-        )
-        np.save(
-            paths["valid_y"],
-            lightgbm_relevance_grades(
-                valid_target_rank_values, bins=config.relevance_bins
-            ),
-        )
-        return train_lightgbm_from_files(
-            **paths,
-            config=config,
-            seed=seed,
-            checkpoint_path=checkpoint_path,
-            preprocessing=preprocessing,
-        )
 
 
 def train_lightgbm_from_files(

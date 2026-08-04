@@ -1,8 +1,9 @@
 # FacDiggerNN coding guide
 
 本文件只保存 coding agent 每次任务都需要的仓库规则。开发流程和 CI 见
-`CONTRIBUTING.md`，安全与秘密处理见 `SECURITY.md`；使用、架构和实验协议分别见
-`README.md`、`docs/开发文档.md` 和 `docs/实验设计文档.md`。
+`CONTRIBUTING.md`，安全与秘密处理见 `SECURITY.md`；文档职责和历史归档见
+`docs/README.md`，使用、架构和实验协议分别见 `README.md`、`docs/开发文档.md` 和
+`docs/实验设计文档.md`。
 
 ## Project context
 

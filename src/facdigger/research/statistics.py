@@ -149,21 +149,6 @@ def non_overlapping_mean_inference(
     }
 
 
-def series_inference(
-    values: list[float],
-    *,
-    hac_lags: int,
-    stride: int,
-    offset: int,
-    null_mean: float = 0.0,
-    alpha: float = 0.05,
-) -> dict[str, Any]:
-    return {
-        "hac": newey_west_mean_inference(values, hac_lags, null_mean=null_mean, alpha=alpha),
-        "non_overlapping": non_overlapping_mean_inference(values, stride=stride, offset=offset),
-    }
-
-
 def panel_mean_inference(
     groups: list[list[float]],
     *,

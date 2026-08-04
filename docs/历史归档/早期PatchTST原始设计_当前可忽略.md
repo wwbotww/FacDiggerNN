@@ -53,6 +53,10 @@ artifacts:
   - metrics.json
 ---
 
+> **历史归档（当前可忽略）**：本文是早期 PatchTST 设计与阶段性同步稿，部分安装、硬件、
+> 数据和待办结论已被现行实现替代。仅用于追溯设计来源，不得作为当前命令、项目状态或实验
+> 协议依据。现行入口见 [`docs/README.md`](../README.md)。
+
 # PatchTST迁移学习实现设计文档
 
 **IMPLEMENTATION DESIGN**
