@@ -60,13 +60,13 @@ finetuning:
   head_learning_rate: 0.001
   encoder_learning_rate: 0.00001
   weight_decay: 0.0001
-  gradient_accumulation_steps: 1
+  dates_per_optimizer_step: 1
   max_grad_norm: 1.0
   device: cpu
   precision: fp32
   num_workers: 0
   objective:
-    name: cross_sectional_rank_correlation_surrogate_v1
+    name: cross_sectional_rank_correlation_surrogate_v2_full_date
     epsilon: 0.000001
     minimum_cross_section_size: 2
     minimum_selection_dates: 2

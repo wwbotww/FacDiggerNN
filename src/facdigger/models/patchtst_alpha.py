@@ -23,6 +23,36 @@ class AlphaModelOutput:
     encoder: EncoderOutput
 
 
+def patchify_observed_mask(
+    observed_mask: torch.Tensor,
+    *,
+    patch_length: int,
+    patch_stride: int,
+    sequence_start: int,
+) -> torch.Tensor:
+    """Patchify observations from the same first timestep as PatchTST."""
+
+    if observed_mask.ndim != 3:
+        raise ValueError("observed_mask must be [B,L,C]")
+    if not 0 <= sequence_start < observed_mask.shape[1]:
+        raise ValueError(
+            f"sequence_start must be within [0, {observed_mask.shape[1]}), "
+            f"got {sequence_start}"
+        )
+    aligned = observed_mask[:, sequence_start:, :]
+    if aligned.shape[1] < patch_length:
+        raise ValueError(
+            f"aligned sequence length {aligned.shape[1]} is shorter than patch_length "
+            f"{patch_length}"
+        )
+    return (
+        aligned.unfold(dimension=-2, size=patch_length, step=patch_stride)
+        .transpose(-2, -3)
+        .contiguous()
+        .to(dtype=torch.bool)
+    )
+
+
 class PatchTSTEncoderOutputAdapter:
     """Normalize and validate the external backbone's output layout."""
 
@@ -33,18 +63,19 @@ class PatchTSTEncoderOutputAdapter:
         *,
         patch_length: int,
         patch_stride: int,
+        sequence_start: int,
     ) -> EncoderOutput:
         hidden = output.last_hidden_state
         if hidden.ndim != 4:
             raise ValueError(f"PatchTST hidden state must be [B,C,P,D], got {hidden.shape}")
-        if observed_mask.ndim != 3:
-            raise ValueError("observed_mask must be [B,L,C]")
-        patch_mask = (
-            observed_mask.transpose(1, 2)
-            .unfold(dimension=-1, size=patch_length, step=patch_stride)
-            .any(dim=-1)
+        observed_elements = patchify_observed_mask(
+            observed_mask,
+            patch_length=patch_length,
+            patch_stride=patch_stride,
+            sequence_start=sequence_start,
         )
-        channel_mask = observed_mask.any(dim=1)
+        patch_mask = observed_elements.any(dim=-1)
+        channel_mask = observed_elements.any(dim=(-1, -2))
         expected = hidden.shape[:3]
         if patch_mask.shape != expected:
             raise ValueError(
@@ -148,5 +179,6 @@ class PatchTSTAlphaModel(nn.Module):
             observed_mask,
             patch_length=self.patch_length,
             patch_stride=self.patch_stride,
+            sequence_start=int(self.backbone.patchifier.sequence_start),
         )
         return AlphaModelOutput(score=self.alpha_head(encoder), encoder=encoder)

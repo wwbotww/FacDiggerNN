@@ -18,7 +18,7 @@ windows: [5, 20, 60, 120, 252]
 costs_bps: [0, 10, 20, 50]
 
 objective:
-  name: cross_sectional_rank_correlation_surrogate_v1
+  name: cross_sectional_rank_correlation_surrogate_v2_full_date
   epsilon: 0.000001
   minimum_cross_section_size: 2
   minimum_selection_dates: 2

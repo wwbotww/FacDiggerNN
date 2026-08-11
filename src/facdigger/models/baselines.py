@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
-from facdigger.datasets.sampler import DateGroupedBatchSampler
+from facdigger.datasets.sampler import FullDateBatchSampler
 from facdigger.training.e0_config import LightGBMBaselineConfig, MLPBaselineConfig
 from facdigger.training.ranking import (
     RANKING_OBJECTIVE,
@@ -280,9 +280,8 @@ def train_mlp(
         train_dates,
         minimum_cross_section_size=objective.minimum_cross_section_size,
     )
-    sampler = DateGroupedBatchSampler(
+    sampler = FullDateBatchSampler(
         train_dates,
-        batch_size=config.batch_size,
         shuffle=True,
         seed=seed,
         minimum_group_size=objective.minimum_cross_section_size,
@@ -292,7 +291,7 @@ def train_mlp(
         batch_sampler=sampler,
         num_workers=0,
     )
-    valid_features = torch.from_numpy(valid_x).to(device)
+    valid_features = torch.from_numpy(valid_x)
     best_rank_ic = float("-inf")
     best_selection_audit: dict[str, Any] = {}
     best_epoch = 0
@@ -320,7 +319,12 @@ def train_mlp(
             total_score_std += float(prediction.detach().float().std(unbiased=False).cpu())
         model.eval()
         with torch.no_grad():
-            valid_prediction = model(valid_features).squeeze(-1)
+            valid_prediction = torch.cat(
+                [
+                    model(batch.to(device)).squeeze(-1).float().cpu()
+                    for batch in valid_features.split(config.batch_size)
+                ]
+            )
         selection = grouped_rank_ic_audit(
             valid_prediction.detach().float().cpu().numpy(),
             valid_y,
@@ -336,6 +340,7 @@ def train_mlp(
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "train_score_std": total_score_std / max(total_batches, 1),
+                "complete_date_steps": total_batches,
                 "selection_mean_rank_ic": selection_rank_ic,
                 "selection_valid_dates": selection["valid_dates"],
                 "selection_skipped_dates": selection["skipped_dates"],
@@ -378,6 +383,9 @@ def train_mlp(
         "device": device,
         "objective": RANKING_OBJECTIVE,
         "target_transform": TARGET_TRANSFORM,
+        "optimization_unit": "one_complete_asof_date_cross_section",
+        "prediction_batch_size": config.batch_size,
+        "training_dates_per_epoch": len(loader),
         "best_epoch": best_epoch,
         "best_selection_rank_ic": best_rank_ic,
         "best_selection_audit": best_selection_audit,

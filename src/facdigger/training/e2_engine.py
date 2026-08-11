@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from facdigger.datasets.sampler import DateGroupedBatchSampler
+from facdigger.datasets.sampler import FullDateBatchSampler
 from facdigger.datasets.window import SnapshotWindowDataset
 from facdigger.experiments.manifest import sha256_json
 from facdigger.models.patchtst_alpha import PatchTSTAlphaModel
@@ -17,10 +17,12 @@ from facdigger.models.patchtst_transfer import (
     module_fingerprint,
 )
 from facdigger.training.e1_engine import (
-    _forward_loss,
-    _loader,
+    _backward_complete_date,
+    _dates_in_current_optimizer_step,
+    _full_date_loader,
     _restore_rng_state,
     _rng_state,
+    _step_optimizer,
     evaluate_e1_selection,
     seed_everything,
     select_device,
@@ -93,7 +95,7 @@ def _save_checkpoint(
     stale_epochs: int,
     history: list[dict[str, Any]],
     stage_audits: dict[str, dict[str, Any]],
-    sampler: DateGroupedBatchSampler,
+    sampler: FullDateBatchSampler,
     dataset_id: str,
     protocol_hash: str,
     config_payload: dict[str, Any],
@@ -103,10 +105,18 @@ def _save_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "experiment_family": "e2",
             "objective": RANKING_OBJECTIVE,
             "target_transform": TARGET_TRANSFORM,
+            "optimization_protocol": {
+                "unit": "complete_date",
+                "method": "exact_two_pass_full_date_pearson",
+                "physical_microbatch_size": config_payload["training"]["batch_size"],
+                "dates_per_optimizer_step": config_payload["training"][
+                    "dates_per_optimizer_step"
+                ],
+            },
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
@@ -174,9 +184,8 @@ def train_e2(
         optimizer, T_max=config.training.max_epochs
     )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    train_loader, train_sampler = _loader(
+    train_loader, train_sampler = _full_date_loader(
         train_dataset,
-        batch_size=config.training.batch_size,
         shuffle=True,
         seed=config.seed,
         num_workers=config.training.num_workers,
@@ -204,11 +213,12 @@ def train_e2(
     resumed_from_epoch: int | None = None
     if resume_from is not None:
         checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
-        if checkpoint.get("schema_version") != 2 or checkpoint.get("objective") != (
+        if checkpoint.get("schema_version") != 3 or checkpoint.get("objective") != (
             RANKING_OBJECTIVE
         ):
             raise ValueError(
-                "resume checkpoint predates the cross-sectional ranking protocol"
+                "resume checkpoint predates the cross-sectional ranking protocol; "
+                "old v1 chunked checkpoints cannot resume under the v2 full-date objective"
             )
         if checkpoint.get("experiment_family") != "e2":
             raise ValueError("resume checkpoint is not an E2 checkpoint")
@@ -247,34 +257,56 @@ def train_e2(
         stage_step_captured = False
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
-        total_batches = 0
+        total_dates = 0
         total_score_std = 0.0
-        for batch_index, batch in enumerate(train_loader, start=1):
-            score, loss = _forward_loss(
+        first_pass_microbatches = 0
+        second_pass_microbatches = 0
+        gradient_norms: list[float] = []
+        amp_skipped_optimizer_steps = 0
+        for date_index, batch in enumerate(train_loader, start=1):
+            dates_in_step = _dates_in_current_optimizer_step(
+                date_index,
+                total_dates=len(train_loader),
+                configured_dates=config.training.dates_per_optimizer_step,
+            )
+            date_audit = _backward_complete_date(
                 model,
                 batch,
                 device=device,
                 target_rank_lookup=train_target_ranks,
                 epsilon=config.training.objective.epsilon,
                 amp_enabled=amp_enabled,
+                scaler=scaler,
+                physical_microbatch_size=config.training.batch_size,
+                dates_in_optimizer_step=dates_in_step,
             )
-            scaler.scale(loss / config.training.gradient_accumulation_steps).backward()
-            total_loss += float(loss.detach().cpu())
-            total_batches += 1
-            total_score_std += float(score.detach().float().std(unbiased=False).cpu())
+            total_loss += float(date_audit["loss"])
+            total_dates += 1
+            total_score_std += float(date_audit["score_std"])
+            first_pass_microbatches += int(date_audit["first_pass_microbatches"])
+            second_pass_microbatches += int(date_audit["second_pass_microbatches"])
             should_step = (
-                batch_index % config.training.gradient_accumulation_steps == 0
-                or batch_index == len(train_loader)
+                date_index % config.training.dates_per_optimizer_step == 0
+                or date_index == len(train_loader)
             )
             if should_step:
-                scaler.unscale_(optimizer)
                 trainable = [
                     parameter for parameter in model.parameters() if parameter.requires_grad
                 ]
-                torch.nn.utils.clip_grad_norm_(trainable, config.training.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+                gradient_norm, optimizer_updated = _step_optimizer(
+                    optimizer,
+                    scaler,
+                    trainable,
+                    max_grad_norm=config.training.max_grad_norm,
+                    amp_enabled=amp_enabled,
+                    experiment_name="E2",
+                )
+                if not optimizer_updated:
+                    amp_skipped_optimizer_steps += 1
+                    continue
+                if gradient_norm is None:
+                    raise RuntimeError("E2 optimizer update has no finite gradient norm")
+                gradient_norms.append(gradient_norm)
                 global_step += 1
                 if capture_stage_step and not stage_step_captured:
                     encoder_after = module_fingerprint(model.backbone)
@@ -300,7 +332,7 @@ def train_e2(
                     }
                     stage_step_captured = True
 
-        train_loss = total_loss / max(total_batches, 1)
+        train_loss = total_loss / max(total_dates, 1)
         selection = evaluate_e1_selection(
             model,
             valid_dataset,
@@ -329,7 +361,22 @@ def train_e2(
                 "epoch": epoch,
                 "stage": stage_name,
                 "train_loss": train_loss,
-                "train_score_std": total_score_std / max(total_batches, 1),
+                "train_score_std": total_score_std / max(total_dates, 1),
+                "optimizer_unit": "complete_date",
+                "physical_microbatch_size": config.training.batch_size,
+                "dates_per_optimizer_step": config.training.dates_per_optimizer_step,
+                "train_dates": total_dates,
+                "first_pass_microbatches": first_pass_microbatches,
+                "second_pass_microbatches": second_pass_microbatches,
+                "mean_pre_clip_gradient_norm": (
+                    sum(gradient_norms) / len(gradient_norms)
+                    if gradient_norms
+                    else None
+                ),
+                "max_pre_clip_gradient_norm": (
+                    max(gradient_norms) if gradient_norms else None
+                ),
+                "amp_skipped_optimizer_steps": amp_skipped_optimizer_steps,
                 "selection_mean_rank_ic": selection_rank_ic,
                 "selection_valid_dates": selection["valid_dates"],
                 "selection_skipped_dates": selection["skipped_dates"],
@@ -380,6 +427,12 @@ def train_e2(
         "precision": "fp16" if amp_enabled else "fp32",
         "objective": RANKING_OBJECTIVE,
         "target_transform": TARGET_TRANSFORM,
+        "optimization_protocol": {
+            "unit": "complete_date",
+            "method": "exact_two_pass_full_date_pearson",
+            "physical_microbatch_size": config.training.batch_size,
+            "dates_per_optimizer_step": config.training.dates_per_optimizer_step,
+        },
         "best_epoch": best_epoch,
         "best_selection_rank_ic": best_selection_rank_ic,
         "best_selection_audit": best_selection_audit,

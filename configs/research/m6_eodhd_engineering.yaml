@@ -1,4 +1,4 @@
-research_id: m6_eodhd_engineering
+research_id: m6_eodhd_engineering_full_date_v2
 base_dataset_config: configs/datasets/eodhd_historical_liquid.yaml
 output_root: artifacts/research
 snapshot_output_root: data/walk_forward_snapshots

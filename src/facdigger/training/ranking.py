@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
@@ -12,13 +13,13 @@ from pydantic import Field
 
 from facdigger.data.config import StrictModel
 
-RANKING_OBJECTIVE = "cross_sectional_rank_correlation_surrogate_v1"
+RANKING_OBJECTIVE = "cross_sectional_rank_correlation_surrogate_v2_full_date"
 TARGET_TRANSFORM = "full_date_average_rank_percentile_minus_one_to_one"
 
 
 class CrossSectionalRankingConfig(StrictModel):
-    name: Literal["cross_sectional_rank_correlation_surrogate_v1"] = (
-        "cross_sectional_rank_correlation_surrogate_v1"
+    name: Literal["cross_sectional_rank_correlation_surrogate_v2_full_date"] = (
+        "cross_sectional_rank_correlation_surrogate_v2_full_date"
     )
     epsilon: float = Field(default=1e-6, gt=0)
     minimum_cross_section_size: int = Field(default=2, ge=2)
@@ -113,6 +114,318 @@ def cross_sectional_rank_correlation_loss(
     if not torch.isfinite(loss):
         raise FloatingPointError("rank correlation loss became non-finite")
     return loss
+
+
+@dataclass(frozen=True)
+class FullDateRankCorrelationStatistics:
+    """Detached Float32 moments for one complete-date Pearson objective.
+
+    The statistics are sufficient to compute the analytic gradient of the
+    regularized loss used by :func:`cross_sectional_rank_correlation_loss`:
+
+    ``1 - cov(score, target) / sqrt((var(score) + eps) * (var(target) + eps))``.
+
+    Keeping only these scalar moments lets a trainer discard first-pass model
+    activations and recompute one microbatch at a time during the gradient pass.
+    """
+
+    count: int
+    microbatch_count: int
+    epsilon: float
+    score_mean: float
+    target_mean: float
+    score_centered_mean: float
+    target_centered_mean: float
+    score_variance: float
+    target_variance: float
+    covariance: float
+    score_min: float
+    score_max: float
+    target_min: float
+    target_max: float
+    correlation: float
+    loss: float
+
+    def gradient(self, scores: Any, target_ranks: Any) -> Any:
+        """Return ``d(loss) / d(scores)`` for one replayed microbatch.
+
+        The returned tensor has the score tensor's shape and is always
+        Float32. The caller must replay every row used to build these
+        statistics and should use :class:`FullDateRankCorrelationReplay` to
+        verify that contract before applying an optimizer step.
+        """
+
+        import torch
+
+        score = scores.detach().float().reshape(-1)
+        target = target_ranks.detach().float().reshape(-1)
+        if score.shape != target.shape or score.numel() == 0:
+            raise ValueError(
+                "full-date rank correlation gradient requires aligned non-empty vectors"
+            )
+        if not torch.isfinite(score).all() or not torch.isfinite(target).all():
+            raise FloatingPointError(
+                "full-date rank correlation gradient received non-finite values"
+            )
+
+        score_mean = score.new_tensor(self.score_mean)
+        target_mean = score.new_tensor(self.target_mean)
+        score_variance = score.new_tensor(self.score_variance)
+        target_variance = score.new_tensor(self.target_variance)
+        covariance = score.new_tensor(self.covariance)
+        epsilon = score.new_tensor(self.epsilon)
+        denominator = torch.sqrt(score_variance + epsilon) * torch.sqrt(
+            target_variance + epsilon
+        )
+        gradient = (
+            covariance
+            * (score - score_mean - self.score_centered_mean)
+            / (score_variance + epsilon)
+            - (target - target_mean - self.target_centered_mean)
+        ) / (self.count * denominator)
+        if not torch.isfinite(gradient).all():
+            raise FloatingPointError(
+                "full-date rank correlation analytic gradient became non-finite"
+            )
+        return gradient.reshape(scores.shape)
+
+    def audit(self) -> dict[str, Any]:
+        """Return JSON-serializable evidence for the first-pass objective."""
+
+        return {
+            "schema_version": 1,
+            "objective": RANKING_OBJECTIVE,
+            "method": "exact_two_pass_full_date_pearson",
+            "accumulation_dtype": "float32",
+            "rows": self.count,
+            "first_pass_microbatches": self.microbatch_count,
+            "epsilon": self.epsilon,
+            "score_mean": self.score_mean,
+            "target_mean": self.target_mean,
+            "score_centered_mean": self.score_centered_mean,
+            "target_centered_mean": self.target_centered_mean,
+            "score_variance": self.score_variance,
+            "target_variance": self.target_variance,
+            "covariance": self.covariance,
+            "score_min": self.score_min,
+            "score_max": self.score_max,
+            "target_min": self.target_min,
+            "target_max": self.target_max,
+            "regularized_correlation": self.correlation,
+            "loss": self.loss,
+        }
+
+
+class FullDateRankCorrelationAccumulator:
+    """Collect detached microbatch outputs for exact complete-date moments.
+
+    Only the Float32 score and target vectors for the current date are retained
+    on the first input's device. This is bounded by the cross-section size (not
+    by model activation size), keeps no computation graph, and lets
+    :meth:`finalize` use the exact same centered reductions as the single-graph
+    reference loss.
+    """
+
+    def __init__(self, *, epsilon: float) -> None:
+        if epsilon <= 0 or not math.isfinite(epsilon):
+            raise ValueError("ranking epsilon must be finite and positive")
+        self.epsilon = float(epsilon)
+        self.count = 0
+        self.microbatch_count = 0
+        self._device: Any | None = None
+        self._score_chunks: list[Any] = []
+        self._target_chunks: list[Any] = []
+        self._finalized = False
+
+    def update(self, scores: Any, target_ranks: Any) -> None:
+        """Add one no-graph microbatch from the same complete date."""
+
+        import torch
+
+        if self._finalized:
+            raise RuntimeError("full-date rank correlation statistics are already finalized")
+        with torch.no_grad():
+            score = scores.detach().float().reshape(-1)
+            target = target_ranks.detach().float().reshape(-1)
+            if score.shape != target.shape or score.numel() == 0:
+                raise ValueError(
+                    "full-date statistics require aligned non-empty score/target vectors"
+                )
+            if self._device is not None and score.device != self._device:
+                raise ValueError("all full-date statistic microbatches must share one device")
+            if target.device != score.device:
+                raise ValueError("full-date scores and targets must share one device")
+
+            if self.count == 0:
+                self._device = score.device
+            self._score_chunks.append(score.clone())
+            self._target_chunks.append(target.clone())
+            self.count += score.numel()
+            self.microbatch_count += 1
+
+    def finalize(self) -> FullDateRankCorrelationStatistics:
+        """Validate the complete date and freeze its scalar objective state."""
+
+        import torch
+
+        if self.count < 2 or not self._score_chunks:
+            raise ValueError(
+                "full-date rank correlation requires at least two accumulated rows"
+            )
+        self._finalized = True
+        score = torch.cat(self._score_chunks)
+        target = torch.cat(self._target_chunks)
+        self._score_chunks.clear()
+        self._target_chunks.clear()
+        if not torch.isfinite(score).all() or not torch.isfinite(target).all():
+            raise FloatingPointError(
+                "full-date rank correlation statistics received non-finite values"
+            )
+
+        score_mean_tensor = score.mean()
+        target_mean_tensor = target.mean()
+        score_centered = score - score_mean_tensor
+        target_centered = target - target_mean_tensor
+        score_variance_tensor = score_centered.square().mean()
+        target_variance_tensor = target_centered.square().mean()
+        covariance_tensor = (score_centered * target_centered).mean()
+        score_mean = float(score_mean_tensor.detach().cpu())
+        target_mean = float(target_mean_tensor.detach().cpu())
+        score_centered_mean = float(score_centered.mean().detach().cpu())
+        target_centered_mean = float(target_centered.mean().detach().cpu())
+        score_variance = float(score_variance_tensor.detach().cpu())
+        target_variance = float(target_variance_tensor.detach().cpu())
+        covariance = float(covariance_tensor.detach().cpu())
+        scalar_values = {
+            "score_mean": score_mean,
+            "target_mean": target_mean,
+            "score_centered_mean": score_centered_mean,
+            "target_centered_mean": target_centered_mean,
+            "score_variance": score_variance,
+            "target_variance": target_variance,
+            "covariance": covariance,
+        }
+        if not all(math.isfinite(value) for value in scalar_values.values()):
+            raise FloatingPointError(
+                "full-date rank correlation statistics became non-finite"
+            )
+        if score_variance < 0:
+            raise FloatingPointError(
+                "full-date rank correlation score variance became negative"
+            )
+        if target_variance <= 0:
+            raise ValueError("full-date rank correlation target has zero variance")
+
+        denominator = torch.sqrt(score_variance_tensor + self.epsilon) * torch.sqrt(
+            target_variance_tensor + self.epsilon
+        )
+        correlation = float((covariance_tensor / denominator).detach().cpu())
+        loss = float((1.0 - covariance_tensor / denominator).detach().cpu())
+        if not math.isfinite(correlation) or not math.isfinite(loss):
+            raise FloatingPointError("full-date rank correlation loss became non-finite")
+        return FullDateRankCorrelationStatistics(
+            count=self.count,
+            microbatch_count=self.microbatch_count,
+            epsilon=self.epsilon,
+            score_mean=score_mean,
+            target_mean=target_mean,
+            score_centered_mean=score_centered_mean,
+            target_centered_mean=target_centered_mean,
+            score_variance=score_variance,
+            target_variance=target_variance,
+            covariance=covariance,
+            score_min=float(score.min().detach().cpu()),
+            score_max=float(score.max().detach().cpu()),
+            target_min=float(target.min().detach().cpu()),
+            target_max=float(target.max().detach().cpu()),
+            correlation=correlation,
+            loss=loss,
+        )
+
+
+class FullDateRankCorrelationReplay:
+    """Validate a gradient replay before its accumulated gradients are stepped.
+
+    A trainer should call :meth:`gradient` for every second-pass microbatch,
+    backpropagate those returned gradients, then call :meth:`finalize` before
+    ``optimizer.step()``. A mismatch means stochastic model state or row
+    membership changed between passes, so the accumulated gradients must be
+    discarded.
+    """
+
+    def __init__(
+        self,
+        statistics: FullDateRankCorrelationStatistics,
+        *,
+        relative_tolerance: float = 1e-5,
+        absolute_tolerance: float = 1e-6,
+    ) -> None:
+        if relative_tolerance < 0 or absolute_tolerance < 0:
+            raise ValueError("replay tolerances must be non-negative")
+        self.statistics = statistics
+        self.relative_tolerance = relative_tolerance
+        self.absolute_tolerance = absolute_tolerance
+        self._accumulator = FullDateRankCorrelationAccumulator(
+            epsilon=statistics.epsilon
+        )
+        self._finalized = False
+
+    def gradient(self, scores: Any, target_ranks: Any) -> Any:
+        """Record a replayed microbatch and return its analytic gradient."""
+
+        if self._finalized:
+            raise RuntimeError("full-date rank correlation replay is already finalized")
+        self._accumulator.update(scores, target_ranks)
+        return self.statistics.gradient(scores, target_ranks)
+
+    def finalize(self) -> dict[str, Any]:
+        """Fail closed if the second pass did not reproduce the first pass."""
+
+        if self._finalized:
+            raise RuntimeError("full-date rank correlation replay is already finalized")
+        self._finalized = True
+        replay = self._accumulator.finalize()
+        if replay.count != self.statistics.count:
+            raise RuntimeError(
+                "full-date rank correlation replay row count differs from first pass: "
+                f"{replay.count} != {self.statistics.count}"
+            )
+        checked_fields = (
+            "score_mean",
+            "target_mean",
+            "score_centered_mean",
+            "target_centered_mean",
+            "score_variance",
+            "target_variance",
+            "covariance",
+            "score_min",
+            "score_max",
+            "target_min",
+            "target_max",
+        )
+        mismatches = [
+            field
+            for field in checked_fields
+            if not math.isclose(
+                getattr(replay, field),
+                getattr(self.statistics, field),
+                rel_tol=self.relative_tolerance,
+                abs_tol=self.absolute_tolerance,
+            )
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "full-date rank correlation replay differs from first pass for: "
+                + ", ".join(mismatches)
+            )
+        return {
+            "schema_version": 1,
+            "verified": True,
+            "rows": replay.count,
+            "second_pass_microbatches": replay.microbatch_count,
+            "relative_tolerance": self.relative_tolerance,
+            "absolute_tolerance": self.absolute_tolerance,
+        }
 
 
 def grouped_rank_ic_audit(

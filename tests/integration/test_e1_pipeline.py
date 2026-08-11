@@ -127,8 +127,16 @@ def test_e1_run_can_be_reloaded_for_bitwise_replay(tmp_path) -> None:
     checkpoint = torch.load(
         run_dir / "checkpoints" / "best.pt", map_location="cpu", weights_only=False
     )
-    assert checkpoint["schema_version"] == 2
-    assert checkpoint["objective"] == "cross_sectional_rank_correlation_surrogate_v1"
+    assert checkpoint["schema_version"] == 3
+    assert checkpoint["optimization_protocol"] == {
+        "unit": "complete_date",
+        "method": "exact_two_pass_full_date_pearson",
+        "physical_microbatch_size": 64,
+        "dates_per_optimizer_step": 1,
+    }
+    assert checkpoint["objective"] == (
+        "cross_sectional_rank_correlation_surrogate_v2_full_date"
+    )
     assert "best_selection_rank_ic" in checkpoint
     assert "best_valid_loss" not in checkpoint
     assert run_manifest["training"]["objective"] == checkpoint["objective"]

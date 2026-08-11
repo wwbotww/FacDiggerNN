@@ -10,7 +10,9 @@ pytest.importorskip("transformers")
 from facdigger.models.patchtst_pretrain import FinancialPatchTSTPretrainer  # noqa: E402
 
 
-def _model(loss: str = "huber") -> FinancialPatchTSTPretrainer:
+def _model(
+    loss: str = "huber", *, context_length: int = 12
+) -> FinancialPatchTSTPretrainer:
     config = SimpleNamespace(
         patch_length=4,
         patch_stride=4,
@@ -28,7 +30,7 @@ def _model(loss: str = "huber") -> FinancialPatchTSTPretrainer:
         scaling="mean",
     )
     return FinancialPatchTSTPretrainer(
-        context_length=12,
+        context_length=context_length,
         num_input_channels=2,
         model_config=config,
         mask_ratio=0.5,
@@ -67,3 +69,38 @@ def test_masked_reconstruction_loss_uses_only_observed_masked_elements() -> None
     assert output.valid_element_count < int(internal.mask.sum()) * 4
     output.loss.backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_masked_reconstruction_observations_align_with_backbone_patch_input() -> None:
+    model = _model(context_length=14)
+    values = torch.randn(2, 14, 2)
+    observed = torch.ones_like(values, dtype=torch.bool)
+    observed[:, :2, 0] = False
+    observed[:, 2, 1] = False
+    values[~observed] = 0.0
+
+    torch.manual_seed(23)
+    output = model(values, observed)
+    torch.manual_seed(23)
+    internal = model.pretrainer.model(
+        past_values=values,
+        past_observed_mask=observed,
+        return_dict=True,
+    )
+    prediction = model.pretrainer.head(internal.last_hidden_state)
+    expected_observed_elements = model.pretrainer.model.patchifier(observed)
+    valid = internal.mask.bool().unsqueeze(-1) & expected_observed_elements
+    difference = prediction - internal.patch_input
+    absolute = difference.abs()
+    expected_elements = torch.where(
+        absolute <= 1.0,
+        0.5 * difference.square(),
+        absolute - 0.5,
+    )
+
+    assert model.pretrainer.model.patchifier.sequence_start == 2
+    torch.testing.assert_close(
+        output.loss,
+        expected_elements.masked_select(valid).mean(),
+    )
+    assert output.valid_element_count == int(valid.sum())

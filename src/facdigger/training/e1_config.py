@@ -38,12 +38,14 @@ class RandomPatchTSTConfig(StrictModel):
 
 
 class E1TrainingConfig(StrictModel):
+    # ``batch_size`` is the physical device microbatch size. One optimizer
+    # objective still spans every security in a complete date cross-section.
     batch_size: int = Field(default=64, ge=1)
     max_epochs: int = Field(default=30, ge=1)
     patience: int = Field(default=7, ge=1)
     learning_rate: float = Field(default=3e-4, gt=0)
     weight_decay: float = Field(default=1e-4, ge=0)
-    gradient_accumulation_steps: int = Field(default=1, ge=1)
+    dates_per_optimizer_step: int = Field(default=1, ge=1)
     max_grad_norm: float = Field(default=1.0, gt=0)
     device: Literal["auto", "cpu", "cuda"] = "auto"
     precision: Literal["fp32", "fp16"] = "fp16"
@@ -73,12 +75,6 @@ class E1ExperimentConfig(StrictModel):
             raise ValueError("evaluation_split=test requires unlock_test=true")
         if self.training.minimum_epochs > self.training.max_epochs:
             raise ValueError("minimum_epochs cannot exceed max_epochs")
-        if self.training.objective.minimum_cross_section_size > (
-            self.training.batch_size + 1
-        ) // 2:
-            raise ValueError(
-                "minimum_cross_section_size cannot exceed half of training batch_size"
-            )
         if any(cost < 0 for cost in self.costs_bps):
             raise ValueError("costs_bps cannot be negative")
         return self

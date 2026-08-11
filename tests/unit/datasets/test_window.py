@@ -4,8 +4,9 @@ from datetime import date, timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 
-from facdigger.datasets.sampler import DateGroupedBatchSampler
+from facdigger.datasets.sampler import DateGroupedBatchSampler, FullDateBatchSampler
 from facdigger.datasets.window import (
     SecurityFeatureStore,
     SnapshotInferenceWindowDataset,
@@ -162,3 +163,36 @@ def test_date_grouped_sampler_balances_large_dates_without_dropping_rows() -> No
     assert min(map(len, batches)) >= 32
     assert {len(batch) for batch in batches[:16]} == {62, 63}
     assert [len(batch) for batch in batches[16:]] == [33, 32]
+
+
+def test_full_date_sampler_never_splits_date_at_device_microbatch_boundary() -> None:
+    dates = ["d1"] * 7 + ["d2"] * 3 + ["d3"] * 11
+    sampler = FullDateBatchSampler(
+        dates,
+        shuffle=True,
+        seed=29,
+        minimum_group_size=3,
+    )
+    sampler.set_epoch(4)
+    assert sampler.groups == [(0, 7), (7, 10), (10, 21)]
+    first = list(sampler)
+    second = list(sampler)
+
+    assert first == second
+    assert sorted(index for batch in first for index in batch) == list(range(len(dates)))
+    assert sorted(map(len, first)) == [3, 7, 11]
+    assert all(len({dates[index] for index in batch}) == 1 for batch in first)
+
+    restored = FullDateBatchSampler(
+        dates,
+        shuffle=True,
+        seed=29,
+        minimum_group_size=3,
+    )
+    restored.load_state_dict(sampler.state_dict())
+    assert list(restored) == first
+
+
+def test_full_date_sampler_rejects_noncontiguous_dates() -> None:
+    with pytest.raises(ValueError, match="contiguous date groups"):
+        FullDateBatchSampler(["d1", "d2", "d1"], shuffle=False, seed=0)

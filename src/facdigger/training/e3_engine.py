@@ -25,12 +25,16 @@ from facdigger.models.patchtst_transfer import module_fingerprint
 from facdigger.training.e1_engine import (
     _restore_rng_state,
     _rng_state,
+    _step_optimizer,
     seed_everything,
     select_device,
 )
 from facdigger.training.e3_config import E3ExperimentConfig
 
 PretrainingInitializer = Callable[[], tuple[FinancialPatchTSTPretrainer, dict[str, Any]]]
+
+E3_PRETRAINING_CHECKPOINT_SCHEMA = 2
+E3_PATCH_ALIGNMENT_PROTOCOL = "patchifier_sequence_start_v2"
 
 
 def split_pretraining_index(
@@ -102,6 +106,17 @@ def _loader(
     return DataLoader(dataset, batch_sampler=sampler, num_workers=num_workers), sampler
 
 
+def _batches_in_current_optimizer_step(
+    batch_index: int, *, total_batches: int, configured_batches: int
+) -> int:
+    """Return the real accumulation-group size, including a residual final group."""
+
+    if not 1 <= batch_index <= total_batches:
+        raise ValueError("batch_index must identify a batch in the current epoch")
+    group_start = ((batch_index - 1) // configured_batches) * configured_batches
+    return min(configured_batches, total_batches - group_start)
+
+
 def _forward(
     model: FinancialPatchTSTPretrainer,
     batch: dict[str, torch.Tensor],
@@ -165,8 +180,9 @@ def _save_pretraining_checkpoint(
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "schema_version": 1,
+            "schema_version": E3_PRETRAINING_CHECKPOINT_SCHEMA,
             "experiment_family": "e3_pretraining",
+            "patch_alignment_protocol": E3_PATCH_ALIGNMENT_PROTOCOL,
             "model_state": model.state_dict(),
             "backbone_state": model.backbone.state_dict(),
             "optimizer_state": optimizer.state_dict(),
@@ -252,6 +268,14 @@ def train_financial_pretraining(
         checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
         if checkpoint.get("experiment_family") != "e3_pretraining":
             raise ValueError("resume checkpoint is not an E3 pretraining checkpoint")
+        if (
+            checkpoint.get("schema_version") != E3_PRETRAINING_CHECKPOINT_SCHEMA
+            or checkpoint.get("patch_alignment_protocol")
+            != E3_PATCH_ALIGNMENT_PROTOCOL
+        ):
+            raise ValueError(
+                "resume checkpoint predates the PatchTST patch/mask alignment protocol"
+            )
         if checkpoint["dataset_id"] != dataset_id:
             raise ValueError("resume checkpoint dataset_id does not match")
         if checkpoint["protocol_hash"] != protocol_hash:
@@ -283,9 +307,16 @@ def train_financial_pretraining(
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
         total_elements = 0
+        gradient_norms: list[float] = []
+        amp_skipped_optimizer_steps = 0
         for batch_index, batch in enumerate(train_loader, start=1):
             loss, elements = _forward(model, batch, device=device, amp_enabled=amp_enabled)
-            scaler.scale(loss / training.gradient_accumulation_steps).backward()
+            batches_in_step = _batches_in_current_optimizer_step(
+                batch_index,
+                total_batches=len(train_loader),
+                configured_batches=training.gradient_accumulation_steps,
+            )
+            scaler.scale(loss / batches_in_step).backward()
             total_loss += float(loss.detach().cpu()) * elements
             total_elements += elements
             should_step = (
@@ -293,11 +324,22 @@ def train_financial_pretraining(
                 or batch_index == len(train_loader)
             )
             if should_step:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), training.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+                gradient_norm, optimizer_updated = _step_optimizer(
+                    optimizer,
+                    scaler,
+                    model.parameters(),
+                    max_grad_norm=training.max_grad_norm,
+                    amp_enabled=amp_enabled,
+                    experiment_name="E3 pretraining",
+                )
+                if not optimizer_updated:
+                    amp_skipped_optimizer_steps += 1
+                    continue
+                if gradient_norm is None:
+                    raise RuntimeError(
+                        "E3 pretraining optimizer update has no finite gradient norm"
+                    )
+                gradient_norms.append(gradient_norm)
                 global_step += 1
         train_loss = total_loss / max(total_elements, 1)
         selection_loss, selection_elements = evaluate_pretraining_loss(
@@ -322,6 +364,16 @@ def train_financial_pretraining(
                 "selection_loss": selection_loss,
                 "train_masked_observed_elements": total_elements,
                 "selection_masked_observed_elements": selection_elements,
+                "gradient_accumulation_steps": training.gradient_accumulation_steps,
+                "mean_pre_clip_gradient_norm": (
+                    float(sum(gradient_norms) / len(gradient_norms))
+                    if gradient_norms
+                    else None
+                ),
+                "max_pre_clip_gradient_norm": (
+                    float(max(gradient_norms)) if gradient_norms else None
+                ),
+                "amp_skipped_optimizer_steps": amp_skipped_optimizer_steps,
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "global_step": global_step,
             }
@@ -408,6 +460,13 @@ def initialize_alpha_from_financial_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if checkpoint.get("experiment_family") != "e3_pretraining":
         raise ValueError("financial initializer is not an E3 pretraining checkpoint")
+    if (
+        checkpoint.get("schema_version") != E3_PRETRAINING_CHECKPOINT_SCHEMA
+        or checkpoint.get("patch_alignment_protocol") != E3_PATCH_ALIGNMENT_PROTOCOL
+    ):
+        raise ValueError(
+            "financial initializer predates the PatchTST patch/mask alignment protocol"
+        )
     target = _build_alpha(config, context_length)
     random_fingerprint = module_fingerprint(target.backbone)
     backbone_state = checkpoint["backbone_state"]

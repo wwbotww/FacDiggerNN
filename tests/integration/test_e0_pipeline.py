@@ -109,7 +109,7 @@ def test_e0_train_predict_report_pipeline(tmp_path, model_type: str) -> None:
                 "dropout": 0.0,
                 "max_epochs": 4,
                 "patience": 2,
-                "batch_size": 64,
+                "batch_size": 1,
                 "device": "cpu",
             },
             "lightgbm": {
@@ -144,11 +144,20 @@ def test_e0_train_predict_report_pipeline(tmp_path, model_type: str) -> None:
     ] == 0
     assert run_manifest["row_counts"]["inner_selection"] > 0
     assert run_manifest["training"]["objective"] in {
-        "cross_sectional_rank_correlation_surrogate_v1",
+        "cross_sectional_rank_correlation_surrogate_v2_full_date",
         "lambdarank",
     }
     if model_type == "mlp":
         assert "best_selection_rank_ic" in run_manifest["training"]
+        assert run_manifest["training"]["optimization_unit"] == (
+            "one_complete_asof_date_cross_section"
+        )
+        assert run_manifest["training"]["prediction_batch_size"] == 1
+        assert all(
+            epoch["complete_date_steps"]
+            == run_manifest["training"]["training_dates_per_epoch"]
+            for epoch in run_manifest["training"]["history"]
+        )
     else:
         assert run_manifest["training"]["checkpoint_metric"] == (
             "mean_daily_spearman_rank_ic"

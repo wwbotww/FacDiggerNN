@@ -44,6 +44,45 @@ def test_patchtst_alpha_shape_masks_and_backward() -> None:
     assert model.alpha_head.projection[-1].weight.grad is not None
 
 
+def test_patchtst_alpha_mask_starts_where_backbone_patchification_starts() -> None:
+    model = PatchTSTAlphaModel(
+        context_length=14,
+        num_input_channels=2,
+        patch_length=4,
+        patch_stride=4,
+        d_model=8,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        ffn_dim=16,
+        dropout=0.0,
+        attention_dropout=0.0,
+        positional_dropout=0.0,
+        path_dropout=0.0,
+        ff_dropout=0.0,
+        norm_type="layernorm",
+        pre_norm=False,
+        scaling="mean",
+        alpha_hidden_dim=8,
+        alpha_dropout=0.0,
+    )
+    values = torch.zeros(1, 14, 2)
+    observed = torch.zeros_like(values, dtype=torch.bool)
+    observed[0, :2, 0] = True  # These timesteps are discarded by PatchTST.
+    observed[0, 2, 1] = True  # This is the first element of the first real patch.
+
+    output = model(values, observed)
+    expected_elements = model.backbone.patchifier(observed)
+
+    assert model.backbone.patchifier.sequence_start == 2
+    torch.testing.assert_close(output.encoder.patch_mask, expected_elements.any(dim=-1))
+    torch.testing.assert_close(
+        output.encoder.channel_mask,
+        expected_elements.any(dim=(-1, -2)),
+    )
+    assert not output.encoder.channel_mask[0, 0]
+    assert output.encoder.patch_mask[0, 1, 0]
+
+
 def test_patchtst_alpha_can_overfit_one_tiny_batch() -> None:
     torch.manual_seed(9)
     model = PatchTSTAlphaModel(

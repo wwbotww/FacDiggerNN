@@ -86,6 +86,90 @@ class DateGroupedBatchSampler:
         return len(self._batches())
 
 
+class FullDateBatchSampler:
+    """Yield every row for one date as a single CPU-side DataLoader batch.
+
+    ``batch_size`` is deliberately absent: callers may split the collated date
+    into device microbatches, but the optimization objective must still see the
+    complete cross-section. No date is split or combined with another date.
+    """
+
+    def __init__(
+        self,
+        asof_dates: Sequence[Any],
+        *,
+        shuffle: bool,
+        seed: int,
+        minimum_group_size: int = 1,
+        drop_last: bool = False,
+    ) -> None:
+        if minimum_group_size < 1:
+            raise ValueError("minimum_group_size must be positive")
+        if drop_last:
+            raise ValueError("FullDateBatchSampler cannot drop cross-sectional rows")
+        self.shuffle = shuffle
+        self.seed = seed
+        self.minimum_group_size = minimum_group_size
+        self.drop_last = drop_last
+        self.epoch = 0
+        self.groups: list[tuple[int, int]] = []
+        seen: set[Any] = set()
+        group_start = 0
+        previous: Any | None = None
+        for index, asof_date in enumerate(asof_dates):
+            if index == 0:
+                previous = asof_date
+                seen.add(asof_date)
+                continue
+            if asof_date != previous:
+                if asof_date in seen:
+                    raise ValueError("FullDateBatchSampler requires contiguous date groups")
+                self.groups.append((group_start, index))
+                group_start = index
+                previous = asof_date
+                seen.add(asof_date)
+        if len(asof_dates) > 0:
+            self.groups.append((group_start, len(asof_dates)))
+        if not self.groups:
+            raise ValueError("FullDateBatchSampler requires at least one date group")
+        undersized = [
+            stop - start
+            for start, stop in self.groups
+            if stop - start < minimum_group_size
+        ]
+        if undersized:
+            raise ValueError(
+                "date group is smaller than minimum_group_size: "
+                f"{min(undersized)} < {minimum_group_size}"
+            )
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def state_dict(self) -> dict[str, int]:
+        return {"epoch": self.epoch}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.epoch = int(state["epoch"])
+
+    def _batches(self) -> Iterator[list[int]]:
+        generator = random.Random(self.seed + self.epoch)
+        groups = list(self.groups)
+        if self.shuffle:
+            generator.shuffle(groups)
+        for start, stop in groups:
+            group = list(range(start, stop))
+            if self.shuffle:
+                generator.shuffle(group)
+            yield group
+
+    def __iter__(self) -> Iterator[list[int]]:
+        yield from self._batches()
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+
 class SequenceBatchSampler:
     """Deterministically shuffle independent sequence windows by epoch."""
 

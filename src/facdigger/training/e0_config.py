@@ -17,7 +17,14 @@ class MLPBaselineConfig(StrictModel):
     dropout: float = Field(default=0.2, ge=0, lt=1)
     learning_rate: float = Field(default=1e-3, gt=0)
     weight_decay: float = Field(default=1e-4, ge=0)
-    batch_size: int = Field(default=256, ge=1)
+    batch_size: int = Field(
+        default=256,
+        ge=1,
+        description=(
+            "Inner-selection prediction batch size; MLP optimization always uses one "
+            "complete as-of-date cross-section"
+        ),
+    )
     max_epochs: int = Field(default=100, ge=1)
     patience: int = Field(default=15, ge=1)
     device: Literal["auto", "cpu", "cuda"] = "auto"
@@ -62,10 +69,6 @@ class E0ExperimentConfig(StrictModel):
             raise ValueError("windows must be sorted and unique")
         if any(cost < 0 for cost in self.costs_bps):
             raise ValueError("costs_bps cannot be negative")
-        if self.objective.minimum_cross_section_size > (self.mlp.batch_size + 1) // 2:
-            raise ValueError(
-                "minimum_cross_section_size cannot exceed half of MLP batch_size"
-            )
         return self
 
 

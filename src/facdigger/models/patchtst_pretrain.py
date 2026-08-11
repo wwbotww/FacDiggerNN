@@ -10,6 +10,7 @@ from torch import nn
 from transformers import PatchTSTConfig, PatchTSTForPretraining
 
 from facdigger.models.patchtst_adapter import load_matching_encoder_weights
+from facdigger.models.patchtst_alpha import patchify_observed_mask
 from facdigger.models.patchtst_transfer import (
     initialize_transferred_alpha_model,
     module_fingerprint,
@@ -83,10 +84,11 @@ class FinancialPatchTSTPretrainer(nn.Module):
             return_dict=True,
         )
         prediction = self.pretrainer.head(model_output.last_hidden_state)
-        observed_elements = (
-            observed_mask.transpose(1, 2)
-            .unfold(-1, self.patch_length, self.patch_stride)
-            .to(dtype=torch.bool)
+        observed_elements = patchify_observed_mask(
+            observed_mask,
+            patch_length=self.patch_length,
+            patch_stride=self.patch_stride,
+            sequence_start=int(self.pretrainer.model.patchifier.sequence_start),
         )
         valid = model_output.mask.to(dtype=torch.bool).unsqueeze(-1) & observed_elements
         valid_count = int(valid.sum().detach().cpu())

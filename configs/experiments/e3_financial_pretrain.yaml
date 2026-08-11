@@ -35,10 +35,12 @@ source:
 
 pretraining:
   batch_size: 64
-  max_epochs: 20
-  patience: 5
-  minimum_epochs: 3
-  learning_rate: 0.0001
+  # One old 1e-4 epoch already meant roughly 15k--19k optimizer steps and
+  # materially displaced the ETTh1 encoder. Bound the first registered rerun.
+  max_epochs: 3
+  patience: 2
+  minimum_epochs: 1
+  learning_rate: 0.00001
   weight_decay: 0.0001
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
@@ -52,21 +54,22 @@ pretraining:
 
 finetuning:
   batch_size: 64
-  max_epochs: 15
-  patience: 5
-  minimum_epochs: 4
-  head_only_epochs: 3
+  max_epochs: 5
+  patience: 2
+  minimum_epochs: 3
+  head_only_epochs: 2
   unfreeze_last_n_blocks: 1
-  head_learning_rate: 0.001
+  head_learning_rate: 0.0003
   encoder_learning_rate: 0.00001
   weight_decay: 0.0001
-  gradient_accumulation_steps: 1
+  # GPU batch_size is only the physical microbatch; the loss still covers a full date.
+  dates_per_optimizer_step: 1
   max_grad_norm: 1.0
   device: auto
   precision: fp16
   num_workers: 0
   objective:
-    name: cross_sectional_rank_correlation_surrogate_v1
+    name: cross_sectional_rank_correlation_surrogate_v2_full_date
     epsilon: 0.000001
     minimum_cross_section_size: 32
     minimum_selection_dates: 20

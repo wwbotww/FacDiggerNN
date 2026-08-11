@@ -19,6 +19,19 @@ def test_test_split_requires_explicit_unlock() -> None:
         raise AssertionError("test split was not gated")
 
 
+def test_mlp_prediction_batch_size_does_not_limit_full_date_objective() -> None:
+    config = E0ExperimentConfig.model_validate(
+        {
+            "model_type": "mlp",
+            "mlp": {"batch_size": 1},
+            "objective": {"minimum_cross_section_size": 32},
+        }
+    )
+
+    assert config.mlp.batch_size == 1
+    assert config.objective.minimum_cross_section_size == 32
+
+
 def test_multiscale_features_use_only_past_and_append_missing_masks() -> None:
     dates = [date(2025, 1, 1) + timedelta(days=index) for index in range(8)]
     features = pl.DataFrame(

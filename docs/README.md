@@ -32,11 +32,18 @@
 ## 当前状态摘要
 
 - 工程链路已覆盖标准化、快照、E0—E3、统一评价、回放、信号和 M6 walk-forward；
-- 监督阶段以同日横截面排序相关性为目标，LightGBM 使用按日期分组的 LambdaRank；
+- 监督阶段以完整日横截面排序相关性为目标；E1—E3 通过 CPU 整日组装、GPU
+  physical microbatch 和两遍回放计算精确整日梯度，LightGBM 使用按完整日分组的
+  LambdaRank；
+- 当前 E1—E3 监督 checkpoint 是 schema v3，objective 是
+  `cross_sectional_rank_correlation_surrogate_v2_full_date`；旧 v1 chunked artifacts 不能恢复或混用；
 - M6 决策要求单侧 HAC 显著性、非重叠样本稳健性和 Holm 多重比较控制；
 - final holdout 在冻结参数后重新建立截至 validation 末日的训练快照并重新训练；
 - 全历史 EODHD bronze 曾在项目机器上完成重建和质量门禁，但真实数据不随 Git 分发；
 - 真实退市收益、点时行业和点时流通市值仍缺失，因此当前 M6 是 engineering 模式。
+- 新一轮 engineering validation 的 `research_id` 是
+  `m6_eodhd_engineering_full_date_v2`，final holdout 仍锁定；RTX 2070 Super / 16 GB
+  的 `batch_size=64`、FP16 配置尚待真实 CUDA 单 cell 与完整矩阵验收。
 
 具体机器是否具备数据、来源证明、快照和 checkpoint，必须检查本地目录及 manifest，不能根据
 文档中的历史完成记录推断。

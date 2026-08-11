@@ -181,6 +181,11 @@ def test_e2_runner_writes_transfer_training_and_evaluation_artifacts(tmp_path) -
     assert manifest["status"] == "complete"
     assert manifest["training"]["stage_audits"]["ft0_head_only"]["encoder_changed"] is False
     assert manifest["training"]["stage_audits"]["ft1_last_blocks"]["encoder_changed"] is True
+    checkpoint = torch.load(
+        run_dir / "checkpoints" / "best.pt", map_location="cpu", weights_only=False
+    )
+    assert checkpoint["schema_version"] == 3
+    assert checkpoint["optimization_protocol"]["unit"] == "complete_date"
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"

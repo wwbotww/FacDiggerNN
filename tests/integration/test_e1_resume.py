@@ -80,7 +80,7 @@ def _config(tmp_path) -> E1ExperimentConfig:
                 "patience": 10,
                 "minimum_epochs": 1,
                 "learning_rate": 0.001,
-                "gradient_accumulation_steps": 2,
+                "dates_per_optimizer_step": 2,
                 "device": "cpu",
                 "precision": "fp32",
                 "objective": {
@@ -132,7 +132,7 @@ def test_epoch_resume_matches_uninterrupted_training(tmp_path) -> None:
         torch.testing.assert_close(value, resumed["model_state"][name], rtol=0, atol=0)
 
 
-def test_huber_checkpoint_cannot_resume_into_ranking_protocol(tmp_path) -> None:
+def test_legacy_chunked_checkpoint_cannot_resume_into_full_date_protocol(tmp_path) -> None:
     train_dataset, valid_dataset = _datasets()
     config = _config(tmp_path)
     checkpoint_dir = tmp_path / "legacy"
@@ -147,16 +147,16 @@ def test_huber_checkpoint_cannot_resume_into_ranking_protocol(tmp_path) -> None:
     legacy = torch.load(
         checkpoint_dir / "last.pt", map_location="cpu", weights_only=False
     )
-    legacy["schema_version"] = 1
-    legacy.pop("objective")
-    torch.save(legacy, checkpoint_dir / "legacy.pt")
+    legacy["schema_version"] = 2
+    legacy["objective"] = "cross_sectional_rank_correlation_surrogate_v1"
+    torch.save(legacy, checkpoint_dir / "legacy-v1.pt")
 
-    with pytest.raises(ValueError, match="predates the cross-sectional ranking"):
+    with pytest.raises(ValueError, match="old v1 chunked checkpoints cannot resume"):
         train_e1(
             config,
             train_dataset=train_dataset,
             valid_dataset=valid_dataset,
             dataset_id="tiny-dataset",
             checkpoint_dir=checkpoint_dir,
-            resume_from=checkpoint_dir / "legacy.pt",
+            resume_from=checkpoint_dir / "legacy-v1.pt",
         )

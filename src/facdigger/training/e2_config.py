@@ -22,6 +22,8 @@ class E2SourceConfig(StrictModel):
 
 
 class E2FineTuneConfig(StrictModel):
+    # ``batch_size`` bounds device memory only; ranking moments use a complete
+    # date cross-section assembled on CPU and replayed in these microbatches.
     batch_size: int = Field(default=64, ge=1)
     max_epochs: int = Field(default=15, ge=2)
     patience: int = Field(default=5, ge=1)
@@ -31,7 +33,7 @@ class E2FineTuneConfig(StrictModel):
     head_learning_rate: float = Field(default=1e-3, gt=0)
     encoder_learning_rate: float = Field(default=1e-5, gt=0)
     weight_decay: float = Field(default=1e-4, ge=0)
-    gradient_accumulation_steps: int = Field(default=1, ge=1)
+    dates_per_optimizer_step: int = Field(default=1, ge=1)
     max_grad_norm: float = Field(default=1.0, gt=0)
     device: Literal["auto", "cpu", "cuda"] = "auto"
     precision: Literal["fp32", "fp16"] = "fp16"
@@ -48,10 +50,6 @@ class E2FineTuneConfig(StrictModel):
             raise ValueError("minimum_epochs must include at least one FT-1 epoch")
         if self.minimum_epochs > self.max_epochs:
             raise ValueError("minimum_epochs cannot exceed max_epochs")
-        if self.objective.minimum_cross_section_size > (self.batch_size + 1) // 2:
-            raise ValueError(
-                "minimum_cross_section_size cannot exceed half of training batch_size"
-            )
         return self
 
 

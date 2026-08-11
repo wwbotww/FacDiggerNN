@@ -13,7 +13,11 @@ from facdigger.datasets.window import SnapshotWindowDataset  # noqa: E402
 from facdigger.models.patchtst_pretrain import FinancialPatchTSTPretrainer  # noqa: E402
 from facdigger.models.patchtst_transfer import module_fingerprint  # noqa: E402
 from facdigger.training.e3_config import E3ExperimentConfig  # noqa: E402
-from facdigger.training.e3_engine import train_financial_pretraining  # noqa: E402
+from facdigger.training.e3_engine import (  # noqa: E402
+    _batches_in_current_optimizer_step,
+    initialize_alpha_from_financial_checkpoint,
+    train_financial_pretraining,
+)
 
 
 def _datasets() -> tuple[SnapshotWindowDataset, SnapshotWindowDataset]:
@@ -80,6 +84,7 @@ def _config(tmp_path) -> E3ExperimentConfig:
             },
             "pretraining": {
                 "batch_size": 4,
+                "gradient_accumulation_steps": 2,
                 "max_epochs": 2,
                 "minimum_epochs": 2,
                 "patience": 2,
@@ -184,5 +189,64 @@ def test_pretraining_resume_is_bitwise_exact(tmp_path) -> None:
     resumed = torch.load(resumed_dir / "last.pt", map_location="cpu", weights_only=False)
     assert full_audit["history"] == resumed_audit["history"]
     assert resumed_audit["resumed_from_epoch"] == 1
+    assert full_audit["global_step"] == 6
+    assert full_audit["history"][-1]["amp_skipped_optimizer_steps"] == 0
     for name, value in full["model_state"].items():
         torch.testing.assert_close(value, resumed["model_state"][name], rtol=0, atol=0)
+
+
+def test_pretraining_residual_accumulation_group_uses_its_actual_size() -> None:
+    group_sizes = [
+        _batches_in_current_optimizer_step(
+            batch_index, total_batches=5, configured_batches=2
+        )
+        for batch_index in range(1, 6)
+    ]
+
+    assert group_sizes == [2, 2, 2, 2, 1]
+
+
+def test_pretraining_resume_rejects_legacy_patch_alignment_checkpoint(tmp_path) -> None:
+    train_dataset, selection_dataset = _datasets()
+    config = _config(tmp_path)
+    leakage = {
+        "source_split": "train",
+        "formal_validation_rows_used": 0,
+        "formal_test_rows_used": 0,
+    }
+    checkpoint_dir = tmp_path / "legacy"
+    train_financial_pretraining(
+        config,
+        train_dataset=train_dataset,
+        selection_dataset=selection_dataset,
+        leakage_audit=leakage,
+        dataset_id="tiny-e3",
+        checkpoint_dir=checkpoint_dir,
+        stop_after_epoch=1,
+        initializer=_initializer,
+    )
+    checkpoint = torch.load(
+        checkpoint_dir / "last.pt", map_location="cpu", weights_only=False
+    )
+    checkpoint["schema_version"] = 1
+    checkpoint.pop("patch_alignment_protocol")
+    legacy_path = checkpoint_dir / "legacy.pt"
+    torch.save(checkpoint, legacy_path)
+
+    with pytest.raises(ValueError, match="patch/mask alignment"):
+        train_financial_pretraining(
+            config,
+            train_dataset=train_dataset,
+            selection_dataset=selection_dataset,
+            leakage_audit=leakage,
+            dataset_id="tiny-e3",
+            checkpoint_dir=checkpoint_dir,
+            resume_from=legacy_path,
+            initializer=_initializer,
+        )
+    with pytest.raises(ValueError, match="patch/mask alignment"):
+        initialize_alpha_from_financial_checkpoint(
+            config,
+            context_length=train_dataset.context_length,
+            checkpoint_path=legacy_path,
+        )

@@ -29,7 +29,7 @@ EODHD 或自备标准 Parquet 数据转换为内容寻址快照，训练 E0—E3
 | 股票池 | active + delisted 候选、历史日 ADV20 动态 top-1000、交易日历和身份隔离 |
 | 数据集 | 七通道特征、Train-only scaler、五日超额收益标签、不可变快照 |
 | 模型 | E0 LightGBM/MLP、E1 随机 PatchTST、E2 ETTh1 迁移、E3 金融域预训练 |
-| 训练 | 按日期横截面 batch、排序相关性目标、inner selection、resume 和泄漏审计 |
+| 训练 | 完整日横截面排序目标、显存受限两遍精确梯度、inner selection、resume 和泄漏审计 |
 | 评价 | IC/Rank IC、ICIR、分组收益、换手、成本、稳定性和中性化可用性报告 |
 | 研究 | 多 fold/seed 矩阵、HAC/非重叠检验、Holm 校正、freeze 和 final refit |
 | 推理 | checkpoint 独立回放、无标签因子导出、最新信号和独立 prediction 评价 |
@@ -54,19 +54,26 @@ provider / 标准 Parquet
 - 监督目标：同日横截面 `1 - corr(score, target_rank)`；
 - 主评价：逐日 Rank IC 及其显著性；20 bps 组合结果是参考评价，不是排序主门禁。
 
+神经模型的监督目标是 `cross_sectional_rank_correlation_surrogate_v2_full_date`。
+DataLoader 在 CPU 一次组装一个完整交易日，GPU 内只保留由 `batch_size` 限制的
+physical microbatch；两遍回放用完整日统计量计算精确梯度。因此降低 `batch_size`
+不会把目标退化为小横截面相关性。但模型使用 train-mode BatchNorm，物理微批大小
+仍会影响 BN 统计、吞吐和训练轨迹，正式对照必须固定它。
+
 ## 安装
 
 推荐 Python 3.11 和 [uv](https://docs.astral.sh/uv/)：
 
 ```bash
-git clone --branch codex/rank-objective git@github.com:wwbotww/FacDiggerNN.git
+git clone git@github.com:wwbotww/FacDiggerNN.git
 cd FacDiggerNN
+git checkout REVIEWED_COMMIT_SHA
 uv sync --frozen --all-extras
 uv run facdigger doctor
 ```
 
-`codex/rank-objective` 是本文更新时包含排序目标、统计门禁和 final-refit 的受支持分支；合并
-后应改用维护者指定的分支，并为正式实验记录 `git rev-parse HEAD` 的确切 commit。
+正式实验必须 checkout 审阅后的确切 commit，并记录 `git rev-parse HEAD`；不要
+依赖会继续移动的分支名。
 
 `uv.lock` 是首选锁文件。`requirements-lock.txt` 是从同一 lock 导出的全 extras pip
 fallback，主要供不能使用 uv 的环境使用。Windows + RTX 2070 Super 正式训练推荐 WSL2，
@@ -148,9 +155,17 @@ uv run facdigger train e1 \
 E1—E3 支持从同一 dataset、完整配置和来源权重哈希绑定的 `last.pt` 恢复。E2/E3 首次运行
 还需要取得锁定 revision 的 IBM PatchTST 权重。
 
+当前 E1—E3 监督 checkpoint 是 schema v3，排序目标是 v2 完整日协议。旧 Huber
+或 v1 小块相关性 artifacts 只可留作历史证据，不能 resume 到当前协议，也不能与
+新结果混合比较。
+E3 reconstruction checkpoint 独立使用 schema v2 和
+`patch_alignment_protocol=patchifier_sequence_start_v2`，用来拒绝修复前 mask 错位权重。
+
 ### 3. Walk-forward engineering research
 
 M6 runner 会按 fold 自行建立 `data/walk_forward_snapshots/`，不要求先构建上面的普通快照：
+当前配置的 `research_id` 是 `m6_eodhd_engineering_full_date_v2`，用于完整日
+objective v2 的新一轮 validation；它不继承旧 artifacts，final holdout 仍锁定。
 
 ```bash
 uv run facdigger research plan \
@@ -210,7 +225,10 @@ uv run facdigger research run \
 2. 点时行业和点时流通市值缺失，正式行业/市值中性化门禁尚不能开启。
 3. 历史 bronze、快照和结果是本地资产；每台新机器都必须迁移并重新校验哈希。
 4. 16 GB RAM / RTX 2070 Super 已有内存优化和工程 pilot，但当前排序与 final-refit 协议仍需
-   在目标机重新完成资源门禁后再跑完整 M6。
+   在目标机重新完成资源门禁后再跑完整 M6。当前建议是 8 GB GPU / 16 GB
+   RAM 使用 `batch_size: 64`、FP16 先验收单个 cell；这是待实测的配置，不是已完成
+   CUDA 全流程验收或速度承诺。主配置为首轮可行性注册了 5 个监督 epoch
+   上限和 3 个 E3 reconstruction epoch 上限，不代表最优最终预算。
 5. 项目不包含交易执行、组合约束优化或生产服务。
 
 ## 开发与验证

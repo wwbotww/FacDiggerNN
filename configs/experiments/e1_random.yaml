@@ -35,18 +35,20 @@ model:
 
 training:
   batch_size: 64
-  max_epochs: 30
-  patience: 7
+  # RTX2070 feasibility protocol: full 3-fold/3-seed matrix with bounded epochs.
+  max_epochs: 5
+  patience: 2
   minimum_epochs: 3
   learning_rate: 0.0003
   weight_decay: 0.0001
-  gradient_accumulation_steps: 1
+  # GPU batch_size is only the physical microbatch; the loss still covers a full date.
+  dates_per_optimizer_step: 1
   max_grad_norm: 1.0
   device: auto
   precision: fp16
   num_workers: 0
   objective:
-    name: cross_sectional_rank_correlation_surrogate_v1
+    name: cross_sectional_rank_correlation_surrogate_v2_full_date
     epsilon: 0.000001
     minimum_cross_section_size: 32
     minimum_selection_dates: 20
