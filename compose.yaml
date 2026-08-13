@@ -1,0 +1,29 @@
+services:
+  facdigger-production:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      EODHD_API_TOKEN: ${EODHD_API_TOKEN:?set EODHD_API_TOKEN before starting production}
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+    command:
+      - production
+      - serve
+      - --config
+      - /app/configs/production/eodhd_daily.local.yaml
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/facdigger
+        - production
+        - health
+        - --config
+        - /app/configs/production/eodhd_daily.local.yaml
+      interval: 60s
+      timeout: 15s
+      retries: 4
+      start_period: 90s
+    stop_grace_period: 30s

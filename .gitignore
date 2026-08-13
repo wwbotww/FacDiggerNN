@@ -15,6 +15,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+*.local.yaml
 
 # Local research data and generated artifacts (root-only: do not hide src/*/data)
 /data/

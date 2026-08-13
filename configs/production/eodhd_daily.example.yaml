@@ -1,0 +1,34 @@
+contract: facdigger.daily_production
+
+schedule:
+  timezone: America/New_York
+  first_attempt: "19:00:00"
+  retry_minutes: 30
+  cutoff: next_regular_session_open
+
+data:
+  provider_config: configs/data/eodhd_daily_production.yaml
+  store_root: data/production/eodhd
+  revision_sessions: 10
+  feature_buffer_sessions: 20
+  bootstrap_source: data/bronze/eodhd_us_historical_liquid
+
+model:
+  release_root: artifacts/releases
+  # Copy this file to eodhd_daily.local.yaml and replace this exact value.
+  # The service never discovers or auto-upgrades releases.
+  release_id: "0000000000000000000000000000000000000000000000000000000000000000"
+  device: cpu
+
+inference:
+  output_root: data/inference_snapshots/production
+  retention_sessions: 10
+
+factor_batch:
+  output_root: artifacts/factor_batches
+  retention: forever
+  minimum_candidate_rows: 100
+  minimum_eligible_rows: 100
+
+state_database: data/production/production.sqlite3
+poll_seconds: 60

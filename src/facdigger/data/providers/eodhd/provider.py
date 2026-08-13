@@ -92,6 +92,11 @@ class EODHDProvider:
         )
         return self._client
 
+    def client(self) -> EODHDClient:
+        """Return the configured client for provider-owned production workflows."""
+
+        return self._get_client()
+
     def _resolve_symbols_and_metadata(
         self, client: EODHDClient, warnings: list[str]
     ) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, Any]]:

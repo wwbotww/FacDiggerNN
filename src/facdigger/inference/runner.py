@@ -1,10 +1,11 @@
-"""Unified E0-E3 checkpoint loading, replay verification and factor export."""
+"""Unified E0-E3 checkpoint loading, replay verification and signal inference."""
 
 from __future__ import annotations
 
 import json
 import shutil
 import uuid
+from collections.abc import Callable
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -19,13 +20,11 @@ from facdigger.datasets.window import SnapshotInferenceWindowDataset, SnapshotWi
 from facdigger.environment import collect_environment
 from facdigger.evaluation.contracts import prediction_coverage
 from facdigger.evaluation.metrics import evaluate_predictions
-from facdigger.evaluation.neutralization import neutralize_predictions
 from facdigger.evaluation.report import write_evaluation_report
 from facdigger.experiments.manifest import sha256_json
 from facdigger.models.baselines import (
     TabularPreprocessor,
     build_multiscale_features,
-    build_multiscale_inference_features,
     load_mlp_checkpoint,
     predict_lightgbm_checkpoint,
     predict_mlp,
@@ -34,6 +33,7 @@ from facdigger.models.patchtst_alpha import PatchTSTAlphaModel
 from facdigger.training.common import (
     apply_source_readiness_gate,
     build_prediction_frame,
+    load_required_snapshot_features,
     load_source_provenance,
     load_training_snapshot,
 )
@@ -105,34 +105,6 @@ def _validate_dataset(
     if sha256_file(dataset_path / "manifest.json") != expected_hash:
         raise DataContractError("inference dataset manifest hash does not match source run")
     return dataset_manifest, frames
-
-
-def _load_signal_snapshot(
-    manifest: dict[str, Any], dataset_path: Path
-) -> tuple[dict[str, Any], dict[str, pl.DataFrame]]:
-    """Load only target-free artifacts required by live signal generation."""
-
-    manifest_path = dataset_path / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Dataset manifest does not exist: {manifest_path}")
-    dataset_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if dataset_manifest.get("schema_version", 0) < 3:
-        raise DataContractError(
-            "latest signal inference requires a schema-v3 snapshot with inference_index.parquet"
-        )
-    if dataset_manifest["dataset_id"] != manifest["dataset_id"]:
-        raise DataContractError("signal dataset_id does not match source run")
-    if sha256_file(manifest_path) != manifest["dataset_manifest_hash"]:
-        raise DataContractError("signal dataset manifest hash does not match source run")
-    artifacts = dataset_manifest.get("artifacts") or {}
-    feature_path = dataset_path / str(artifacts.get("features", "features.parquet"))
-    inference_path = dataset_path / str(artifacts.get("inference_index", ""))
-    if not feature_path.is_file() or not inference_path.is_file():
-        raise DataContractError("schema-v3 target-free signal artifacts are missing")
-    return dataset_manifest, {
-        "features": pl.read_parquet(feature_path),
-        "inference_index": pl.read_parquet(inference_path),
-    }
 
 
 def _load_preprocessor(
@@ -340,151 +312,94 @@ def _verify_replay(
     return audit
 
 
-def _factor_frame(predictions: pl.DataFrame) -> pl.DataFrame:
-    return predictions.select(
-        "security_id",
-        "symbol",
-        "asof_date",
-        "score_raw",
-        "score_neutralized",
-        "split",
-        "model_id",
-        "checkpoint_hash",
-        "dataset_id",
-    ).with_columns(
-        pl.lit("after_close").alias("signal_available"),
-        pl.lit("next_session_open").alias("earliest_execution"),
-    )
-
-
-def _select_inference_rows(
+def _select_signal_inputs(
     index: pl.DataFrame,
+    delivery_universe: pl.DataFrame,
     *,
-    asof: str | None,
-    start_date: date | None,
-    end_date: date | None,
-) -> pl.DataFrame:
-    if asof is not None and (start_date is not None or end_date is not None):
-        raise ValueError("asof cannot be combined with start_date or end_date")
-    selected = index
-    if asof is not None:
-        selected_date = (
-            index["asof_date"].max() if asof == "latest" else date.fromisoformat(asof)
-        )
-        selected = index.filter(pl.col("asof_date") == selected_date)
-    else:
-        if start_date is not None:
-            selected = selected.filter(pl.col("asof_date") >= start_date)
-        if end_date is not None:
-            selected = selected.filter(pl.col("asof_date") <= end_date)
-    selected = selected.sort(["asof_date", "security_id"])
-    if selected.is_empty():
-        raise DataContractError("inference date selection contains no eligible rows")
-    return selected
+    asof: str,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Select one declared candidate date without silently falling back to stale scores."""
 
-
-def _build_live_factor_frame(
-    rows: pl.DataFrame,
-    scores: np.ndarray,
-    *,
-    model_id: str,
-    checkpoint_hash: str,
-    dataset_id: str,
-) -> tuple[pl.DataFrame, dict[str, Any]]:
-    if len(scores) != rows.height:
-        raise DataContractError("model score count differs from inference index row count")
-    factors = rows.select(
-        "security_id",
-        "symbol",
-        "asof_date",
-        "eligible",
-        "industry_code",
-        "log_float_market_cap",
-    ).with_columns(
-        pl.Series("score_raw", scores, dtype=pl.Float64),
-        pl.lit(None, dtype=pl.Float64).alias("score_neutralized"),
-        pl.lit(model_id).alias("model_id"),
-        pl.lit(checkpoint_hash).alias("checkpoint_hash"),
-        pl.lit(dataset_id).alias("dataset_id"),
-        pl.lit("after_close").alias("signal_available"),
-        pl.lit("next_session_open").alias("earliest_execution"),
+    selected_date = (
+        delivery_universe["asof_date"].max()
+        if asof == "latest"
+        else date.fromisoformat(asof)
     )
-    if factors["score_raw"].is_null().any() or not np.isfinite(
-        factors["score_raw"].to_numpy()
-    ).all():
-        raise DataContractError("factor scores must be finite and non-null")
-    return neutralize_predictions(factors)
+    candidates = delivery_universe.filter(
+        pl.col("asof_date") == selected_date
+    ).sort("security_id")
+    if candidates.is_empty():
+        raise DataContractError("requested signal date is absent from the delivery universe")
+    rows = index.filter(pl.col("asof_date") == selected_date).sort("security_id")
+    return rows, candidates
 
 
 def run_signal_inference(
-    run_dir: str | Path,
+    release_dir: str | Path,
     *,
-    output_dir: str | Path | None = None,
-    dataset_dir: str | Path | None = None,
-    asof: str | None = "latest",
-    start_date: date | None = None,
-    end_date: date | None = None,
+    output_root: str | Path = "artifacts/factor_batches",
+    dataset_dir: str | Path,
+    asof: str = "latest",
     device: Literal["auto", "cpu", "cuda"] = "cpu",
+    before_publish: Callable[[], None] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    """Score target-free schema-v3 rows without reading labels or test membership."""
+    """Score one target-free inference snapshot and publish a FactorBatch."""
 
-    source_run = Path(run_dir).resolve()
-    manifest, config_payload, checkpoint_path = _load_source_run(source_run)
-    dataset_path = Path(dataset_dir or manifest["dataset_path"]).resolve()
-    dataset_manifest, frames = _load_signal_snapshot(manifest, dataset_path)
-    inference_index = frames["inference_index"]
-    rows = _select_inference_rows(
-        inference_index,
-        asof=asof,
-        start_date=start_date,
-        end_date=end_date,
+    from facdigger.data.inference_snapshots import load_inference_snapshot
+    from facdigger.data.providers.eodhd.market_calendar import CALENDAR_VERSION
+    from facdigger.inference.factor_batch import (
+        FactorBatchInput,
+        FactorBatchTime,
+        build_factor_frame,
+        factor_batch_metadata,
+        factor_universe_sha256,
+        publish_factor_batch,
     )
-    context_length = int(dataset_manifest["config"]["features"]["context_length"])
-    channels = list(dataset_manifest["config"]["features"]["channels"])
-    if list(config_payload["channels"]) != channels:
-        raise DataContractError("source run channels differ from inference dataset")
+    from facdigger.inference.releases import release_runtime
 
-    if manifest["model_type"] in {"mlp", "lightgbm"}:
-        config = E0ExperimentConfig.model_validate(config_payload)
-        tabular, feature_columns = build_multiscale_inference_features(
-            frames["features"],
-            rows,
-            channels=config.channels,
-            windows=config.windows,
-            context_length=context_length,
+    release_path = Path(release_dir).resolve()
+    release, config_payload, checkpoint_path = release_runtime(release_path)
+    if release.model_type != "financial_pretrained_patchtst":
+        raise DataContractError(
+            "cross-project signal inference currently accepts only an E3 ModelRelease"
+    )
+    dataset_path = Path(dataset_dir).resolve()
+    dataset_manifest, frames = load_inference_snapshot(dataset_path, release)
+    inference_index = frames["inference_index"]
+    rows, candidate_universe = _select_signal_inputs(
+        inference_index,
+        frames["delivery_universe"],
+        asof=asof,
+    )
+    context_length = release.feature_contract.context_length
+    channels = list(release.feature_contract.channels)
+    if list(config_payload["channels"]) != channels:
+        raise DataContractError("release channels differ from inference dataset")
+
+    config, inference_config = _patch_config(release.model_type, config_payload)
+    if rows.is_empty():
+        scored_rows = pl.DataFrame(
+            schema={
+                "security_id": pl.String,
+                "asof_date": pl.Date,
+                "score": pl.Float64,
+            }
         )
-        if feature_columns != list(manifest["feature_columns"]):
-            raise DataContractError("reconstructed E0 feature columns differ from source run")
-        if manifest["model_type"] == "mlp":
-            selected_device = select_device(device)
-            model, preprocessor, checkpoint_payload = load_mlp_checkpoint(
-                checkpoint_path, device=selected_device
-            )
-            scores = predict_mlp(model, preprocessor.transform(tabular), selected_device)
-            loader_audit = {
-                "loader": "embedded_mlp_checkpoint",
-                "device": selected_device,
-                "checkpoint_seed": checkpoint_payload.get("seed"),
-            }
-        else:
-            preprocessor, preprocessing_audit = _load_preprocessor(
-                source_run, manifest, checkpoint_path
-            )
-            scores = predict_lightgbm_checkpoint(
-                checkpoint_path, preprocessor.transform(tabular)
-            )
-            loader_audit = {
-                "loader": "isolated_lightgbm_checkpoint",
-                "device": "cpu",
-                "preprocessing": preprocessing_audit,
-            }
-        if preprocessor.feature_columns != feature_columns:
-            raise DataContractError("E0 preprocessing feature columns differ from reconstruction")
-        scored_rows = rows
     else:
-        config, inference_config = _patch_config(manifest["model_type"], config_payload)
+        required_features = load_required_snapshot_features(
+            dataset_path,
+            {
+                "config": {
+                    "features": {
+                        "channels": channels,
+                    }
+                },
+                "artifacts": dataset_manifest["artifacts"],
+            },
+            rows,
+        )
         dataset = SnapshotInferenceWindowDataset(
-            features=frames["features"],
+            features=required_features,
             inference_index=rows,
             channels=config.channels,
             context_length=context_length,
@@ -500,8 +415,8 @@ def run_signal_inference(
         checkpoint = torch.load(
             checkpoint_path, map_location=selected_device, weights_only=False
         )
-        if checkpoint.get("dataset_id") != manifest["dataset_id"]:
-            raise DataContractError("PatchTST checkpoint dataset_id does not match source run")
+        if checkpoint.get("dataset_id") != release.training_data.dataset_id:
+            raise DataContractError("checkpoint training dataset differs from ModelRelease")
         model.load_state_dict(checkpoint["model_state"], strict=True)
         precision = inference_config.precision if selected_device == "cuda" else "fp32"
         scores = predict_e1(
@@ -512,80 +427,38 @@ def run_signal_inference(
             precision=precision,
             num_workers=inference_config.num_workers,
         )
-        scored_rows = dataset.sample_rows.drop("split")
-        loader_audit = {
-            "loader": "strict_patchtst_state_dict",
-            "device": selected_device,
-            "precision": precision,
-            "checkpoint_epoch": checkpoint.get("epoch"),
-            "checkpoint_best_epoch": checkpoint.get("best_epoch"),
-        }
-
-    checkpoint_hash = sha256_file(checkpoint_path)
-    factors, neutralization_audit = _build_live_factor_frame(
-        scored_rows,
-        scores,
-        model_id=manifest["model_id"],
-        checkpoint_hash=checkpoint_hash,
-        dataset_id=manifest["dataset_id"],
+        scored_rows = dataset.sample_rows.select(
+            "security_id", "asof_date"
+        ).with_columns(pl.Series("score", scores, dtype=pl.Float64))
+    candidate_universe = candidate_universe.select(
+        "security_id", "symbol", "asof_date", "eligible"
     )
-    created_at = datetime.now(timezone.utc)
-    destination = (
-        Path(output_dir).resolve()
-        if output_dir is not None
-        else source_run
-        / "signals"
-        / f"{created_at.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    factors = build_factor_frame(candidate_universe, scored_rows)
+    source_metadata, model_metadata = factor_batch_metadata(
+        release, source_kind="signal_inference"
     )
-    if destination.exists():
-        raise FileExistsError(f"signal output already exists: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.parent / f".tmp-{destination.name}-{uuid.uuid4().hex}"
-    temporary.mkdir(parents=False, exist_ok=False)
-    factors_path = temporary / "factors.parquet"
-    factors.write_parquet(factors_path)
-    signal_manifest = {
-        "schema_version": 1,
-        "status": "complete",
-        "created_at": created_at.isoformat(),
-        "source_run": str(source_run),
-        "source_run_id": manifest["run_id"],
-        "source_run_manifest_sha256": sha256_file(source_run / "manifest.json"),
-        "source_model_type": manifest["model_type"],
-        "dataset_id": manifest["dataset_id"],
-        "dataset_path": str(dataset_path),
-        "dataset_manifest_sha256": sha256_file(dataset_path / "manifest.json"),
-        "checkpoint": {"file": str(checkpoint_path), "sha256": checkpoint_hash},
-        "selection": {
-            "asof": asof,
-            "start_date": start_date,
-            "end_date": end_date,
-            "minimum_asof_date": factors["asof_date"].min(),
-            "maximum_asof_date": factors["asof_date"].max(),
-        },
-        "row_count": factors.height,
-        "coverage": {"expected": rows.height, "actual": factors.height, "coverage": 1.0},
-        "loader": loader_audit,
-        "neutralization": neutralization_audit,
-        "factor_contract": {
-            "contains_target": False,
-            "reads_labels": False,
-            "reads_test_membership": False,
-            "signal_available": "after_close",
-            "earliest_execution": "next_session_open",
-        },
-        "environment": collect_environment(include_model_dependencies=True),
-        "artifacts": {
-            "factors": {"file": "factors.parquet", "sha256": sha256_file(factors_path)}
-        },
-    }
-    try:
-        _write_json(temporary / "manifest.json", signal_manifest)
-        temporary.rename(destination)
-    except Exception:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
-    return destination, signal_manifest
+    input_metadata = FactorBatchInput(
+        snapshot_id=str(dataset_manifest["snapshot_id"]),
+        snapshot_manifest_sha256=sha256_file(dataset_path / "manifest.json"),
+        universe_semantics="complete_candidate_cross_section",
+        universe_sha256=factor_universe_sha256(candidate_universe),
+        identity_policy=release.feature_contract.identity_policy,
+    )
+    time_metadata = FactorBatchTime(
+        calendar_version=CALENDAR_VERSION,
+        minimum_asof_date=factors["asof_date"].min(),
+        maximum_asof_date=factors["asof_date"].max(),
+    )
+    destination, factor_manifest = publish_factor_batch(
+        factors,
+        output_root,
+        source=source_metadata,
+        model=model_metadata,
+        input_metadata=input_metadata,
+        time_metadata=time_metadata,
+        before_commit=before_publish,
+    )
+    return destination, factor_manifest.model_dump(mode="json")
 
 
 def run_inference(
@@ -697,12 +570,9 @@ def run_inference(
     temporary = destination.parent / f".tmp-{destination.name}-{uuid.uuid4().hex}"
     temporary.mkdir(parents=False, exist_ok=False)
     predictions_path = temporary / "predictions.parquet"
-    factors_path = temporary / "factors.parquet"
     metrics_path = temporary / "metrics.json"
     try:
         predictions.write_parquet(predictions_path)
-        factors = _factor_frame(predictions)
-        factors.write_parquet(factors_path)
         _write_json(metrics_path, metrics)
         write_evaluation_report(metrics, temporary / "report.html")
     except Exception:
@@ -730,20 +600,11 @@ def run_inference(
         "coverage": coverage,
         "loader": loader_audit,
         "replay_verification": replay_audit,
-        "factor_contract": {
-            "contains_target": False,
-            "signal_available": "after_close",
-            "earliest_execution": "next_session_open",
-        },
         "environment": collect_environment(include_model_dependencies=True),
         "artifacts": {
             "predictions": {
                 "file": "predictions.parquet",
                 "sha256": sha256_file(predictions_path),
-            },
-            "factors": {
-                "file": "factors.parquet",
-                "sha256": sha256_file(factors_path),
             },
             "metrics": {"file": "metrics.json", "sha256": sha256_file(metrics_path)},
             "report": "report.html",

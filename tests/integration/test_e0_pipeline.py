@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import json
-import shutil
 from datetime import date, timedelta
 
 import polars as pl
 import pytest
 
 from facdigger.data.config import DatasetBuildConfig
-from facdigger.data.snapshots import build_dataset_snapshot
+from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
 from facdigger.evaluation.runner import evaluate_prediction_file
-from facdigger.inference.runner import run_inference, run_signal_inference
+from facdigger.inference.runner import run_inference
 from facdigger.training.e0 import run_e0
 from facdigger.training.e0_config import E0ExperimentConfig
 
@@ -162,37 +161,19 @@ def test_e0_train_predict_report_pipeline(tmp_path, model_type: str) -> None:
         assert run_manifest["training"]["checkpoint_metric"] == (
             "mean_daily_spearman_rank_ic"
         )
+    assert run_manifest["input"]["feature_scaler_sha256"] == sha256_file(
+        snapshot_dir / "scaler.json"
+    )
+    assert run_manifest["predictions_sha256"] == sha256_file(
+        run_dir / "predictions.parquet"
+    )
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"
     )
     assert replay_manifest["replay_verification"]["matched"] is True
-    factors = pl.read_parquet(replay_dir / "factors.parquet")
-    assert "target" not in factors.columns
-    assert factors["signal_available"].unique().to_list() == ["after_close"]
-    assert factors["earliest_execution"].unique().to_list() == ["next_session_open"]
-
-    signal_dir, signal_manifest = run_signal_inference(
-        run_dir, output_dir=tmp_path / "latest-signal", device="cpu"
-    )
-    latest_factors = pl.read_parquet(signal_dir / "factors.parquet")
-    assert signal_manifest["factor_contract"]["reads_labels"] is False
-    assert signal_manifest["factor_contract"]["reads_test_membership"] is False
-    assert latest_factors["asof_date"].unique().to_list() == [calendar[-1]]
-    assert "target" not in latest_factors.columns
-    assert latest_factors.height == 6
-
-    target_free_snapshot = tmp_path / "target-free-snapshot"
-    target_free_snapshot.mkdir()
-    for filename in ["manifest.json", "features.parquet", "inference_index.parquet"]:
-        shutil.copyfile(snapshot_dir / filename, target_free_snapshot / filename)
-    _, isolated_signal_manifest = run_signal_inference(
-        run_dir,
-        dataset_dir=target_free_snapshot,
-        output_dir=tmp_path / "isolated-latest-signal",
-        device="cpu",
-    )
-    assert isolated_signal_manifest["row_count"] == 6
+    assert (replay_dir / "predictions.parquet").is_file()
+    assert not (replay_dir / "factors.parquet").exists()
 
     evaluation_dir, evaluation_manifest = evaluate_prediction_file(
         run_dir / "predictions.parquet",

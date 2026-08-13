@@ -10,7 +10,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
 from facdigger.data.config import DatasetBuildConfig  # noqa: E402
-from facdigger.data.snapshots import build_dataset_snapshot  # noqa: E402
+from facdigger.data.snapshots import build_dataset_snapshot, sha256_file  # noqa: E402
 from facdigger.inference.runner import run_inference  # noqa: E402
 from facdigger.models.patchtst_alpha import PatchTSTAlphaModel  # noqa: E402
 from facdigger.models.patchtst_transfer import module_fingerprint  # noqa: E402
@@ -186,9 +186,16 @@ def test_e2_runner_writes_transfer_training_and_evaluation_artifacts(tmp_path) -
     )
     assert checkpoint["schema_version"] == 3
     assert checkpoint["optimization_protocol"]["unit"] == "complete_date"
+    assert manifest["input"]["feature_scaler_sha256"] == sha256_file(
+        snapshot_dir / "scaler.json"
+    )
+    assert manifest["predictions_sha256"] == sha256_file(
+        run_dir / "predictions.parquet"
+    )
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"
     )
     assert replay_manifest["replay_verification"]["matched"] is True
-    assert (replay_dir / "factors.parquet").is_file()
+    assert (replay_dir / "predictions.parquet").is_file()
+    assert not (replay_dir / "factors.parquet").exists()

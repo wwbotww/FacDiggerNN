@@ -268,6 +268,13 @@ def run_e0(
             "test_unlocked": config.unlock_test,
             "feature_columns": feature_columns,
             "input_dimensions_with_masks": len(feature_columns) * 2,
+            "input": {
+                "feature_set": dataset_config["features"].get("name"),
+                "context_length": context_length,
+                "channels": config.channels,
+                "feature_scaler": dataset_config["features"].get("scaler"),
+                "feature_scaler_sha256": sha256_file(dataset_path / "scaler.json"),
+            },
             "row_counts": {
                 **row_counts,
             },
@@ -279,6 +286,9 @@ def run_e0(
             },
             "training": training_audit,
             "source_provenance": source_provenance,
+            "predictions_sha256": sha256_file(
+                temporary_dir / "predictions.parquet"
+            ),
             "git": collect_git_state(repository_root),
             "environment": collect_environment(include_model_dependencies=True),
             "artifacts": {

@@ -199,6 +199,7 @@ def build_universe(
     min_adv20_usd: float,
     max_daily_symbols: int | None = None,
     calendar: pl.DataFrame | None = None,
+    listed_day_offsets: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Build a full security-session grid and optional daily dynamic-liquidity universe.
 
@@ -267,6 +268,30 @@ def build_universe(
             validate="1:1",
         )
         .sort(["security_id", "trade_date"])
+    )
+    if listed_day_offsets is None:
+        frame = frame.with_columns(pl.lit(0, dtype=pl.Int64).alias("_listed_day_offset"))
+    else:
+        required = {"security_id", "listed_day_offset"}
+        if set(listed_day_offsets.columns) != required:
+            raise ValueError(
+                "listed_day_offsets columns must exactly equal security_id and "
+                "listed_day_offset"
+            )
+        if listed_day_offsets["security_id"].n_unique() != listed_day_offsets.height:
+            raise ValueError("listed_day_offsets security_id values must be unique")
+        if listed_day_offsets.filter(pl.col("listed_day_offset") < 0).height:
+            raise ValueError("listed_day_offsets values must be non-negative")
+        frame = frame.join(
+            listed_day_offsets.with_columns(pl.col("listed_day_offset").cast(pl.Int64)),
+            on="security_id",
+            how="left",
+            validate="m:1",
+        ).with_columns(
+            pl.col("listed_day_offset").fill_null(0).alias("_listed_day_offset")
+        ).drop("listed_day_offset")
+    frame = (
+        frame
         .with_columns(
             pl.col("_observed_symbol")
             .forward_fill()
@@ -278,7 +303,10 @@ def build_universe(
             .rolling_mean(window_size=20, min_samples=20)
             .over("security_id")
             .alias("adv20_usd"),
-            pl.int_range(1, pl.len() + 1).over("security_id").alias("listed_days"),
+            (
+                pl.int_range(1, pl.len() + 1).over("security_id")
+                + pl.col("_listed_day_offset")
+            ).alias("listed_days"),
             pl.col("_exchange_source")
             .fill_null("US")
             .str.to_uppercase()

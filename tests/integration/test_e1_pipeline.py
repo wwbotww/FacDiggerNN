@@ -10,8 +10,8 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
 from facdigger.data.config import DatasetBuildConfig  # noqa: E402
-from facdigger.data.snapshots import build_dataset_snapshot  # noqa: E402
-from facdigger.inference.runner import run_inference, run_signal_inference  # noqa: E402
+from facdigger.data.snapshots import build_dataset_snapshot, sha256_file  # noqa: E402
+from facdigger.inference.runner import run_inference  # noqa: E402
 from facdigger.training.e1 import run_e1  # noqa: E402
 from facdigger.training.e1_config import E1ExperimentConfig  # noqa: E402
 
@@ -140,6 +140,12 @@ def test_e1_run_can_be_reloaded_for_bitwise_replay(tmp_path) -> None:
     assert "best_selection_rank_ic" in checkpoint
     assert "best_valid_loss" not in checkpoint
     assert run_manifest["training"]["objective"] == checkpoint["objective"]
+    assert run_manifest["input"]["feature_scaler_sha256"] == sha256_file(
+        snapshot / "scaler.json"
+    )
+    assert run_manifest["predictions_sha256"] == sha256_file(
+        run_dir / "predictions.parquet"
+    )
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"
@@ -147,12 +153,5 @@ def test_e1_run_can_be_reloaded_for_bitwise_replay(tmp_path) -> None:
 
     assert replay_manifest["source_model_type"] == "random_patchtst"
     assert replay_manifest["replay_verification"]["matched"] is True
-    assert (replay_dir / "factors.parquet").is_file()
-
-    signal_dir, signal_manifest = run_signal_inference(
-        run_dir, output_dir=tmp_path / "latest-signal", device="cpu"
-    )
-    factors = pl.read_parquet(signal_dir / "factors.parquet")
-    assert signal_manifest["factor_contract"]["reads_labels"] is False
-    assert factors["asof_date"].unique().to_list() == [calendar[-1]]
-    assert "target" not in factors.columns
+    assert (replay_dir / "predictions.parquet").is_file()
+    assert not (replay_dir / "factors.parquet").exists()

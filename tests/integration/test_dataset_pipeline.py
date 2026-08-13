@@ -7,18 +7,27 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 
-from facdigger.data.config import DatasetBuildConfig, SplitConfig
+from facdigger.data.config import (
+    DatasetBuildConfig,
+    InferenceSnapshotConfig,
+    SplitConfig,
+)
 from facdigger.data.contracts import (
     DataContractError,
     validate_bars,
     validate_delistings,
     validate_universe,
 )
+from facdigger.data.inference_snapshots import (
+    build_inference_snapshot,
+    load_inference_snapshot,
+)
 from facdigger.data.provenance import build_standardization_contract
 from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
 from facdigger.datasets.splits import assign_chronological_splits
 from facdigger.features.price_volume import build_price_volume_features
 from facdigger.features.scaling import fit_train_robust_scaler
+from facdigger.inference.releases import ModelReleaseManifest
 from facdigger.labels.forward_return import build_forward_excess_return_labels
 
 
@@ -309,3 +318,334 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
     moved_dir, moved_manifest = build_dataset_snapshot(moved_config)
     assert moved_dir.parent != first_dir.parent
     assert moved_manifest["dataset_id"] == first_manifest["dataset_id"]
+
+
+def test_inference_snapshot_reuses_release_scaler_without_labels_or_fit(
+    tmp_path, monkeypatch
+) -> None:
+    bars, universe = synthetic_frames(90)
+    bars_path = tmp_path / "bars.parquet"
+    universe_path = tmp_path / "universe.parquet"
+    bars.write_parquet(bars_path)
+    universe.write_parquet(universe_path)
+    calendar = sessions(90)
+    training_snapshot, training_manifest = build_dataset_snapshot(
+        DatasetBuildConfig.model_validate(
+            {
+                "sources": {"bars": bars_path, "universe": universe_path},
+                "output_root": tmp_path / "training-snapshots",
+                "features": {"context_length": 20},
+                "split": {
+                    "train_end": calendar[35],
+                    "valid_end": calendar[58],
+                    "test_end": calendar[82],
+                    "embargo_sessions": 2,
+                },
+            }
+        )
+    )
+    scaler = json.loads((training_snapshot / "scaler.json").read_text(encoding="utf-8"))
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    scaler_path = release_dir / "scaler.json"
+    scaler_path.write_text(
+        (training_snapshot / "scaler.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    release = ModelReleaseManifest.model_validate(
+        {
+            "release_id": "1" * 64,
+            "created_at": "2026-08-12T00:00:00+00:00",
+            "model_id": "e3-test",
+            "model_type": "financial_pretrained_patchtst",
+            "forecast_horizon_sessions": 5,
+            "objective": "rank",
+            "target_transform": "rank",
+            "source": {
+                "repository": "FacDiggerNN",
+                "commit": "1" * 40,
+                "run_id": "run-1",
+                "run_manifest_sha256": "2" * 64,
+                "predictions_sha256": "5" * 64,
+                "git_clean": True,
+            },
+            "training_data": {
+                "dataset_id": training_manifest["dataset_id"],
+                "dataset_manifest_sha256": sha256_file(training_snapshot / "manifest.json"),
+            },
+            "feature_contract": {
+                "feature_set": "price_volume_v1",
+                "channels": list(scaler["channels"]),
+                "context_length": 20,
+                "scaler_sha256": sha256_file(scaler_path),
+                "scaler_contract": "train_global_robust",
+                "identity_policy": "provider_neutral_security_id",
+            },
+            "artifacts": {
+                name: {"file": name, "sha256": "4" * 64, "bytes": 1}
+                for name in {
+                    "checkpoint",
+                    "checkpoint_protocol",
+                    "resolved_config",
+                    "training_dataset_manifest",
+                    "source_run_manifest",
+                }
+            }
+            | {
+                "scaler": {
+                    "file": "scaler.json",
+                    "sha256": sha256_file(scaler_path),
+                    "bytes": scaler_path.stat().st_size,
+                }
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "facdigger.data.inference_snapshots.load_model_release", lambda _: release
+    )
+    monkeypatch.setattr(
+        "facdigger.data.snapshots.fit_train_robust_scaler",
+        lambda *args, **kwargs: pytest.fail("inference path must not fit a scaler"),
+    )
+
+    snapshot, manifest = build_inference_snapshot(
+        InferenceSnapshotConfig.model_validate(
+            {
+                "sources": {"bars": bars_path, "universe": universe_path},
+                "output_root": tmp_path / "inference-snapshots",
+            }
+        ),
+        release_dir,
+    )
+
+    assert manifest["feature_contract"]["scaler_sha256"] == sha256_file(scaler_path)
+    assert "labels" not in manifest["artifacts"]
+    assert "sample_index" not in manifest["artifacts"]
+    assert (snapshot / "delivery_universe.parquet").is_file()
+    assert (snapshot / "scaler.json").read_text(encoding="utf-8") == (
+        json.dumps(scaler, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    )
+    assert pl.read_parquet(snapshot / "features.parquet").equals(
+        pl.read_parquet(training_snapshot / "features.parquet"),
+        null_equal=True,
+    )
+
+    loaded_manifest, frames = load_inference_snapshot(snapshot, release)
+    assert loaded_manifest["snapshot_id"] == manifest["snapshot_id"]
+    assert set(frames) == {"inference_index", "delivery_universe"}
+    eligible_universe = frames["delivery_universe"].filter(pl.col("eligible")).select(
+        "security_id", "symbol", "asof_date"
+    )
+    assert eligible_universe.equals(
+        frames["inference_index"].select("security_id", "symbol", "asof_date"),
+        null_equal=True,
+    )
+
+
+def test_inference_snapshot_loader_rejects_eligibility_drift(
+    tmp_path, monkeypatch
+) -> None:
+    bars, universe = synthetic_frames(50)
+    bars_path = tmp_path / "bars.parquet"
+    universe_path = tmp_path / "universe.parquet"
+    bars.write_parquet(bars_path)
+    universe.write_parquet(universe_path)
+    scaler = fit_train_robust_scaler(
+        build_price_volume_features(validate_bars(bars), validate_universe(universe)),
+        [
+            "r_close",
+            "r_gap",
+            "r_intraday",
+            "range",
+            "dlog_volume",
+            "vol20",
+            "dollar_volume_z20",
+        ],
+        sessions(50)[30],
+    )
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    scaler_path = release_dir / "scaler.json"
+    scaler_path.write_text(
+        json.dumps(scaler, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    release = ModelReleaseManifest.model_validate(
+        {
+            "release_id": "1" * 64,
+            "created_at": "2026-08-12T00:00:00+00:00",
+            "model_id": "e3-test",
+            "model_type": "financial_pretrained_patchtst",
+            "forecast_horizon_sessions": 5,
+            "objective": "rank",
+            "target_transform": "rank",
+            "source": {
+                "repository": "FacDiggerNN",
+                "commit": "1" * 40,
+                "run_id": "run-1",
+                "run_manifest_sha256": "2" * 64,
+                "predictions_sha256": "5" * 64,
+                "git_clean": True,
+            },
+            "training_data": {
+                "dataset_id": "training-1",
+                "dataset_manifest_sha256": "3" * 64,
+            },
+            "feature_contract": {
+                "feature_set": "price_volume_v1",
+                "channels": list(scaler["channels"]),
+                "context_length": 20,
+                "scaler_sha256": sha256_file(scaler_path),
+                "scaler_contract": "train_global_robust",
+                "identity_policy": "provider_neutral_security_id",
+            },
+            "artifacts": {
+                name: {"file": name, "sha256": "4" * 64, "bytes": 1}
+                for name in {
+                    "checkpoint",
+                    "checkpoint_protocol",
+                    "resolved_config",
+                    "training_dataset_manifest",
+                    "source_run_manifest",
+                }
+            }
+            | {
+                "scaler": {
+                    "file": "scaler.json",
+                    "sha256": sha256_file(scaler_path),
+                    "bytes": scaler_path.stat().st_size,
+                }
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "facdigger.data.inference_snapshots.load_model_release", lambda _: release
+    )
+    snapshot, _ = build_inference_snapshot(
+        InferenceSnapshotConfig.model_validate(
+            {
+                "sources": {"bars": bars_path, "universe": universe_path},
+                "output_root": tmp_path / "inference-snapshots",
+            }
+        ),
+        release_dir,
+    )
+    delivery_path = snapshot / "delivery_universe.parquet"
+    delivery = pl.read_parquet(delivery_path)
+    changed_key = (pl.col("security_id") == delivery["security_id"][0]) & (
+        pl.col("asof_date") == delivery["asof_date"][0]
+    )
+    delivery.with_columns(
+        pl.when(changed_key)
+        .then(~pl.col("eligible"))
+        .otherwise(pl.col("eligible"))
+        .alias("eligible")
+    ).write_parquet(delivery_path)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_hashes"]["delivery_universe"] = sha256_file(delivery_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(DataContractError, match="eligibility does not exactly match"):
+        load_inference_snapshot(snapshot, release)
+
+
+def test_exact_date_inference_snapshot_is_partitioned_and_contains_only_target(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    bars, universe = synthetic_frames(50)
+    bars_path = tmp_path / "bars.parquet"
+    universe_path = tmp_path / "universe.parquet"
+    bars.write_parquet(bars_path)
+    universe.write_parquet(universe_path)
+    raw = build_price_volume_features(validate_bars(bars), validate_universe(universe))
+    scaler = fit_train_robust_scaler(
+        raw,
+        [
+            "r_close",
+            "r_gap",
+            "r_intraday",
+            "range",
+            "dlog_volume",
+            "vol20",
+            "dollar_volume_z20",
+        ],
+        sessions(50)[30],
+    )
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    scaler_path = release_dir / "scaler.json"
+    scaler_path.write_text(json.dumps(scaler, sort_keys=True), encoding="utf-8")
+    release = ModelReleaseManifest.model_validate(
+        {
+            "release_id": "1" * 64,
+            "created_at": "2026-08-12T00:00:00+00:00",
+            "model_id": "e3-test",
+            "model_type": "financial_pretrained_patchtst",
+            "forecast_horizon_sessions": 5,
+            "objective": "rank",
+            "target_transform": "rank",
+            "source": {
+                "repository": "FacDiggerNN",
+                "commit": "1" * 40,
+                "run_id": "run-1",
+                "run_manifest_sha256": "2" * 64,
+                "predictions_sha256": "5" * 64,
+                "git_clean": True,
+            },
+            "training_data": {
+                "dataset_id": "training-1",
+                "dataset_manifest_sha256": "3" * 64,
+            },
+            "feature_contract": {
+                "feature_set": "price_volume_v1",
+                "channels": list(scaler["channels"]),
+                "context_length": 20,
+                "scaler_sha256": sha256_file(scaler_path),
+                "scaler_contract": "train_global_robust",
+                "identity_policy": "provider_neutral_security_id",
+            },
+            "artifacts": {
+                name: {"file": name, "sha256": "4" * 64, "bytes": 1}
+                for name in {
+                    "checkpoint",
+                    "checkpoint_protocol",
+                    "resolved_config",
+                    "training_dataset_manifest",
+                    "source_run_manifest",
+                }
+            }
+            | {
+                "scaler": {
+                    "file": "scaler.json",
+                    "sha256": sha256_file(scaler_path),
+                    "bytes": scaler_path.stat().st_size,
+                }
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "facdigger.data.inference_snapshots.load_model_release",
+        lambda _: release,
+    )
+    target = sessions(50)[-1]
+
+    snapshot, manifest = build_inference_snapshot(
+        InferenceSnapshotConfig.model_validate(
+            {
+                "sources": {"bars": bars_path, "universe": universe_path},
+                "output_root": tmp_path / "inference",
+            }
+        ),
+        release_dir,
+        asof_date=target,
+    )
+
+    assert snapshot.parent.name == target.isoformat()
+    assert manifest["config"]["asof_date"] == target.isoformat()
+    index = pl.read_parquet(snapshot / "inference_index.parquet")
+    delivery = pl.read_parquet(snapshot / "delivery_universe.parquet")
+    assert index["asof_date"].unique().to_list() == [target]
+    assert delivery["asof_date"].unique().to_list() == [target]
+    assert pl.read_parquet(snapshot / "features.parquet").height < raw.height

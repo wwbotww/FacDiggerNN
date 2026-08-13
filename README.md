@@ -32,18 +32,27 @@ EODHD 或自备标准 Parquet 数据转换为内容寻址快照，训练 E0—E3
 | 训练 | 完整日横截面排序目标、显存受限两遍精确梯度、inner selection、resume 和泄漏审计 |
 | 评价 | IC/Rank IC、ICIR、分组收益、换手、成本、稳定性和中性化可用性报告 |
 | 研究 | 多 fold/seed 矩阵、HAC/非重叠检验、Holm 校正、freeze 和 final refit |
-| 推理 | checkpoint 独立回放、无标签因子导出、最新信号和独立 prediction 评价 |
+| 推理/生产 | checkpoint 回放、ModelRelease、冻结 scaler 的无标签快照、FactorBatch、Docker 日调度和独立评价 |
 
 核心数据流：
 
 ```text
 provider / 标准 Parquet
   -> 标准表 + provider-neutral provenance
-  -> 内容寻址 snapshot
-  -> E0 / E1 / E2 / E3
-  -> 统一 prediction 契约与评价
-  -> checkpoint 回放 / signal / walk-forward freeze / final refit
+  -> 训练 snapshot -> E0 / E1 / E2 / E3 -> 统一评价 / walk-forward / final refit
+  -> E3 ModelRelease -> 无标签 inference snapshot -> FactorBatch
 ```
+
+跨项目交易接入只使用 `facdigger.factor_batch` 严格契约。FactorBatch 是
+`factors.parquet + manifest.json` 的内容寻址不可变目录；`delivery_id` 同时绑定因子文件
+哈希及来源、模型 release、推理输入、时间和覆盖语义，而不是只对 Parquet 求哈希。
+checkpoint、配置和 scaler 不跨项目传递；它们由 FacDiggerNN 内部的 ModelRelease 绑定。
+ModelRelease 还绑定 source run 原始 predictions 的文件哈希，历史回放适配器不会接受修改或
+重新序列化后的预测文件。
+日常推理快照不读取 label 或 split，也不重新拟合 scaler；`facdigger signal` 当前只接受
+E3 ModelRelease，并固定输出单个 as-of 日期的完整候选横截面。`--asof latest` 以候选
+universe 的最新交易日为准，不会退回最近仍有可评分股票的旧日期；全体不可评分时输出
+当日显式无信号批次。
 
 ## 研究任务
 
@@ -191,6 +200,113 @@ uv run facdigger research run \
 构建 refit snapshot 并核对冻结的 2025 test 键，再重新训练和一次性评价。2025 test 不进入
 训练、scaler 拟合或 checkpoint selection。
 
+### 4. 发布 E3 日频因子
+
+先选择由 clean Git 工作树训练出的完整 E3 run，再创建 ModelRelease；发布命令可以在后续
+clean 提交上运行，但 release 固定记录训练 run 的原始 commit。随后用它的冻结 scaler 构建
+无标签推理快照，最后发布一个交易日的 FactorBatch：
+
+```bash
+uv run facdigger release create \
+  --run artifacts/e3/<run_id> \
+  --output-root artifacts/releases
+
+uv run facdigger dataset build-inference \
+  --config configs/datasets/eodhd_historical_liquid_inference.yaml \
+  --release artifacts/releases/<release_id>
+
+uv run facdigger signal \
+  --release artifacts/releases/<release_id> \
+  --dataset data/inference_snapshots/<snapshot_id> \
+  --output-root artifacts/factor_batches \
+  --asof latest
+```
+
+发布目录只含 `factors.parquet` 和 `manifest.json`，这是 HeyBoss 的唯一输入。当前生产入口
+只接受 E3；研究 `predict` 只生成 predictions/metrics/report，不再维护第二种因子格式。
+需要把同一 release 已绑定的原始评价 predictions 用于 HeyBoss 隔离回放时：
+
+```bash
+uv run facdigger factor-batch from-predictions \
+  --predictions artifacts/e3/<run_id>/predictions.parquet \
+  --release artifacts/releases/<release_id> \
+  --output-root artifacts/factor_batches
+
+uv run facdigger factor-batch verify \
+  --bundle artifacts/factor_batches/<delivery_id>
+```
+
+适配器输出 `source.kind=evaluation_predictions`，只有 eligible 已评分行，不能用于 paper。
+它要求 predictions 文件字节与 ModelRelease 绑定值完全一致；旧 Huber、v1 chunked ranking、
+mask 错位或未绑定 predictions/scaler 的 `artifacts2` 会被拒绝，必须等新协议 E3 重训后再联调。
+HeyBoss 侧的精确验收与流程测试计划见
+[HeyBoss 因子联调交接](docs/HeyBoss因子联调交接.md)。
+
+### 5. Docker 每日生产服务
+
+日常生产不依赖 macOS `launchd`。Docker 容器内的 `facdigger production serve` 持有
+New York 交易时钟、重试状态和单实例锁，因此同一镜像可部署到 macOS、Linux 或后续的
+容器平台。每日事务固定为：
+
+```text
+19:00 America/New_York 首次尝试
+  -> fresh EODHD 最近 10 session 修订（首次部署会补齐历史 bronze 到 D 的缺口）
+  -> 调整因子变化证券的定向 hot-window 回填
+  -> 原子切换 production source CURRENT
+  -> 只为 D 建无标签 inference snapshot
+  -> 显式固定 release_id 推理
+  -> D 的 FactorBatch 原子发布
+  -> ledger 记录 published 后清理为最近 10 个 inference snapshots
+```
+
+失败时每 30 分钟重试，到下一 regular session 09:30 ET 截止。只有 D 完整通过才发布；
+不会使用旧 FactorBatch，也不会改写 `data/snapshots/` 或
+`data/walk_forward_snapshots/`。FactorBatch 永久保留。生产 source
+只保存约 `context_length + 20` 个 session 的 bars、当前日 universe 和当前/上一修订，避免
+每天复制全历史；内部 source revision 只用不透明 ID 标识原子状态，不扫描全表生成内容哈希。
+历史 bronze 与训练 snapshot 保持独立、只读。
+
+首次配置：
+
+```bash
+cp configs/production/eodhd_daily.example.yaml \
+  configs/production/eodhd_daily.local.yaml
+# 编辑 local YAML，将 model.release_id 替换成已验证 E3 release 的 64 位 ID
+
+set -a
+source .env.local
+set +a
+
+uv run facdigger production plan \
+  --config configs/production/eodhd_daily.local.yaml
+
+uv run facdigger production bootstrap \
+  --config configs/production/eodhd_daily.local.yaml
+
+docker compose build
+docker compose up -d
+docker compose logs -f facdigger-production
+```
+
+Docker 构建上下文排除本地 `data/`、`artifacts/`、`.env*`、测试和文档；真实资产只通过
+运行时 bind mount 进入容器，不会被烘焙进镜像层。默认 Compose 在容器内使用 root，以兼容
+macOS Docker Desktop 与已有宿主目录的 bind-mount 写权限；若部署到 Linux 服务器，应在
+确认卷 UID/GID 后显式设置 `user:`，不要通过放宽目录到全局可写来解决权限问题。
+
+`eodhd_daily.local.yaml` 被 `.gitignore` 的 `*.local.yaml` 规则覆盖。不要在其中放 token
+（token 只在 `.env.local`），并确认提交前 `git status`。容器启动前 shell
+必须已有 `EODHD_API_TOKEN`。状态与健康检查：
+
+```bash
+docker compose exec facdigger-production facdigger production status \
+  --config /app/configs/production/eodhd_daily.local.yaml
+
+docker compose exec facdigger-production facdigger production health \
+  --config /app/configs/production/eodhd_daily.local.yaml
+```
+
+`production tick` 只用于人工单次诊断；正常运行只启动 `serve`，不要再配置第二个宿主调度器。
+
 ## 配置选择
 
 | 配置 | 用途 | 不能代表什么 |
@@ -199,10 +315,13 @@ uv run facdigger research run \
 | `configs/data/eodhd_free.yaml` | 两只股票、低成本 live API smoke | 横截面研究 |
 | `configs/data/eodhd_all_world_pilot.yaml` | 当前 active 100 股票资源门禁 | 无存活偏差的研究 |
 | `configs/data/eodhd_historical_liquid.yaml` | 历史动态 top-1000 主数据路径 | 自动 research-ready |
+| `configs/data/eodhd_daily_production.yaml` | fresh bulk EOD 日常修订 | 全历史重新采集 |
+| `configs/datasets/eodhd_historical_liquid_inference.yaml` | 冻结 scaler 的无标签推理快照 | 训练或标签评价 |
 | `configs/experiments/*_smoke.yaml` | 快速端到端测试 | 正式模型结论 |
 | `configs/experiments/*_paid_pilot.yaml` | 真实规模资源验证 | 多 seed 正式对照 |
 | `configs/experiments/e1_random.yaml`、`e2_etth1.yaml`、`e3_financial_pretrain.yaml` | 完整模型配置 | 独立于 M6 的正式结论 |
 | `configs/research/m6_eodhd_engineering.yaml` | 当前 walk-forward 主线 | 完成正式中性化后的研究 |
+| `configs/production/eodhd_daily.example.yaml` | Docker 每日服务模板；本地副本固定 release ID | 以占位 ID 启动（会失败关闭） |
 
 `configs/datasets/us_equities_daily_v1.yaml` 是 provider-neutral 标准表范例；EODHD 历史主线
 使用 `configs/datasets/eodhd_historical_liquid.yaml`。
@@ -212,7 +331,11 @@ uv run facdigger research run \
 - `data/bronze/`：标准化来源表，删除后可能需要重新消耗 API 配额；
 - `data/cache/`：EODHD 原始响应缓存，用于避免重复请求和离线重建；
 - `data/state/`：本地调用预算状态；
-- `data/snapshots/`、`data/walk_forward_snapshots/`：可重建的内容寻址快照；
+- `data/snapshots/`、`data/walk_forward_snapshots/`：训练/研究的内容寻址快照；
+- `data/inference_snapshots/`：绑定 ModelRelease、无标签且复用冻结 scaler 的推理快照；
+- `artifacts/releases/`：绑定 checkpoint、配置、scaler、训练/run manifest 与 predictions
+  身份的内部 ModelRelease；
+- `artifacts/factor_batches/`：唯一跨项目交付目录；
 - `artifacts/`：checkpoint、预测、指标、报告和研究冻结；
 - `.env.local`：仅本机秘密。
 

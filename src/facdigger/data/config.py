@@ -78,6 +78,14 @@ class DatasetBuildConfig(StrictModel):
     split: SplitConfig
 
 
+class InferenceSnapshotConfig(StrictModel):
+    """Target-free snapshot input configured independently from training splits."""
+
+    dataset_name: str = "us_equities_daily_inference"
+    sources: ParquetSourceConfig
+    output_root: Path = Path("data/inference_snapshots")
+
+
 def load_dataset_build_config(path: str | Path) -> DatasetBuildConfig:
     config_path = Path(path)
     if not config_path.is_file():
@@ -86,3 +94,13 @@ def load_dataset_build_config(path: str | Path) -> DatasetBuildConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"Configuration root must be a mapping: {config_path}")
     return DatasetBuildConfig.model_validate(raw)
+
+
+def load_inference_snapshot_config(path: str | Path) -> InferenceSnapshotConfig:
+    config_path = Path(path)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Inference snapshot configuration not found: {config_path}")
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Configuration root must be a mapping: {config_path}")
+    return InferenceSnapshotConfig.model_validate(raw)

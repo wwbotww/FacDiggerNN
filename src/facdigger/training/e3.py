@@ -353,9 +353,11 @@ def run_e3(
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "architecture": config.model.model_dump(mode="json"),
             "input": {
+                "feature_set": dataset_config["features"].get("name"),
                 "context_length": context_length,
                 "channels": config.channels,
                 "feature_scaler": dataset_config["features"].get("scaler"),
+                "feature_scaler_sha256": sha256_file(dataset_path / "scaler.json"),
                 "model_internal_scaling": config.model.scaling,
             },
             "row_counts": {
@@ -375,6 +377,7 @@ def run_e3(
                 "pretraining_sha256": sha256_file(pretraining_checkpoint),
             },
             "source_provenance": source_provenance,
+            "predictions_sha256": sha256_file(run_dir / "predictions.parquet"),
             "git": collect_git_state(repository_root),
             "environment": collect_environment(include_model_dependencies=True),
             "artifacts": {

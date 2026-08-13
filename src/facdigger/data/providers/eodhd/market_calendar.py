@@ -8,12 +8,14 @@ expected on those dates.
 from __future__ import annotations
 
 import calendar as calendar_module
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
 CALENDAR_NAME = "US_EQUITIES_REGULAR"
 CALENDAR_VERSION = "2026.1"
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 # Unscheduled full-day closures which cannot be expressed as recurring rules.
 _SPECIAL_CLOSURES = {
@@ -123,3 +125,43 @@ def regular_session_frame(start: date, end: date) -> pl.DataFrame:
         {"trade_date": regular_sessions(start, end)},
         schema={"trade_date": pl.Date},
     )
+
+
+def previous_regular_session(day: date) -> date:
+    """Return the last regular session strictly before ``day``."""
+
+    candidate = day - timedelta(days=1)
+    while not regular_sessions(candidate, candidate):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def shift_regular_session(day: date, offset: int) -> date:
+    """Move by a signed number of regular sessions; zero requires a session."""
+
+    if offset == 0:
+        if not regular_sessions(day, day):
+            raise ValueError(f"not a regular US-equity session: {day.isoformat()}")
+        return day
+    result = day
+    step = next_regular_session if offset > 0 else previous_regular_session
+    for _ in range(abs(offset)):
+        result = step(result)
+    return result
+
+
+def next_regular_session(day: date) -> date:
+    """Return the first regular session strictly after ``day``."""
+
+    candidate = day + timedelta(days=1)
+    while not regular_sessions(candidate, candidate):
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def regular_session_open(day: date) -> datetime:
+    """Return the scheduled regular open for one valid US-equity session."""
+
+    if not regular_sessions(day, day):
+        raise ValueError(f"not a regular US-equity session: {day.isoformat()}")
+    return datetime.combine(day, time(hour=9, minute=30), tzinfo=MARKET_TIMEZONE)

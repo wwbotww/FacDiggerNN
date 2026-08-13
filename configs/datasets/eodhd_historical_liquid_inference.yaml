@@ -1,0 +1,8 @@
+dataset_name: eodhd_us_historical_liquid_inference
+
+sources:
+  bars: data/bronze/eodhd_us_historical_liquid/bars_daily.parquet
+  universe: data/bronze/eodhd_us_historical_liquid/universe_daily.parquet
+  source_manifest: data/bronze/eodhd_us_historical_liquid/eodhd_ingestion_manifest.json
+
+output_root: data/inference_snapshots

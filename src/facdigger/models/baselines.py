@@ -102,32 +102,6 @@ def build_multiscale_features(
     return pl.concat(parts, how="vertical", rechunk=False), feature_columns
 
 
-def build_multiscale_inference_features(
-    features: pl.DataFrame,
-    inference_index: pl.DataFrame,
-    *,
-    channels: list[str],
-    windows: list[int],
-    context_length: int,
-) -> tuple[pl.DataFrame, list[str]]:
-    """Rebuild E0 statistics for a target-free inference index."""
-
-    placeholder = inference_index.select(
-        "sample_id", "security_id", "symbol", "asof_date"
-    ).with_columns(
-        pl.lit("inference").alias("split"),
-        pl.lit(0.0, dtype=pl.Float64).alias("target"),
-    )
-    tabular, columns = build_multiscale_features(
-        features,
-        placeholder,
-        channels=channels,
-        windows=windows,
-        context_length=context_length,
-    )
-    return tabular.drop("split", "target"), columns
-
-
 @dataclass(frozen=True)
 class TabularPreprocessor:
     feature_columns: list[str]

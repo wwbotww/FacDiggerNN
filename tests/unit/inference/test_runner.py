@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
+import polars as pl
 import pytest
 import yaml
 
@@ -10,7 +12,11 @@ pytest.importorskip("transformers")
 
 from facdigger.data.contracts import DataContractError  # noqa: E402
 from facdigger.experiments.manifest import sha256_json  # noqa: E402
-from facdigger.inference.runner import _load_source_run, _patch_config  # noqa: E402
+from facdigger.inference.runner import (  # noqa: E402
+    _load_source_run,
+    _patch_config,
+    _select_signal_inputs,
+)
 
 
 def _model() -> dict:
@@ -92,3 +98,34 @@ def test_source_run_loader_rejects_checkpoint_tampering_and_path_escape(tmp_path
     (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(DataContractError, match="escapes"):
         _load_source_run(run_dir)
+
+
+def test_latest_signal_date_uses_candidate_universe_without_stale_fallback() -> None:
+    first = date(2026, 8, 10)
+    latest = date(2026, 8, 11)
+    index = pl.DataFrame(
+        {"security_id": ["sec-a"], "asof_date": [first]},
+        schema={"security_id": pl.String, "asof_date": pl.Date},
+    )
+    universe = pl.DataFrame(
+        {
+            "security_id": ["sec-a", "sec-a"],
+            "symbol": ["AAA", "AAA"],
+            "asof_date": [first, latest],
+            "eligible": [True, False],
+        },
+        schema={
+            "security_id": pl.String,
+            "symbol": pl.String,
+            "asof_date": pl.Date,
+            "eligible": pl.Boolean,
+        },
+    )
+
+    rows, candidates = _select_signal_inputs(index, universe, asof="latest")
+
+    assert rows.is_empty()
+    assert candidates["asof_date"].to_list() == [latest]
+    assert candidates["eligible"].to_list() == [False]
+    with pytest.raises(DataContractError, match="absent from the delivery universe"):
+        _select_signal_inputs(index, universe, asof="2026-08-12")

@@ -21,10 +21,16 @@ data_app = typer.Typer(help="Validate or ingest point-in-time market data.")
 dataset_app = typer.Typer(help="Build immutable feature/label dataset snapshots.")
 train_app = typer.Typer(help="Train factor-model experiments.")
 research_app = typer.Typer(help="Run and freeze walk-forward E0-E3 research.")
+release_app = typer.Typer(help="Create and inspect immutable model releases.")
+factor_batch_app = typer.Typer(help="Publish and verify cross-project factor deliveries.")
+production_app = typer.Typer(help="Run the fail-closed daily EODHD production service.")
 app.add_typer(data_app, name="data")
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(train_app, name="train")
 app.add_typer(research_app, name="research")
+app.add_typer(release_app, name="release")
+app.add_typer(factor_batch_app, name="factor-batch")
+app.add_typer(production_app, name="production")
 
 
 @app.command()
@@ -134,6 +140,45 @@ def dataset_build_command(
     typer.echo(
         json.dumps(
             {"dataset_id": manifest["dataset_id"], "path": str(snapshot_dir)},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@dataset_app.command("build-inference")
+def dataset_build_inference_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    release: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Verified ModelRelease providing the frozen feature contract and scaler.",
+        ),
+    ],
+) -> None:
+    """Build a target-free snapshot with the ModelRelease's frozen scaler."""
+
+    from facdigger.data.config import load_inference_snapshot_config
+    from facdigger.data.inference_snapshots import build_inference_snapshot
+
+    try:
+        snapshot_dir, manifest = build_inference_snapshot(
+            load_inference_snapshot_config(config), release
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "snapshot_id": manifest["snapshot_id"],
+                "release_id": manifest["feature_contract"]["release_id"],
+                "path": str(snapshot_dir),
+            },
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -345,7 +390,7 @@ def predict_command(
         typer.Option(help="Require original-split scores to match source predictions."),
     ] = True,
 ) -> None:
-    """Reload an E0-E3 checkpoint and export target-free factor values."""
+    """Reload an E0-E3 checkpoint and reproduce research predictions."""
 
     from facdigger.inference.runner import run_inference
 
@@ -377,7 +422,152 @@ def predict_command(
                 "rows": manifest["row_count"],
                 "coverage": manifest["coverage"]["coverage"],
                 "replay_matched": manifest["replay_verification"].get("matched"),
-                "factors": str(destination / "factors.parquet"),
+                "predictions": str(destination / "predictions.parquet"),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@release_app.command("create")
+def release_create_command(
+    run: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, readable=True, help="Completed source run."),
+    ],
+    output_root: Annotated[
+        Path,
+        typer.Option(help="Root for content-addressed immutable model releases."),
+    ] = Path("artifacts/releases"),
+) -> None:
+    """Freeze a clean completed run into an immutable inference release."""
+
+    from facdigger.inference.releases import create_model_release
+
+    try:
+        destination, manifest = create_model_release(
+            run,
+            output_root,
+            repository_root=Path.cwd(),
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "release_id": manifest.release_id,
+                "model_id": manifest.model_id,
+                "model_type": manifest.model_type,
+                "path": str(destination),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@release_app.command("verify")
+def release_verify_command(
+    release: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, readable=True, help="Model release directory."),
+    ],
+) -> None:
+    """Verify a release identity and every bound artifact hash."""
+
+    from facdigger.inference.releases import load_model_release
+
+    try:
+        manifest = load_model_release(release)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "release_id": manifest.release_id,
+                "model_id": manifest.model_id,
+                "model_type": manifest.model_type,
+                "status": manifest.status,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@factor_batch_app.command("from-predictions")
+def factor_batch_from_predictions_command(
+    predictions: Annotated[
+        Path,
+        typer.Option(exists=True, dir_okay=False, readable=True),
+    ],
+    release: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, readable=True),
+    ],
+    output_root: Annotated[
+        Path,
+        typer.Option(help="Root for content-addressed FactorBatch deliveries."),
+    ] = Path("artifacts/factor_batches"),
+) -> None:
+    """Publish verified E3 evaluation predictions as an isolated replay batch."""
+
+    from facdigger.inference.factor_batch import publish_evaluation_factor_batch
+
+    try:
+        destination, manifest = publish_evaluation_factor_batch(
+            predictions,
+            release,
+            output_root,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "delivery_id": manifest.delivery_id,
+                "source_kind": manifest.source.kind,
+                "rows": manifest.artifact.row_count,
+                "path": str(destination),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@factor_batch_app.command("verify")
+def factor_batch_verify_command(
+    bundle: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, readable=True),
+    ],
+) -> None:
+    """Verify one FactorBatch's semantic identity, files, hashes and coverage."""
+
+    from facdigger.inference.factor_batch import load_factor_batch
+
+    try:
+        manifest = load_factor_batch(bundle)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "delivery_id": manifest.delivery_id,
+                "source_kind": manifest.source.kind,
+                "model_type": manifest.model.model_type,
+                "rows": manifest.artifact.row_count,
+                "status": manifest.status,
             },
             ensure_ascii=False,
             indent=2,
@@ -388,54 +578,42 @@ def predict_command(
 
 @app.command("signal")
 def signal_command(
-    run: Annotated[
+    release: Annotated[
         Path,
-        typer.Option(exists=True, file_okay=False, readable=True, help="Completed source run."),
+        typer.Option(exists=True, file_okay=False, readable=True, help="Verified E3 ModelRelease."),
     ],
-    output: Annotated[
-        Path | None,
-        typer.Option(help="New output directory; defaults to <run>/signals/<signal_id>."),
-    ] = None,
     dataset: Annotated[
-        Path | None,
+        Path,
         typer.Option(
             exists=True,
             file_okay=False,
             readable=True,
-            help="Optional relocated copy of the exact schema-v3 source snapshot.",
+            help="Target-free inference snapshot built from this release.",
         ),
-    ] = None,
+    ],
+    output_root: Annotated[
+        Path,
+        typer.Option(help="Root for content-addressed FactorBatch deliveries."),
+    ] = Path("artifacts/factor_batches"),
     asof: Annotated[
-        str | None,
-        typer.Option(help="latest or YYYY-MM-DD; omit when using a date range."),
+        str,
+        typer.Option(help="latest or one YYYY-MM-DD trading date."),
     ] = "latest",
-    start_date: Annotated[
-        str | None, typer.Option(help="Inclusive YYYY-MM-DD range start.")
-    ] = None,
-    end_date: Annotated[
-        str | None, typer.Option(help="Inclusive YYYY-MM-DD range end.")
-    ] = None,
     device: Annotated[str, typer.Option(help="Inference device: cpu, cuda or auto.")] = "cpu",
 ) -> None:
-    """Generate target-free factors for latest or selected schema-v3 dates."""
-
-    from datetime import date
+    """Generate one strict FactorBatch from an E3 release and inference snapshot."""
 
     from facdigger.inference.runner import run_signal_inference
 
     if device not in {"cpu", "cuda", "auto"}:
         typer.echo("device must be cpu, cuda or auto", err=True)
         raise typer.Exit(code=2)
-    if (start_date or end_date) and asof == "latest":
-        asof = None
     try:
         destination, signal_manifest = run_signal_inference(
-            run,
-            output_dir=output,
+            release,
+            output_root=output_root,
             dataset_dir=dataset,
             asof=asof,
-            start_date=date.fromisoformat(start_date) if start_date else None,
-            end_date=date.fromisoformat(end_date) if end_date else None,
             device=device,
         )
     except Exception as exc:
@@ -445,10 +623,11 @@ def signal_command(
         json.dumps(
             {
                 "output_dir": str(destination),
-                "source_run_id": signal_manifest["source_run_id"],
-                "rows": signal_manifest["row_count"],
-                "minimum_asof_date": signal_manifest["selection"]["minimum_asof_date"],
-                "maximum_asof_date": signal_manifest["selection"]["maximum_asof_date"],
+                "delivery_id": signal_manifest["delivery_id"],
+                "source_run_id": signal_manifest["source"]["run_id"],
+                "rows": signal_manifest["artifact"]["row_count"],
+                "minimum_asof_date": signal_manifest["time"]["minimum_asof_date"],
+                "maximum_asof_date": signal_manifest["time"]["maximum_asof_date"],
                 "factors": str(destination / "factors.parquet"),
             },
             ensure_ascii=False,
@@ -457,6 +636,149 @@ def signal_command(
             default=str,
         )
     )
+
+
+@production_app.command("plan")
+def production_plan_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Validate configuration and show the current New-York-time target window."""
+
+    from datetime import datetime, timezone
+
+    from facdigger.production.calendar import production_window
+    from facdigger.production.config import load_production_config
+
+    try:
+        production = load_production_config(config)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    window = production_window(datetime.now(timezone.utc), production.schedule)
+    typer.echo(
+        json.dumps(
+            {
+                "target_date": window.target_date.isoformat(),
+                "first_attempt_at": window.first_attempt_at.isoformat(),
+                "cutoff_at": window.cutoff_at.isoformat(),
+                "phase": window.phase,
+                "fixed_release_id": production.model.release_id,
+                "training_snapshots": "never_modified",
+                "inference_retention_sessions": (
+                    production.inference.retention_sessions
+                ),
+                "factor_batch_retention": production.factor_batch.retention,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@production_app.command("bootstrap")
+def production_bootstrap_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Create the bounded production store from accepted historical bronze."""
+
+    from facdigger.production.config import load_production_config
+    from facdigger.production.lock import ProductionLock
+    from facdigger.production.runner import bootstrap_store
+
+    production = load_production_config(config)
+    try:
+        with ProductionLock(production.state_database):
+            current = bootstrap_store(production)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "revision_id": current.revision_id,
+                "path": str(current.root),
+                "resolved_start": current.manifest["resolved_start"],
+                "resolved_end": current.manifest["resolved_end"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@production_app.command("tick")
+def production_tick_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Run one idempotent scheduling decision and production transaction."""
+
+    from facdigger.production.config import load_production_config
+    from facdigger.production.lock import ProductionLock
+    from facdigger.production.runner import run_production_tick
+
+    production = load_production_config(config)
+    try:
+        with ProductionLock(production.state_database):
+            result = run_production_tick(production)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(result.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    if result.action in {"blocked", "expired"}:
+        raise typer.Exit(code=1)
+
+
+@production_app.command("status")
+def production_status_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Inspect persisted target state without touching data or inference outputs."""
+
+    from facdigger.production.config import load_production_config
+    from facdigger.production.runner import status_json
+
+    try:
+        typer.echo(status_json(load_production_config(config)))
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@production_app.command("health")
+def production_health_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Check that the long-running service heartbeat remains fresh."""
+
+    from facdigger.production.config import load_production_config
+    from facdigger.production.service import production_health
+
+    try:
+        result = production_health(load_production_config(config))
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    if not result["healthy"]:
+        raise typer.Exit(code=1)
+
+
+@production_app.command("serve")
+def production_serve_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Run the portable container-owned scheduler until SIGTERM or SIGINT."""
+
+    from facdigger.production.config import load_production_config
+    from facdigger.production.service import serve_production
+
+    try:
+        serve_production(load_production_config(config))
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @app.command("evaluate")

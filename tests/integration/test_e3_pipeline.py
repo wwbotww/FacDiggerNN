@@ -10,9 +10,15 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
-from facdigger.data.config import DatasetBuildConfig  # noqa: E402
-from facdigger.data.snapshots import build_dataset_snapshot  # noqa: E402
-from facdigger.inference.runner import run_inference  # noqa: E402
+from facdigger.data.config import (  # noqa: E402
+    DatasetBuildConfig,
+    InferenceSnapshotConfig,
+)
+from facdigger.data.inference_snapshots import build_inference_snapshot  # noqa: E402
+from facdigger.data.snapshots import build_dataset_snapshot, sha256_file  # noqa: E402
+from facdigger.inference.factor_batch import load_factor_batch  # noqa: E402
+from facdigger.inference.releases import create_model_release  # noqa: E402
+from facdigger.inference.runner import run_inference, run_signal_inference  # noqa: E402
 from facdigger.models.patchtst_pretrain import FinancialPatchTSTPretrainer  # noqa: E402
 from facdigger.models.patchtst_transfer import module_fingerprint  # noqa: E402
 from facdigger.training.e3 import run_e3  # noqa: E402
@@ -177,9 +183,10 @@ def _initializer() -> tuple[FinancialPatchTSTPretrainer, dict]:
 
 
 def test_e3_runner_writes_pretraining_chain_and_evaluation_artifacts(tmp_path) -> None:
+    snapshot = _snapshot(tmp_path)
     run_dir, metrics = run_e3(
         _experiment(tmp_path),
-        _snapshot(tmp_path),
+        snapshot,
         repository_root=tmp_path,
         pretraining_initializer=_initializer,
     )
@@ -213,9 +220,77 @@ def test_e3_runner_writes_pretraining_chain_and_evaluation_artifacts(tmp_path) -
     assert manifest["finetuning"]["stage_audits"]["ft1_last_blocks"][
         "encoder_changed"
     ] is True
+    assert manifest["input"]["feature_scaler_sha256"] == sha256_file(
+        snapshot / "scaler.json"
+    )
+    assert manifest["predictions_sha256"] == sha256_file(
+        run_dir / "predictions.parquet"
+    )
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"
     )
     assert replay_manifest["replay_verification"]["matched"] is True
-    assert (replay_dir / "factors.parquet").is_file()
+    assert (replay_dir / "predictions.parquet").is_file()
+    assert not (replay_dir / "factors.parquet").exists()
+
+
+def test_e3_release_inference_snapshot_to_factor_batch(tmp_path, monkeypatch) -> None:
+    snapshot = _snapshot(tmp_path)
+    run_dir, _ = run_e3(
+        _experiment(tmp_path),
+        snapshot,
+        repository_root=tmp_path,
+        pretraining_initializer=_initializer,
+    )
+    commit = "1" * 40
+    run_manifest_path = run_dir / "manifest.json"
+    run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    run_manifest["git"] = {"commit": commit, "branch": "test", "dirty": False}
+    run_manifest_path.write_text(json.dumps(run_manifest), encoding="utf-8")
+    monkeypatch.setattr(
+        "facdigger.inference.releases.collect_git_state",
+        lambda _: {
+            "commit": commit,
+            "branch": "test",
+            "dirty": False,
+            "status_porcelain": "",
+        },
+    )
+    release_dir, release = create_model_release(
+        run_dir, tmp_path / "releases", repository_root=tmp_path
+    )
+    training_manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    source_paths = training_manifest["source_paths"]
+    inference_dir, inference_manifest = build_inference_snapshot(
+        InferenceSnapshotConfig.model_validate(
+            {
+                "sources": {
+                    "bars": source_paths["bars"],
+                    "universe": source_paths["universe"],
+                },
+                "output_root": tmp_path / "inference-snapshots",
+            }
+        ),
+        release_dir,
+    )
+    batch_dir, batch_manifest = run_signal_inference(
+        release_dir,
+        dataset_dir=inference_dir,
+        output_root=tmp_path / "factor-batches",
+        device="cpu",
+    )
+
+    factors = pl.read_parquet(batch_dir / "factors.parquet")
+    assert release.model_type == "financial_pretrained_patchtst"
+    assert inference_manifest["feature_contract"]["scaler_sha256"] == (
+        release.feature_contract.scaler_sha256
+    )
+    assert "labels" not in inference_manifest["artifacts"]
+    assert "sample_index" not in inference_manifest["artifacts"]
+    assert factors.columns == ["security_id", "symbol", "asof_date", "score", "eligible"]
+    assert factors["asof_date"].unique().to_list() == [_sessions(85)[-1]]
+    assert batch_manifest["source"]["kind"] == "signal_inference"
+    assert batch_manifest["model"]["release_id"] == release.release_id
+    assert batch_manifest["input"]["snapshot_id"] == inference_manifest["snapshot_id"]
+    assert load_factor_batch(batch_dir).delivery_id == batch_manifest["delivery_id"]

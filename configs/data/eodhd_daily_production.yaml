@@ -1,0 +1,49 @@
+provider: eodhd
+
+api_token_env: EODHD_API_TOKEN
+allow_demo_token: false
+base_url: https://eodhd.com/api
+
+symbols: []
+exchange_code: US
+universe:
+  mode: historical_liquid
+  max_symbols: 1000
+  exchanges: [NASDAQ, NYSE, NYSE MKT, AMEX]
+  security_types: [common_stock]
+  min_price: 5.0
+  min_avg_volume_200d: 100000.0
+
+# Dates and output_dir are not consumed by production. The daily service resolves
+# its target and revision window from the US-equity calendar and its SQLite state.
+output_dir: data/production/provider-unused
+cache_dir: data/cache/eodhd_daily_production
+state_dir: data/state/eodhd_daily_production
+cache_ttl_hours: 0
+refresh: true
+timeout_seconds: 45
+max_retries: 2
+max_calls_per_day: 90000
+
+fetch_symbol_metadata: false
+metadata_failure_policy: fail
+include_corporate_actions: false
+metadata_overrides: []
+
+min_listed_sessions: 252
+min_price: 5.0
+min_adv20_usd: 1000000.0
+
+quality_gate:
+  enabled: true
+  max_adjusted_price_ratio: 10.0
+  max_alias_overlap_relative_diff: 0.05
+  max_quarantined_security_fraction: 0.10
+
+delisting_imputation:
+  enabled: true
+  method: exchange_penalty
+  nasdaq_return: -0.55
+  nyse_return: -0.30
+  nyse_american_return: -0.30
+  default_return: -0.50

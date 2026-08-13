@@ -11,6 +11,7 @@
 2. [`开发文档.md`](开发文档.md)：架构、数据契约、模块、CLI、产物、扩展和排错；
 3. [`实验设计文档.md`](实验设计文档.md)：研究问题、E0—E3 对照、切分、统计和结论边界；
 4. [`RTX2070_Windows训练指南.md`](RTX2070_Windows训练指南.md)：目标 GPU 机器的安装、迁移和资源门禁。
+5. [`HeyBoss因子联调交接.md`](HeyBoss因子联调交接.md)：交易项目应实现的 importer 契约和流程验收。
 
 ## 现行文档职责
 
@@ -20,6 +21,7 @@
 | [`开发文档.md`](开发文档.md) | 代码怎样组织、数据怎样流动、怎样扩展 | 工程说明 |
 | [`实验设计文档.md`](实验设计文档.md) | 比较什么、怎样防泄漏、何时可下结论 | 实验协议说明 |
 | [`RTX2070_Windows训练指南.md`](RTX2070_Windows训练指南.md) | 怎样在 WSL2/RTX 2070 Super 上运行 | 平台操作 |
+| [`HeyBoss因子联调交接.md`](HeyBoss因子联调交接.md) | HeyBoss 怎样校验、导入和跑通因子链路 | 跨项目交接 |
 | [`项目关键问题与修复复盘.md`](项目关键问题与修复复盘.md) | 真实问题如何定位、权衡、修复和验证 | 持续维护的复盘档案 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 如何改代码、测试和评审 | 贡献流程 |
 | [`SECURITY.md`](../SECURITY.md) | 如何处理 token、外部数据和研究完整性 | 安全规则 |
@@ -32,6 +34,11 @@
 ## 当前状态摘要
 
 - 工程链路已覆盖标准化、快照、E0—E3、统一评价、回放、信号和 M6 walk-forward；
+- 跨项目生产侧已具备不可变 ModelRelease、冻结 scaler 的 target-free inference snapshot
+  和单日 FactorBatch；FacDigger 每日 EODHD 修订、指定日期推理、30 分钟重试、截止门禁及
+  保留策略由 Docker 常驻服务统一编排，不依赖宿主 `launchd`；HeyBoss 已有
+  importer/NT Catalog/Actor 骨架，但消费者仍需按
+  [联调交接](HeyBoss因子联调交接.md)同步现行 semantic delivery ID 与 manifest 字段；
 - 监督阶段以完整日横截面排序相关性为目标；E1—E3 通过 CPU 整日组装、GPU
   physical microbatch 和两遍回放计算精确整日梯度，LightGBM 使用按完整日分组的
   LambdaRank；
@@ -56,13 +63,16 @@ configs/
 ├── data/
 │   ├── eodhd_free.yaml               # 两股票 API smoke
 │   ├── eodhd_all_world_pilot.yaml    # 当前 active 100 股票资源 pilot
-│   └── eodhd_historical_liquid.yaml  # 历史动态 top-1000 主数据路径
+│   ├── eodhd_historical_liquid.yaml  # 历史动态 top-1000 主数据路径
+│   └── eodhd_daily_production.yaml   # daily bulk 修订（禁缓存）
 ├── datasets/
 │   ├── us_equities_daily_v1.yaml     # provider-neutral 标准表范例
 │   ├── eodhd_free_smoke.yaml         # 短窗口管线 smoke
 │   ├── eodhd_all_world_pilot.yaml    # 100 股票工程 snapshot
 │   └── eodhd_historical_liquid.yaml  # 历史动态主 snapshot
 ├── experiments/                      # E0—E3 smoke、pilot 和完整模型配置
+├── production/
+│   └── eodhd_daily.example.yaml      # Docker 生产模板；本地副本固定 release ID
 └── research/
     └── m6_eodhd_engineering.yaml     # 当前 M6 主线；正式门禁未全部开启
 ```
