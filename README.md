@@ -32,7 +32,7 @@ EODHD 或自备标准 Parquet 数据转换为内容寻址快照，训练 E0—E3
 | 训练 | 完整日横截面排序目标、显存受限两遍精确梯度、inner selection、resume 和泄漏审计 |
 | 评价 | IC/Rank IC、ICIR、分组收益、换手、成本、稳定性和中性化可用性报告 |
 | 研究 | 多 fold/seed 矩阵、HAC/非重叠检验、Holm 校正、freeze 和 final refit |
-| 推理/生产 | checkpoint 回放、ModelRelease、冻结 scaler 的无标签快照、FactorBatch、Docker 日调度和独立评价 |
+| 推理/生产 | checkpoint 回放、ModelRelease、冻结 scaler 的无标签快照、单日/全历史 FactorBatch、Docker 日调度和独立评价 |
 
 核心数据流：
 
@@ -40,15 +40,17 @@ EODHD 或自备标准 Parquet 数据转换为内容寻址快照，训练 E0—E3
 provider / 标准 Parquet
   -> 标准表 + provider-neutral provenance
   -> 训练 snapshot -> E0 / E1 / E2 / E3 -> 统一评价 / walk-forward / final refit
-  -> E3 ModelRelease -> 无标签 inference snapshot -> FactorBatch
+  -> E3 ModelRelease -> 无标签 inference snapshot
+       -> 单日 signal FactorBatch / 固定模型全历史回测 FactorBatch
 ```
 
 跨项目交易接入只使用 `facdigger.factor_batch` 严格契约。FactorBatch 是
 `factors.parquet + manifest.json` 的内容寻址不可变目录；`delivery_id` 同时绑定因子文件
 哈希及来源、模型 release、推理输入、时间和覆盖语义，而不是只对 Parquet 求哈希。
 checkpoint、配置和 scaler 不跨项目传递；它们由 FacDiggerNN 内部的 ModelRelease 绑定。
-ModelRelease 还绑定 source run 原始 predictions 的文件哈希，历史回放适配器不会接受修改或
-重新序列化后的预测文件。
+ModelRelease 还绑定 source run 原始 predictions 的文件哈希；`factor-batch
+from-predictions` 不会接受修改或重新序列化后的预测文件。全历史回测则直接对无标签
+inference snapshot 重新评分，不读取 predictions 或 target。
 日常推理快照不读取 label 或 split，也不重新拟合 scaler；`facdigger signal` 当前只接受
 E3 ModelRelease，并固定输出单个 as-of 日期的完整候选横截面。`--asof latest` 以候选
 universe 的最新交易日为准，不会退回最近仍有可评分股票的旧日期；全体不可评分时输出
@@ -239,6 +241,33 @@ uv run facdigger factor-batch verify \
 适配器输出 `source.kind=evaluation_predictions`，只有 eligible 已评分行，不能用于 paper。
 它要求 predictions 文件字节与 ModelRelease 绑定值完全一致；旧 Huber、v1 chunked ranking、
 mask 错位或未绑定 predictions/scaler 的 `artifacts2` 会被拒绝，必须等新协议 E3 重训后再联调。
+
+同一个已审 E3 release 需要覆盖 inference snapshot 中全部历史日期时，不要循环调用单日
+`signal`，使用固定模型历史回放：
+
+```bash
+cp configs/inference/e3_historical_replay.example.yaml \
+  configs/inference/e3_historical_replay.local.yaml
+# 填写 release_dir、inference_snapshot_dir；按需限定日期或 security_ids
+
+uv run facdigger factor-history plan \
+  --config configs/inference/e3_historical_replay.local.yaml
+uv run facdigger factor-history run \
+  --config configs/inference/e3_historical_replay.local.yaml
+uv run facdigger factor-history verify \
+  --export artifacts/factor_history/<history_id>
+```
+
+该路径不读取 label、target 或原 predictions；它加载一次固定 E3 checkpoint，复用每日推理的
+模型构建、窗口和评分代码，并按自然年原子发布、校验和恢复标准 FactorBatch。父目录中的
+plan/state/manifest 只用于 FacDigger 续跑和审计，交给 HeyBoss 的仍是每个
+`factor_batches/<delivery_id>/` 两文件目录。所有历史分片标记为
+`evaluation_predictions/eligible_scored_cross_section`，以便消费者强制限制在 backtest；这里
+固定模型、scaler 和当前历史来源修订可能使用了相对早期日期的未来信息，因此不是严格样本外
+证据，禁止用于 paper 或据此宣称 Alpha。
+`run` 会在 stderr 输出每个年份的 `scoring/published/verified` JSON 进度，最终汇总仍单独写到
+stdout，便于终端观察和脚本解析。
+
 HeyBoss 侧的精确验收与流程测试计划见
 [HeyBoss 因子联调交接](docs/HeyBoss因子联调交接.md)。
 
@@ -317,6 +346,7 @@ docker compose exec facdigger-production facdigger production health \
 | `configs/data/eodhd_historical_liquid.yaml` | 历史动态 top-1000 主数据路径 | 自动 research-ready |
 | `configs/data/eodhd_daily_production.yaml` | fresh bulk EOD 日常修订 | 全历史重新采集 |
 | `configs/datasets/eodhd_historical_liquid_inference.yaml` | 冻结 scaler 的无标签推理快照 | 训练或标签评价 |
+| `configs/inference/e3_historical_replay.example.yaml` | 固定 E3 release 的全历史回测分片 | 严格样本外或 paper 信号 |
 | `configs/experiments/*_smoke.yaml` | 快速端到端测试 | 正式模型结论 |
 | `configs/experiments/*_paid_pilot.yaml` | 真实规模资源验证 | 多 seed 正式对照 |
 | `configs/experiments/e1_random.yaml`、`e2_etth1.yaml`、`e3_financial_pretrain.yaml` | 完整模型配置 | 独立于 M6 的正式结论 |
@@ -335,7 +365,8 @@ docker compose exec facdigger-production facdigger production health \
 - `data/inference_snapshots/`：绑定 ModelRelease、无标签且复用冻结 scaler 的推理快照；
 - `artifacts/releases/`：绑定 checkpoint、配置、scaler、训练/run manifest 与 predictions
   身份的内部 ModelRelease；
-- `artifacts/factor_batches/`：唯一跨项目交付目录；
+- `artifacts/factor_batches/`：单日或原 predictions 适配器生成的独立 FactorBatch；
+- `artifacts/factor_history/`：全历史回放的续跑清单及年度 FactorBatch 子目录；
 - `artifacts/`：checkpoint、预测、指标、报告和研究冻结；
 - `.env.local`：仅本机秘密。
 
@@ -352,7 +383,7 @@ docker compose exec facdigger-production facdigger production health \
    RAM 使用 `batch_size: 64`、FP16 先验收单个 cell；这是待实测的配置，不是已完成
    CUDA 全流程验收或速度承诺。主配置为首轮可行性注册了 5 个监督 epoch
    上限和 3 个 E3 reconstruction epoch 上限，不代表最优最终预算。
-5. 项目不包含交易执行、组合约束优化或生产服务。
+5. 项目不包含交易下单、撮合、资金管理或组合约束优化；每日“生产服务”只负责生成因子。
 
 ## 开发与验证
 

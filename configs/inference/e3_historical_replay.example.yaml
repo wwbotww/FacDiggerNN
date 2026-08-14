@@ -1,0 +1,22 @@
+# Backtest-only replay of one immutable E3 ModelRelease over one target-free
+# inference snapshot. This is deliberately not a strict out-of-sample experiment.
+history_id: e3_fixed_release_history
+release_dir: artifacts/releases/<release_id>
+inference_snapshot_dir: data/inference_snapshots/<snapshot_id>
+output_root: artifacts/factor_history
+
+# null means the first/last scorable date in the inference snapshot.
+start_date: null
+end_date: null
+
+# Empty means every eligible security in the snapshot. Otherwise use exact
+# provider-neutral security_id values, never ticker aliases.
+security_ids: []
+
+device: cpu
+batch_size: 128
+num_workers: 0
+
+# Required acknowledgement: this fixed model/scaler may contain future
+# information relative to early replay dates. Output is rejected for paper use.
+acknowledge_non_oos: true

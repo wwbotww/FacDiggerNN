@@ -23,6 +23,9 @@ train_app = typer.Typer(help="Train factor-model experiments.")
 research_app = typer.Typer(help="Run and freeze walk-forward E0-E3 research.")
 release_app = typer.Typer(help="Create and inspect immutable model releases.")
 factor_batch_app = typer.Typer(help="Publish and verify cross-project factor deliveries.")
+factor_history_app = typer.Typer(
+    help="Replay one fixed E3 release into annual backtest-only FactorBatch files."
+)
 production_app = typer.Typer(help="Run the fail-closed daily EODHD production service.")
 app.add_typer(data_app, name="data")
 app.add_typer(dataset_app, name="dataset")
@@ -30,6 +33,7 @@ app.add_typer(train_app, name="train")
 app.add_typer(research_app, name="research")
 app.add_typer(release_app, name="release")
 app.add_typer(factor_batch_app, name="factor-batch")
+app.add_typer(factor_history_app, name="factor-history")
 app.add_typer(production_app, name="production")
 
 
@@ -568,6 +572,119 @@ def factor_batch_verify_command(
                 "model_type": manifest.model.model_type,
                 "rows": manifest.artifact.row_count,
                 "status": manifest.status,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@factor_history_app.command("plan")
+def factor_history_plan_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Validate a fixed-release historical replay without scoring rows."""
+
+    from facdigger.inference.history import (
+        load_historical_replay_config,
+        plan_historical_replay,
+    )
+
+    try:
+        plan = plan_historical_replay(load_historical_replay_config(config))
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@factor_history_app.command("run")
+def factor_history_run_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Publish resumable annual FactorBatch partitions for historical backtests."""
+
+    from facdigger.inference.history import (
+        HistoricalReplayPartition,
+        load_historical_replay_config,
+        run_historical_replay,
+    )
+
+    def report_partition(
+        status: str,
+        year: int,
+        partition: HistoricalReplayPartition | None,
+    ) -> None:
+        progress: dict[str, object] = {
+            "event": "factor_history_partition",
+            "status": status,
+            "year": year,
+        }
+        if partition is not None:
+            progress["delivery_id"] = partition.delivery_id
+            progress["rows"] = partition.row_count
+        typer.echo(json.dumps(progress, ensure_ascii=False, sort_keys=True), err=True)
+
+    try:
+        destination, manifest = run_historical_replay(
+            load_historical_replay_config(config),
+            on_partition=report_partition,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "history_id": manifest.history_id,
+                "release_id": manifest.release_id,
+                "strict_out_of_sample": manifest.strict_out_of_sample,
+                "rows": manifest.row_count,
+                "dates": manifest.date_count,
+                "output_dir": str(destination),
+                "partitions": [
+                    {
+                        "year": partition.year,
+                        "delivery_id": partition.delivery_id,
+                        "path": str(destination / partition.path),
+                    }
+                    for partition in manifest.partitions
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@factor_history_app.command("verify")
+def factor_history_verify_command(
+    export: Annotated[
+        Path,
+        typer.Option(exists=True, file_okay=False, readable=True),
+    ],
+) -> None:
+    """Revalidate one completed historical replay and every annual FactorBatch."""
+
+    from facdigger.inference.history import verify_historical_replay
+
+    try:
+        manifest = verify_historical_replay(export)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "history_id": manifest.history_id,
+                "release_id": manifest.release_id,
+                "status": manifest.status,
+                "strict_out_of_sample": manifest.strict_out_of_sample,
+                "rows": manifest.row_count,
+                "dates": manifest.date_count,
+                "partitions": len(manifest.partitions),
             },
             ensure_ascii=False,
             indent=2,

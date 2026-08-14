@@ -14,9 +14,15 @@ from facdigger.data.config import (  # noqa: E402
     DatasetBuildConfig,
     InferenceSnapshotConfig,
 )
+from facdigger.data.contracts import DataContractError  # noqa: E402
 from facdigger.data.inference_snapshots import build_inference_snapshot  # noqa: E402
 from facdigger.data.snapshots import build_dataset_snapshot, sha256_file  # noqa: E402
 from facdigger.inference.factor_batch import load_factor_batch  # noqa: E402
+from facdigger.inference.history import (  # noqa: E402
+    HistoricalReplayConfig,
+    run_historical_replay,
+    verify_historical_replay,
+)
 from facdigger.inference.releases import create_model_release  # noqa: E402
 from facdigger.inference.runner import run_inference, run_signal_inference  # noqa: E402
 from facdigger.models.patchtst_pretrain import FinancialPatchTSTPretrainer  # noqa: E402
@@ -294,3 +300,92 @@ def test_e3_release_inference_snapshot_to_factor_batch(tmp_path, monkeypatch) ->
     assert batch_manifest["model"]["release_id"] == release.release_id
     assert batch_manifest["input"]["snapshot_id"] == inference_manifest["snapshot_id"]
     assert load_factor_batch(batch_dir).delivery_id == batch_manifest["delivery_id"]
+
+    history_config = HistoricalReplayConfig.model_validate(
+        {
+            "history_id": "e3-integration-history",
+            "release_dir": release_dir,
+            "inference_snapshot_dir": inference_dir,
+            "output_root": tmp_path / "factor-history",
+            "device": "cpu",
+            "batch_size": 64,
+            "num_workers": 0,
+            "acknowledge_non_oos": True,
+        }
+    )
+    overlapping_config = history_config.model_copy(
+        update={"output_root": inference_dir}
+    )
+    with pytest.raises(DataContractError, match="must not overlap"):
+        run_historical_replay(overlapping_config)
+    assert not (inference_dir / history_config.history_id).exists()
+
+    first_progress = []
+    history_dir, history_manifest = run_historical_replay(
+        history_config,
+        on_partition=lambda status, year, partition: first_progress.append(
+            (status, year, partition)
+        ),
+    )
+
+    assert [item[0] for item in first_progress] == ["scoring", "published"]
+    assert history_manifest.purpose == "backtest_only"
+    assert history_manifest.strict_out_of_sample is False
+    assert history_manifest.model_parameters_may_use_future_data is True
+    assert history_manifest.scaler_may_use_future_data is True
+    assert history_manifest.source_data_may_include_later_revisions is True
+    assert history_manifest.paper_allowed is False
+    assert history_manifest.release_id == release.release_id
+    assert len(history_manifest.partitions) == 1
+    history_batch_dir = history_dir / history_manifest.partitions[0].path
+    history_batch = load_factor_batch(history_batch_dir)
+    history_factors = pl.read_parquet(history_batch_dir / "factors.parquet")
+    assert history_batch.source.kind == "evaluation_predictions"
+    assert history_factors["asof_date"].n_unique() > 1
+    assert history_factors["eligible"].all()
+
+    latest_history = history_factors.filter(
+        pl.col("asof_date") == factors["asof_date"].max()
+    )
+    assert latest_history.select("security_id", "symbol", "asof_date").equals(
+        factors.select("security_id", "symbol", "asof_date")
+    )
+    maximum_score_delta = (
+        latest_history.join(
+            factors.select("security_id", "asof_date", pl.col("score").alias("daily")),
+            on=["security_id", "asof_date"],
+            validate="1:1",
+        )
+        .select((pl.col("score") - pl.col("daily")).abs().max())
+        .item()
+    )
+    assert maximum_score_delta < 1e-6
+    assert verify_historical_replay(history_dir) == history_manifest
+
+    # Simulate a crash after the annual child and state were committed but before
+    # the aggregate manifest became visible. Resume must verify and reuse the child.
+    manifest_path = history_dir / "manifest.json"
+    manifest_path.unlink()
+    resume_progress = []
+    resumed_dir, resumed_manifest = run_historical_replay(
+        history_config,
+        on_partition=lambda status, year, partition: resume_progress.append(
+            (status, year, partition)
+        ),
+    )
+    assert resumed_dir == history_dir
+    assert [item[0] for item in resume_progress] == ["verified"]
+    assert resumed_manifest.partitions == history_manifest.partitions
+    assert {
+        path.name for path in (history_dir / "factor_batches").iterdir()
+    } == {history_manifest.partitions[0].delivery_id}
+
+    completed_dir, completed_manifest = run_historical_replay(history_config)
+    assert completed_dir == history_dir
+    assert completed_manifest == resumed_manifest
+
+    tampered = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tampered["partitions"][0]["path"] = "../outside"
+    manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(DataContractError, match="year or path"):
+        verify_historical_replay(history_dir)

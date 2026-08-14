@@ -1,8 +1,9 @@
 # HeyBoss 因子联调交接
 
-本文是 FacDiggerNN 向 HeyBoss 交易项目的实施交接单。FacDiggerNN 只交付最终
-FactorBatch 目录；HeyBoss 不读取训练数据、ModelRelease、checkpoint、scaler 或
-predictions。双方应各自固定 Git commit，并用真实 FacDigger 产出的目录做契约测试，不能
+本文是 FacDiggerNN 向 HeyBoss 交易项目的实施交接单。FacDiggerNN 只交付最终的单个
+FactorBatch 两文件目录；全历史回放的父 plan/state/manifest 只供 FacDigger 续跑，HeyBoss
+不读取它，也不读取训练数据、ModelRelease、checkpoint、scaler 或 predictions。双方应各自固定
+Git commit，并用真实 FacDigger 产出的目录做契约测试，不能
 各写一份“看起来相同”的测试 fixture 后就认为联调完成。
 
 ## 六项 FacDigger 收尾审计
@@ -12,9 +13,9 @@ predictions。双方应各自固定 Git commit，并用真实 FacDigger 产出�
 | 1. 固化 ModelRelease | 完成 | `inference/releases.py` 绑定 clean Git、checkpoint protocol、配置、scaler、训练/run manifest 和原始 predictions；篡改与旧协议测试失败关闭 |
 | 2. 分离训练/推理快照 | 完成 | `data/inference_snapshots.py` 独立生成无标签 features、inference index 和 delivery universe；训练 snapshot ID 与输入 snapshot ID 分离 |
 | 3. 复用冻结 scaler | 完成 | 推理只调用 `apply_robust_scaler`；回归测试禁止 fit，并逐值证明同一原始区间的训练/推理 features 完全一致 |
-| 4. 统一因子帧 | 完成 | 旧研究 replay factors 已移除；评价回放和日常 signal 均调用唯一 `build_factor_frame`，严格输出五列 |
+| 4. 统一因子帧 | 完成 | 旧研究 replay factors 已移除；原 predictions、固定模型历史回放和日常 signal 均复用同一五列构造、评分边界和 publisher |
 | 5. 原子 FactorBatch publisher | 完成 | Parquet 写入后重新读取校验，manifest 最后写，目录原子 rename；幂等、语义/文件篡改和失败清理均有测试 |
-| 6. E3 集成回放 | 完成但有数据前置 | `factor-batch from-predictions` 只转换 ModelRelease 已绑定的原始 E3 predictions；旧 `artifacts2` 不满足当前协议，故被有意拒绝 |
+| 6. E3 集成回放 | 完成但有数据前置 | 原 predictions 适配器逐字节绑定 source run；新增固定 release 的 target-free 全历史年度回放、断点续跑与逐分片复核；旧 `artifacts2` 仍被有意拒绝 |
 
 第 6 项没有增加 legacy bypass：已有旧结果可保留为研究证据，但实际跨仓联调要等待下一轮
 完整日、正确 mask、完整谱系绑定的 E3 结果。
@@ -25,7 +26,9 @@ FacDiggerNN 已提供两种来源、同一种文件契约：
 
 - `signal_inference`：单日完整候选横截面；“候选”指 FacDigger 当日 source universe，
   并不等于 HeyBoss 已配置标的集合；允许进入人工触发的 paper 验证；
-- `evaluation_predictions`：历史评价样本中 eligible 且已有标签的行；只能用于隔离回测。
+- `evaluation_predictions`：eligible 且已有分数的历史回测行；既可以来自 release 绑定的原始
+  评价 predictions，也可以来自固定 release 对 target-free 历史 snapshot 的重新推理。该枚举
+  表达 backtest-only 消费边界，不表示 FactorBatch 含有或读取了标签；只能用于隔离回测。
 
 目录固定为：
 
@@ -172,14 +175,19 @@ HeyBoss 不必一次映射 top-1000 全部股票。eligible 行缺 signal bar �
 
 ### H3：导入与 Actor 隔离回测
 
-先使用 `evaluation_predictions` bundle：
+优先使用 FacDigger `factor-history run` 生成的年度 `evaluation_predictions` 子目录。先导入
+一个较短年份做 smoke；通过后按父 manifest 声明的年份升序，把每个原始
+`factor_batches/<delivery_id>/` 目录逐个交给同一个 importer。父 manifest 只用于操作人员确认
+分片齐全，不进入 HeyBoss Catalog：
 
 ```bash
 uv run --frozen --env-file .env python scripts/import_factor_bundle.py \
-  /path/to/artifacts/factor_batches/<delivery_id>
+  /path/to/artifacts/factor_history/<history_id>/factor_batches/<delivery_id>
 ```
 
-然后把独立回测配置的 `active_strategy` 切到 `patchtst_e3`，仅在该隔离配置中设置
+也可以先用 `factor-batch from-predictions` 的原评价 split 做更小 smoke，但它通常只覆盖一个
+validation/test 区间，不能代替全历史工程回测。随后把独立回测配置的 `active_strategy` 切到
+`patchtst_e3`，仅在该隔离配置中设置
 `allow_evaluation_predictions: true`，并让 `data_start/evaluation_start/end` 覆盖因子日期：
 
 ```bash
@@ -189,11 +197,16 @@ uv run --frozen --env-file .env python scripts/run_backtest.py
 验收证据至少包括：
 
 - importer 首次导入行数/日期/标的数正确，重复导入为 no-op；
+- 全部年度 delivery 与 FacDigger 父 manifest 一一对应，缺一年或重复一年失败；
 - 同日期不同 delivery 或不同 score 不覆盖 Catalog，而是失败；
 - 每个日期只有完整 batch 才触发 Actor；
 - ineligible 行不参加排序，score 最高方向与权重方向一致；
 - `TradeSignalEvent`、风险限制、订单/成交和回测报告沿现有统一链路产生；
 - `evaluation_predictions` 在默认配置和 paper runner 中均被拒绝。
+
+这个回测只证明固定模型因子能够像普通策略数据一样贯通全历史价格、Catalog、Actor、风险与
+报告。模型参数、scaler 和历史来源修订对早期日期可能含未来信息，禁止把收益曲线标注为样本外，也禁止按
+这条曲线反向挑选 release、seed、日期范围或股票白名单。
 
 ### H4：单日生产语义 dry run
 
@@ -234,7 +247,31 @@ uv run facdigger release verify \
   --release artifacts/releases/<release_id>
 ```
 
-隔离回放：
+全历史工程回测先用 release 的冻结 scaler 建一次完整 target-free snapshot，再运行可恢复的年度
+回放。配置中的 `acknowledge_non_oos: true` 是必需的显式确认：
+
+```bash
+uv run facdigger dataset build-inference \
+  --config configs/datasets/eodhd_historical_liquid_inference.yaml \
+  --release artifacts/releases/<release_id>
+
+cp configs/inference/e3_historical_replay.example.yaml \
+  configs/inference/e3_historical_replay.local.yaml
+# 填写 release_dir、inference_snapshot_dir；需要时限定 start/end/security_ids
+
+uv run facdigger factor-history plan \
+  --config configs/inference/e3_historical_replay.local.yaml
+uv run facdigger factor-history run \
+  --config configs/inference/e3_historical_replay.local.yaml
+uv run facdigger factor-history verify \
+  --export artifacts/factor_history/<history_id>
+```
+
+`run` 按自然年生成子 FactorBatch，已完成年份会在继续前重新验证并跳过。不要写 shell 循环逐日
+调用 `signal`：那会把历史工程回测标成 `signal_inference` 生产语义，且没有父级完整性和恢复
+边界。给 HeyBoss 的是上述 export 内各年度 `<delivery_id>/` 子目录，不是 export 根目录。
+
+原始评价 split 的小范围隔离回放仍可用于 importer smoke：
 
 ```bash
 uv run facdigger factor-batch from-predictions \
@@ -283,8 +320,9 @@ FactorBatch 永久保留；`data/snapshots/` 和 `data/walk_forward_snapshots/` 
 修改。HeyBoss 只监视已完成的
 `artifacts/factor_batches/<delivery_id>/`，不读取 FacDigger SQLite、source store 或隐藏临时目录。
 
-每次交接记录 FacDigger commit、release ID、delivery ID、source kind、日期范围、Parquet hash、
-row/date/eligible counts、被批准的 E3 run/seed 选择依据和 HeyBoss commit。只复制完整
+每次交接记录 FacDigger commit、release ID、history ID/年份（若为历史回放）、delivery ID、
+source kind、日期范围、Parquet hash、row/date/eligible counts、`strict_out_of_sample=false`、被批准
+的 E3 run/seed 选择依据和 HeyBoss commit。只复制完整
 `<delivery_id>/` 目录；不要重新序列化 Parquet 或手改 manifest。
 
 ## 5. 本轮不能直接使用 artifacts2
@@ -304,7 +342,8 @@ commit 的原始 run 创建 ModelRelease。在此之前 HeyBoss 可以完成 H1/
 - 两个仓库均固定具体 commit，测试全绿；
 - FacDigger 对真实 bundle 的 `factor-batch verify` 通过；
 - HeyBoss 用同一原始目录通过严格 semantic/artifact/schema 校验；
-- 至少一个 evaluation bundle 完成 Catalog→Actor→TradeSignalEvent→风险→模拟成交→报告；
+- 至少一个 evaluation bundle 完成 Catalog→Actor→TradeSignalEvent→风险→模拟成交→报告；若验收
+  目标是全历史回测，FacDigger 父 manifest 声明的全部年度子 delivery 均已按序导入；
 - 至少一个 signal bundle 完成价格前置检查、Catalog 导入、Actor bootstrap 和人工审批前 dry run；
 - 重复导入/重启幂等，冲突输入失败关闭；
 - paper 未开启 `allow_evaluation_predictions`，且未自动沿用旧信号；

@@ -16,12 +16,18 @@ import yaml
 
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
-from facdigger.datasets.window import SnapshotInferenceWindowDataset, SnapshotWindowDataset
+from facdigger.datasets.window import SnapshotWindowDataset
 from facdigger.environment import collect_environment
 from facdigger.evaluation.contracts import prediction_coverage
 from facdigger.evaluation.metrics import evaluate_predictions
 from facdigger.evaluation.report import write_evaluation_report
 from facdigger.experiments.manifest import sha256_json
+from facdigger.inference.scoring import (
+    build_patchtst_model,
+    load_e3_inference_runtime,
+    patch_config,
+    score_e3_inference_rows,
+)
 from facdigger.models.baselines import (
     TabularPreprocessor,
     build_multiscale_features,
@@ -29,19 +35,14 @@ from facdigger.models.baselines import (
     predict_lightgbm_checkpoint,
     predict_mlp,
 )
-from facdigger.models.patchtst_alpha import PatchTSTAlphaModel
 from facdigger.training.common import (
     apply_source_readiness_gate,
     build_prediction_frame,
-    load_required_snapshot_features,
     load_source_provenance,
     load_training_snapshot,
 )
 from facdigger.training.e0_config import E0ExperimentConfig
-from facdigger.training.e1_config import E1ExperimentConfig
 from facdigger.training.e1_engine import predict_e1, select_device
-from facdigger.training.e2_config import E2ExperimentConfig
-from facdigger.training.e3_config import E3ExperimentConfig
 
 InferenceSplit = Literal["train", "valid", "test"]
 SUPPORTED_MODEL_TYPES = {
@@ -178,44 +179,6 @@ def _predict_e0(
     return scores, rows, audit
 
 
-def _build_patchtst_model(
-    model_config: Any, *, context_length: int, num_channels: int
-) -> PatchTSTAlphaModel:
-    return PatchTSTAlphaModel(
-        context_length=context_length,
-        num_input_channels=num_channels,
-        patch_length=model_config.patch_length,
-        patch_stride=model_config.patch_stride,
-        d_model=model_config.d_model,
-        num_attention_heads=model_config.num_attention_heads,
-        num_hidden_layers=model_config.num_hidden_layers,
-        ffn_dim=model_config.ffn_dim,
-        dropout=model_config.dropout,
-        attention_dropout=model_config.attention_dropout,
-        positional_dropout=model_config.positional_dropout,
-        path_dropout=model_config.path_dropout,
-        ff_dropout=model_config.ff_dropout,
-        norm_type=model_config.norm_type,
-        pre_norm=model_config.pre_norm,
-        scaling=model_config.scaling,
-        alpha_hidden_dim=model_config.alpha_hidden_dim,
-        alpha_dropout=model_config.alpha_dropout,
-    )
-
-
-def _patch_config(
-    model_type: str, config_payload: dict[str, Any]
-) -> tuple[Any, Any]:
-    if model_type == "random_patchtst":
-        config = E1ExperimentConfig.model_validate(config_payload)
-        return config, config.training
-    if model_type == "etth1_transferred_patchtst":
-        config = E2ExperimentConfig.model_validate(config_payload)
-        return config, config.training
-    config = E3ExperimentConfig.model_validate(config_payload)
-    return config, config.finetuning
-
-
 def _predict_patchtst(
     *,
     manifest: dict[str, Any],
@@ -228,7 +191,7 @@ def _predict_patchtst(
 ) -> tuple[np.ndarray, pl.DataFrame, dict[str, Any]]:
     import torch
 
-    config, inference_config = _patch_config(manifest["model_type"], config_payload)
+    config, inference_config = patch_config(manifest["model_type"], config_payload)
     dataset = SnapshotWindowDataset(
         features=frames["features"],
         sample_index=frames["sample_index"],
@@ -237,7 +200,7 @@ def _predict_patchtst(
         split=split,
     )
     device = select_device(device_preference)
-    model = _build_patchtst_model(
+    model = build_patchtst_model(
         config.model,
         context_length=context_length,
         num_channels=len(config.channels),
@@ -355,14 +318,8 @@ def run_signal_inference(
         factor_universe_sha256,
         publish_factor_batch,
     )
-    from facdigger.inference.releases import release_runtime
-
-    release_path = Path(release_dir).resolve()
-    release, config_payload, checkpoint_path = release_runtime(release_path)
-    if release.model_type != "financial_pretrained_patchtst":
-        raise DataContractError(
-            "cross-project signal inference currently accepts only an E3 ModelRelease"
-    )
+    runtime = load_e3_inference_runtime(release_dir, device=device)
+    release = runtime.release
     dataset_path = Path(dataset_dir).resolve()
     dataset_manifest, frames = load_inference_snapshot(dataset_path, release)
     inference_index = frames["inference_index"]
@@ -371,12 +328,6 @@ def run_signal_inference(
         frames["delivery_universe"],
         asof=asof,
     )
-    context_length = release.feature_contract.context_length
-    channels = list(release.feature_contract.channels)
-    if list(config_payload["channels"]) != channels:
-        raise DataContractError("release channels differ from inference dataset")
-
-    config, inference_config = _patch_config(release.model_type, config_payload)
     if rows.is_empty():
         scored_rows = pl.DataFrame(
             schema={
@@ -386,50 +337,12 @@ def run_signal_inference(
             }
         )
     else:
-        required_features = load_required_snapshot_features(
-            dataset_path,
-            {
-                "config": {
-                    "features": {
-                        "channels": channels,
-                    }
-                },
-                "artifacts": dataset_manifest["artifacts"],
-            },
-            rows,
-        )
-        dataset = SnapshotInferenceWindowDataset(
-            features=required_features,
-            inference_index=rows,
-            channels=config.channels,
-            context_length=context_length,
-        )
-        selected_device = select_device(device)
-        model = _build_patchtst_model(
-            config.model,
-            context_length=context_length,
-            num_channels=len(config.channels),
-        ).to(selected_device)
-        import torch
-
-        checkpoint = torch.load(
-            checkpoint_path, map_location=selected_device, weights_only=False
-        )
-        if checkpoint.get("dataset_id") != release.training_data.dataset_id:
-            raise DataContractError("checkpoint training dataset differs from ModelRelease")
-        model.load_state_dict(checkpoint["model_state"], strict=True)
-        precision = inference_config.precision if selected_device == "cuda" else "fp32"
-        scores = predict_e1(
-            model,
-            dataset,
-            batch_size=inference_config.batch_size,
-            device=selected_device,
-            precision=precision,
-            num_workers=inference_config.num_workers,
-        )
-        scored_rows = dataset.sample_rows.select(
-            "security_id", "asof_date"
-        ).with_columns(pl.Series("score", scores, dtype=pl.Float64))
+        scored_rows = score_e3_inference_rows(
+            runtime,
+            snapshot_dir=dataset_path,
+            snapshot_manifest=dataset_manifest,
+            rows=rows,
+        ).select("security_id", "asof_date", "score")
     candidate_universe = candidate_universe.select(
         "security_id", "symbol", "asof_date", "eligible"
     )

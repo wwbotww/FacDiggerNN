@@ -12,11 +12,8 @@ pytest.importorskip("transformers")
 
 from facdigger.data.contracts import DataContractError  # noqa: E402
 from facdigger.experiments.manifest import sha256_json  # noqa: E402
-from facdigger.inference.runner import (  # noqa: E402
-    _load_source_run,
-    _patch_config,
-    _select_signal_inputs,
-)
+from facdigger.inference.runner import _load_source_run, _select_signal_inputs  # noqa: E402
+from facdigger.inference.scoring import patch_config  # noqa: E402
 
 
 def _model() -> dict:
@@ -39,14 +36,14 @@ def test_patch_config_dispatches_all_e1_e2_e3_manifests() -> None:
         "channels": ["x0", "x1"],
         "model": _model(),
     }
-    e1, e1_training = _patch_config(
+    e1, e1_training = patch_config(
         "random_patchtst",
         {
             **base,
             "training": {"max_epochs": 1, "minimum_epochs": 1},
         },
     )
-    e2, e2_training = _patch_config(
+    e2, e2_training = patch_config(
         "etth1_transferred_patchtst",
         {
             **base,
@@ -57,7 +54,7 @@ def test_patch_config_dispatches_all_e1_e2_e3_manifests() -> None:
             },
         },
     )
-    e3, e3_training = _patch_config(
+    e3, e3_training = patch_config(
         "financial_pretrained_patchtst",
         {
             **base,

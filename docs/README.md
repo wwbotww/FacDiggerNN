@@ -35,7 +35,8 @@
 
 - 工程链路已覆盖标准化、快照、E0—E3、统一评价、回放、信号和 M6 walk-forward；
 - 跨项目生产侧已具备不可变 ModelRelease、冻结 scaler 的 target-free inference snapshot
-  和单日 FactorBatch；FacDigger 每日 EODHD 修订、指定日期推理、30 分钟重试、截止门禁及
+  和单日 FactorBatch；固定 release 的 target-free 全历史回放可按年生成 backtest-only
+  FactorBatch 并断点续跑。FacDigger 每日 EODHD 修订、指定日期推理、30 分钟重试、截止门禁及
   保留策略由 Docker 常驻服务统一编排，不依赖宿主 `launchd`；HeyBoss 已有
   importer/NT Catalog/Actor 骨架，但消费者仍需按
   [联调交接](HeyBoss因子联调交接.md)同步现行 semantic delivery ID 与 manifest 字段；
@@ -71,6 +72,8 @@ configs/
 │   ├── eodhd_all_world_pilot.yaml    # 100 股票工程 snapshot
 │   └── eodhd_historical_liquid.yaml  # 历史动态主 snapshot
 ├── experiments/                      # E0—E3 smoke、pilot 和完整模型配置
+├── inference/
+│   └── e3_historical_replay.example.yaml  # 固定 release 的 backtest-only 全历史回放
 ├── production/
 │   └── eodhd_daily.example.yaml      # Docker 生产模板；本地副本固定 release ID
 └── research/
