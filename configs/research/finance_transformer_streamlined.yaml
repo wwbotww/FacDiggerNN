@@ -1,0 +1,35 @@
+research_id: finance_transformer_scratch_vs_pretrained
+base_dataset_config: configs/datasets/eodhd_historical_liquid_transformer.yaml
+output_root: artifacts/transformer_comparison
+snapshot_output_root: data/transformer_walk_forward_snapshots
+admission_report: artifacts/benchmarks/finance-transformer-rtx2070s.json
+seed: 42
+
+folds:
+  - fold_id: wf1
+    train_end: 2020-12-31
+    valid_end: 2021-12-31
+    test_end: 2022-12-30
+    embargo_sessions: 20
+  - fold_id: wf2
+    train_end: 2021-12-31
+    valid_end: 2022-12-30
+    test_end: 2023-12-29
+    embargo_sessions: 20
+  - fold_id: wf3
+    train_end: 2022-12-30
+    valid_end: 2024-12-31
+    test_end: 2025-12-31
+    embargo_sessions: 20
+
+experiments:
+  pretraining: configs/experiments/finance_patch_pretrain.yaml
+  scratch: configs/experiments/finance_patch_transformer_scratch.yaml
+  pretrained: configs/experiments/finance_patch_transformer_pretrained.example.yaml
+
+decisions:
+  minimum_paired_mean_rank_ic_delta: 0.001
+  minimum_positive_folds: 2
+  require_positive_worst_fold: true
+  hac_lags: 5
+  non_overlapping_stride: 5

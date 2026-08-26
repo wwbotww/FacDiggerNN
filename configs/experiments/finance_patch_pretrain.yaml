@@ -1,0 +1,77 @@
+experiment_id: finance_patch_pretrain
+seed: 42
+output_root: artifacts/finance_pretrain
+future_horizon: 5
+
+channels:
+  - r_close
+  - r_gap
+  - r_intraday
+  - range
+  - dlog_volume
+  - vol20
+  - dollar_volume_z20
+  - rank_r_close
+  - rank_r_gap
+  - rank_r_intraday
+  - rank_range
+  - rank_dlog_volume
+  - rank_vol20
+  - rank_dollar_volume_z20
+market_channels:
+  - market_return_median
+  - market_breadth
+  - market_return_dispersion
+  - market_range_median
+  - market_volume_activity
+  - market_vol20
+
+model:
+  patch_length: 16
+  patch_stride: 8
+  local_d_model: 64
+  local_num_attention_heads: 8
+  local_num_hidden_layers: 4
+  local_ffn_dim: 256
+  market_d_model: 32
+  market_num_attention_heads: 4
+  market_num_hidden_layers: 2
+  market_ffn_dim: 128
+  embedding_dim: 128
+  cross_num_attention_heads: 4
+  cross_num_hidden_layers: 2
+  cross_ffn_dim: 256
+  statistics_output_dim: 64
+  statistics_windows: [5, 20, 60, 120, 252]
+  dropout: 0.1
+
+training:
+  batch_size: 32
+  max_epochs: 3
+  minimum_epochs: 2
+  patience: 1
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  warmup_fraction: 0.05
+  minimum_learning_rate_ratio: 0.1
+  max_grad_norm: 1.0
+  device: auto
+  precision: fp16
+  num_workers: 0
+  objective:
+    mask_ratio: 0.3
+    minimum_span_patches: 1
+    maximum_span_patches: 4
+    shared_channel_fraction: 0.5
+    reconstruction_weight: 0.4
+    future_summary_weight: 0.6
+    huber_delta: 1.0
+  probe:
+    fit_dates: 60
+    selection_dates: 20
+    epochs: 20
+    learning_rate: 0.01
+    weight_decay: 0.0001
+    minimum_cross_section_size: 32

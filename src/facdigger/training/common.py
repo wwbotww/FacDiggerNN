@@ -121,12 +121,17 @@ def load_required_snapshot_features(
     feature_config = dataset_manifest["config"]["features"]
     channels = list(feature_config["channels"])
     observed = [f"observed_{channel}" for channel in channels]
+    end_column = "future_end" if "future_end" in required_rows.columns else "asof_date"
     bounds = (
-        required_rows.select("security_id", "feature_start", "asof_date")
+        required_rows.select(
+            "security_id",
+            "feature_start",
+            pl.col(end_column).alias("_required_sample_end"),
+        )
         .group_by("security_id")
         .agg(
             pl.col("feature_start").min().alias("_required_start"),
-            pl.col("asof_date").max().alias("_required_end"),
+            pl.col("_required_sample_end").max().alias("_required_end"),
         )
     )
     filename = str(
@@ -146,6 +151,42 @@ def load_required_snapshot_features(
         .drop("_required_start", "_required_end")
         .collect()
         .sort(["security_id", "trade_date"])
+    )
+
+
+def load_required_market_features(
+    dataset_dir: Path,
+    dataset_manifest: dict[str, Any],
+    required_rows: pl.DataFrame,
+) -> pl.DataFrame:
+    """Read the single market sequence range needed by one Transformer run."""
+
+    required_columns = {"feature_start", "asof_date"}
+    missing = sorted(required_columns - set(required_rows.columns))
+    if missing:
+        raise DataContractError(f"required market rows missing columns: {missing}")
+    if required_rows.is_empty():
+        raise DataContractError("cannot load market features for an empty sample selection")
+    feature_config = dataset_manifest["config"]["features"]
+    channels = list(feature_config.get("market_channels") or [])
+    if not channels:
+        raise DataContractError("dataset does not declare market context channels")
+    filename = dataset_manifest.get("artifacts", {}).get("market_features")
+    if not isinstance(filename, str):
+        raise DataContractError("dataset does not contain market context features")
+    path = dataset_dir / filename
+    if not path.is_file():
+        raise FileNotFoundError(f"Snapshot market features do not exist: {path}")
+    start = required_rows["feature_start"].min()
+    end_column = "future_end" if "future_end" in required_rows.columns else "asof_date"
+    end = required_rows[end_column].max()
+    observed = [f"observed_{channel}" for channel in channels]
+    return (
+        pl.scan_parquet(path)
+        .select("trade_date", *channels, *observed)
+        .filter(pl.col("trade_date").is_between(start, end))
+        .collect()
+        .sort("trade_date")
     )
 
 

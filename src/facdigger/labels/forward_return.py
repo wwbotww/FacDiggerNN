@@ -1,4 +1,4 @@
-"""Five-session forward excess-return labels with delisting handling."""
+"""Forward excess-return labels with delisting handling."""
 
 from __future__ import annotations
 
@@ -135,4 +135,101 @@ def build_forward_excess_return_labels(
         "benchmark_return",
         "target",
         "crosses_delisting",
+    )
+
+
+def build_multi_horizon_excess_return_labels(
+    bars: pl.DataFrame,
+    universe: pl.DataFrame,
+    *,
+    horizons: list[int],
+    primary_horizon: int,
+    delistings: pl.DataFrame | None = None,
+    execution_lag: int = 1,
+) -> pl.DataFrame:
+    """Build aligned labels while retaining primary aliases used by evaluators.
+
+    Generic ``target``/``raw_return`` columns identify ``primary_horizon``. The
+    generic ``label_end`` uses the longest horizon so chronological split
+    assignment purges every auxiliary target at the boundary.
+    """
+
+    ordered_horizons = sorted(set(horizons))
+    if not ordered_horizons:
+        raise ValueError("at least one label horizon is required")
+    if len(ordered_horizons) != len(horizons):
+        raise ValueError("label horizons must be unique")
+    if primary_horizon not in ordered_horizons:
+        raise ValueError("primary_horizon must be included in horizons")
+    if any(horizon < execution_lag for horizon in ordered_horizons):
+        raise ValueError("all horizons must be >= execution_lag")
+
+    merged: pl.DataFrame | None = None
+    for horizon in ordered_horizons:
+        current = build_forward_excess_return_labels(
+            bars,
+            universe,
+            delistings=delistings,
+            execution_lag=execution_lag,
+            horizon=horizon,
+        ).rename(
+            {
+                "label_start": f"label_start_{horizon}",
+                "label_end": f"label_end_{horizon}",
+                "raw_return": f"raw_return_{horizon}",
+                "benchmark_return": f"benchmark_return_{horizon}",
+                "target": f"target_{horizon}",
+                "crosses_delisting": f"crosses_delisting_{horizon}",
+            }
+        )
+        merged = (
+            current
+            if merged is None
+            else merged.join(
+                current,
+                on=["asof_date", "security_id"],
+                how="inner",
+                validate="1:1",
+            )
+        )
+    assert merged is not None
+    maximum_horizon = max(ordered_horizons)
+    return (
+        merged.with_columns(
+            pl.col(f"label_start_{primary_horizon}").alias("label_start"),
+            pl.col(f"label_end_{maximum_horizon}").alias("label_end"),
+            pl.col(f"raw_return_{primary_horizon}").alias("raw_return"),
+            pl.col(f"benchmark_return_{primary_horizon}").alias(
+                "benchmark_return"
+            ),
+            pl.col(f"target_{primary_horizon}").alias("target"),
+            pl.any_horizontal(
+                *[
+                    pl.col(f"crosses_delisting_{horizon}")
+                    for horizon in ordered_horizons
+                ]
+            ).alias("crosses_delisting"),
+        )
+        .select(
+            "asof_date",
+            "security_id",
+            "label_start",
+            "label_end",
+            "raw_return",
+            "benchmark_return",
+            "target",
+            "crosses_delisting",
+            *[
+                column
+                for horizon in ordered_horizons
+                for column in (
+                    f"label_end_{horizon}",
+                    f"raw_return_{horizon}",
+                    f"benchmark_return_{horizon}",
+                    f"target_{horizon}",
+                    f"crosses_delisting_{horizon}",
+                )
+            ],
+        )
+        .sort(["asof_date", "security_id"])
     )

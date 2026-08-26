@@ -1,12 +1,16 @@
 # FacDiggerNN
 
 FacDiggerNN 是面向美股日频横截面选股的 point-in-time 机器学习因子研究 CLI。它把
-EODHD 或自备标准 Parquet 数据转换为内容寻址快照，训练 E0—E3 对照模型，并输出可回放、
-可审计的因子、评价和 walk-forward 研究结果。
+EODHD 或自备标准 Parquet 数据转换为内容寻址快照，既保留 E0—E3 历史对照，也提供金融
+原生 Transformer 的从头训练/金融预训练配对实验，并输出可回放、可审计的评价和
+walk-forward 研究结果。
 
 本项目是研究工具，不是交易系统；不负责下单、撮合、仓位或资金管理。
 
-> **当前状态**：数据、训练、评价、回放和研究冻结的工程闭环已实现。监督训练以同日股票
+> **当前状态**：数据、训练、评价、回放和研究冻结的工程闭环已实现。金融原生 Transformer
+> 的输入、1/5/20 日标签、完整日 Set Transformer、显存受限 embedding replay、金融预训练、
+> Train 内 linear probe、100-update RTX 基准和 3-fold 精简 runner 已实现，尚待 RTX 2070S
+> CUDA 实测和完整训练。监督训练以同日股票
 > 横截面排序为目标；final holdout 只能在显著性门禁通过、协议冻结并显式解封后，先登记
 > holdout 访问和核对冻结样本键，再以截至 validation 末日的数据重新训练后评价。历史动态
 > EODHD bronze 曾在项目机器上完成采集和质量审计，
@@ -27,11 +31,11 @@ EODHD 或自备标准 Parquet 数据转换为内容寻址快照，训练 E0—E3
 |---|---|
 | 数据 | EODHD provider、标准 Parquet 契约、来源质量证明、响应缓存和调用预算 |
 | 股票池 | active + delisted 候选、历史日 ADV20 动态 top-1000、交易日历和身份隔离 |
-| 数据集 | 七通道特征、Train-only scaler、五日超额收益标签、不可变快照 |
-| 模型 | E0 LightGBM/MLP、E1 随机 PatchTST、E2 ETTh1 迁移、E3 金融域预训练 |
-| 训练 | 完整日横截面排序目标、显存受限两遍精确梯度、inner selection、resume 和泄漏审计 |
+| 数据集 | 旧七通道；新 14 路个股 + 6 路市场状态、Train-only scaler、1/5/20 日标签、target-free 预训练索引 |
+| 模型 | E0—E3；金融原生 local/market PatchTST + 多尺度统计 + 完整日 Set Transformer |
+| 训练 | 完整日多期限排序、精确 embedding replay、连续片段金融预训练、Train 内 probe、resume 和泄漏审计 |
 | 评价 | IC/Rank IC、ICIR、分组收益、换手、成本、稳定性和中性化可用性报告 |
-| 研究 | 多 fold/seed 矩阵、HAC/非重叠检验、Holm 校正、freeze 和 final refit |
+| 研究 | 新主线 3 folds × 1 seed × 2 初始化；旧 M6 完整矩阵、HAC/非重叠检验、freeze 和 final refit |
 | 推理/生产 | checkpoint 回放、ModelRelease、冻结 scaler 的无标签快照、单日/全历史 FactorBatch、Docker 日调度和独立评价 |
 
 核心数据流：
@@ -39,7 +43,8 @@ EODHD 或自备标准 Parquet 数据转换为内容寻址快照，训练 E0—E3
 ```text
 provider / 标准 Parquet
   -> 标准表 + provider-neutral provenance
-  -> 训练 snapshot -> E0 / E1 / E2 / E3 -> 统一评价 / walk-forward / final refit
+  -> 训练 snapshot -> E0—E3（历史）/ finance Transformer（当前）
+       -> 统一评价 / 精简 walk-forward
   -> E3 ModelRelease -> 无标签 inference snapshot
        -> 单日 signal FactorBatch / 固定模型全历史回测 FactorBatch
 ```
@@ -56,20 +61,23 @@ E3 ModelRelease，并固定输出单个 as-of 日期的完整候选横截面。`
 universe 的最新交易日为准，不会退回最近仍有可评分股票的旧日期；全体不可评分时输出
 当日显式无信号批次。
 
-## 研究任务
+## 当前 Transformer 研究任务
 
 - 市场：Nasdaq、NYSE、NYSE American 普通股日频；
 - 决策时点：交易日 `t` 收盘后，最早 `t+1` 开盘执行；
-- 输入：最近 512 个市场 session 的 7 个价格/成交量通道；
-- 标签：`t+1` 开盘到 `t+5` 收盘的对数收益，减当日 eligible 股票池等权收益；
-- 监督目标：同日横截面 `1 - corr(score, target_rank)`；
+- 输入：最近 512 个市场 session 的 7 个原始价量通道、对应 7 个同日横截面 rank 通道，
+  外加每日期 6 个市场状态通道；
+- 标签：1/5/20 日未来超额收益，5 日为主任务；
+- 监督目标：完整交易日内加权的多期限 `1 - corr(score_h, target_rank_h)`；
 - 主评价：逐日 Rank IC 及其显著性；20 bps 组合结果是参考评价，不是排序主门禁。
 
-神经模型的监督目标是 `cross_sectional_rank_correlation_surrogate_v2_full_date`。
+旧 E1—E3 和新模型都以完整日排序为基础；新模型的 objective 是
+`multi_horizon_full_date_rank_correlation`。
 DataLoader 在 CPU 一次组装一个完整交易日，GPU 内只保留由 `batch_size` 限制的
 physical microbatch；两遍回放用完整日统计量计算精确梯度。因此降低 `batch_size`
-不会把目标退化为小横截面相关性。但模型使用 train-mode BatchNorm，物理微批大小
-仍会影响 BN 统计、吞吐和训练轨迹，正式对照必须固定它。
+不会把目标退化为小横截面相关性。新模型使用 LayerNorm，不依赖 train-mode BatchNorm；
+scratch 与 pretrained 仍必须固定相同 physical microbatch、完整数据、epoch 预算和
+selection 规则。
 
 ## 安装
 
@@ -172,7 +180,58 @@ E1—E3 支持从同一 dataset、完整配置和来源权重哈希绑定的 `la
 E3 reconstruction checkpoint 独立使用 schema v2 和
 `patch_alignment_protocol=patchifier_sequence_start_v2`，用来拒绝修复前 mask 错位权重。
 
-### 3. Walk-forward engineering research
+### 3. 金融原生 Transformer 精简实验（当前主线）
+
+精简矩阵严格固定为 3 个 fold、seed 42、scratch/finance-pretrained 两个监督方法；每个 fold
+只做一次金融预训练。因此是 3 次预训练 + 6 个监督 cell，共 9 个长阶段。旧 E0—E3 和完整
+3-seed 消融不自动运行。
+
+在 RTX 机器上先为最大的 fold 构建新 snapshot，再做 100 个真实 optimizer update 的资源准入：
+
+```bash
+uv run facdigger dataset build \
+  --config configs/datasets/eodhd_historical_liquid_transformer.yaml
+
+uv run facdigger train finance-benchmark \
+  --supervised-config configs/experiments/finance_patch_transformer_scratch.yaml \
+  --pretraining-config configs/experiments/finance_patch_pretrain.yaml \
+  --dataset data/snapshots/<largest_fold_dataset_id> \
+  --updates 100 \
+  --output artifacts/benchmarks/finance-transformer-rtx2070s.json
+```
+
+基准只提前停止测量任务，不改变正式模型、股票池、日期、512 日上下文或 epoch 上限。报告只有
+在 CUDA/FP16 已实际启用、峰值显存/宿主 RAM 分别不超过 7.2/13 GiB，且保守矩阵投影不超过
+14 天时才给出 `admitted=true`。`transformer-run` 会强制校验这份报告的配置哈希、最大 fold
+dataset ID 和至少 100 个 update，缺失或不匹配时拒绝启动。随后执行：
+
+```bash
+uv run facdigger research transformer-plan \
+  --config configs/research/finance_transformer_streamlined.yaml
+
+uv run facdigger research transformer-run \
+  --config configs/research/finance_transformer_streamlined.yaml
+```
+
+中断后只恢复未完成阶段：
+
+```bash
+uv run facdigger research transformer-run \
+  --config configs/research/finance_transformer_streamlined.yaml \
+  --resume-run artifacts/transformer_comparison/<research_run_id>
+```
+
+每个长任务在自身 run 目录持续追加 `progress.jsonl`，可在另一终端查看：
+
+```bash
+tail -f artifacts/transformer_comparison/<research_run_id>/runs/<fold>/<stage>/<run_id>/progress.jsonl
+```
+
+新监督 checkpoint 是 schema v4。`facdigger predict` 已支持在原训练 snapshot 上严格回放；
+面向生产的 target-free snapshot、ModelRelease 与 FactorBatch 仍只接受已验证的 E3，等本轮因子
+通过配对门禁后再扩展，避免把尚未证明有效的模型接入每日发布。
+
+### 4. 旧 Walk-forward engineering research（保留，不作为当前默认矩阵）
 
 M6 runner 会按 fold 自行建立 `data/walk_forward_snapshots/`，不要求先构建上面的普通快照：
 当前配置的 `research_id` 是 `m6_eodhd_engineering_full_date_v2`，用于完整日
@@ -202,7 +261,7 @@ uv run facdigger research run \
 构建 refit snapshot 并核对冻结的 2025 test 键，再重新训练和一次性评价。2025 test 不进入
 训练、scaler 拟合或 checkpoint selection。
 
-### 4. 发布 E3 日频因子
+### 5. 发布 E3 日频因子
 
 先选择由 clean Git 工作树训练出的完整 E3 run，再创建 ModelRelease；发布命令可以在后续
 clean 提交上运行，但 release 固定记录训练 run 的原始 commit。随后用它的冻结 scaler 构建

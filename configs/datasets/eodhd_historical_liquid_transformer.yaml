@@ -1,0 +1,54 @@
+dataset_name: eodhd_us_historical_liquid_finance_transformer
+
+sources:
+  bars: data/bronze/eodhd_us_historical_liquid/bars_daily.parquet
+  universe: data/bronze/eodhd_us_historical_liquid/universe_daily.parquet
+  corporate_actions: data/bronze/eodhd_us_historical_liquid/corporate_actions.parquet
+  delistings: data/bronze/eodhd_us_historical_liquid/delistings.parquet
+  source_manifest: data/bronze/eodhd_us_historical_liquid/eodhd_ingestion_manifest.json
+
+output_root: data/snapshots
+
+features:
+  name: finance_transformer
+  context_length: 512
+  scaler: train_global_robust
+  winsor_lower: 0.005
+  winsor_upper: 0.995
+  channels:
+    - r_close
+    - r_gap
+    - r_intraday
+    - range
+    - dlog_volume
+    - vol20
+    - dollar_volume_z20
+    - rank_r_close
+    - rank_r_gap
+    - rank_r_intraday
+    - rank_range
+    - rank_dlog_volume
+    - rank_vol20
+    - rank_dollar_volume_z20
+  market_channels:
+    - market_return_median
+    - market_breadth
+    - market_return_dispersion
+    - market_range_median
+    - market_volume_activity
+    - market_vol20
+
+label:
+  name: multi_horizon_next_open_to_close_excess_return
+  execution_lag: 1
+  horizon: 5
+  auxiliary_horizons: [1, 20]
+  benchmark: eligible_equal_weight
+
+split:
+  # Keep the standalone build aligned with the largest streamlined fold so
+  # the mandatory RTX admission benchmark cannot understate total runtime.
+  train_end: 2022-12-30
+  valid_end: 2024-12-31
+  test_end: 2025-12-31
+  embargo_sessions: 20

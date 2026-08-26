@@ -33,14 +33,14 @@ WSL2 Ubuntu 中运行工程实验。目标环境是 Python 3.11、单张 8 GB NV
 
 2026-07-29 的内存优化除共享 `SecurityFeatureStore` 外，还加入训练窗口范围裁剪、
 索引列裁剪、snapshot 分阶段释放，以及 E0 逐证券 Float32 统计和 LightGBM mmap 输入。
-这移除了已知的 P0 级内存放大，但 16 GB 目标机尚未完成全 M6 峰值验收。16 GB 机器应先
-运行单个 E1/E0 cell，确认系统未进入持续 swap 后再运行完整 M6；不要一开始并行训练多个
-cell。32 GB 以上仍是更稳妥的正式实验配置。
+这移除了已知的 P0 级内存放大，但 16 GB 目标机尚未完成新矩阵峰值验收。16 GB 机器应先
+运行 100-update finance benchmark，确认系统未进入持续 swap 后再运行精简矩阵；不要并行
+训练多个 cell。32 GB 以上仍是更稳妥的正式实验配置。
 
-完整日 objective v2 不会把约一千只股票的 activation 一次全放入 GPU。CPU
+金融原生 Transformer 不会把约一千只股票的全部时间 encoder activation 一次放入 GPU。CPU
 DataLoader 每次组装一个交易日的窗口，GPU 内只处理由 `batch_size` 限制的
-physical microbatch；两遍回放仍使用整日 moments 和精确 score 梯度。相比旧的单遍
-训练，它每日增加约一次不建图 forward；CPU 侧的额外活跃 batch 只是一日窗口，
+physical microbatch；第一遍保存 detached local embedding，完整日 Set Transformer 产生
+embedding 叶梯度，再逐块精确重算时间 encoder。CPU 侧的额外活跃 batch 只是一日窗口，
 但全体 feature store 仍然需要遵守前述 RAM 门禁。这一实现已通过 CPU 单元/集成测试，
 尚未在本目标 CUDA 机上完成真实峰值或速度验收。
 
@@ -157,9 +157,9 @@ research_mode: engineering
 
 `engineering` 是预期状态：当前退市终值为明确标记的插值，且缺少点时行业和流通市值。
 
-## 7. 下载并验证 PatchTST 来源权重
+## 7. 旧 E2/E3 来源权重（当前精简实验不需要）
 
-目标机首次运行需要访问 Hugging Face：
+只有继续运行旧 E2/E3 时，目标机首次运行才需要访问 Hugging Face：
 
 ```bash
 uv run facdigger probe-patchtst \
@@ -176,7 +176,98 @@ FP16。若目标机不能联网，可以把 Mac 的对应 Hugging Face model cac
 的 observed mask 使用相同起点。修复前 artifacts 的 mask 从第 0 个 session 开始，
 与真实 patch 错位 8 个 session；这些权重不能用于本轮矩阵，必须重新训练。
 
-## 8. 构建快照与启动训练
+## 8. 当前精简 Transformer：构建和资源准入
+
+先构建 schema-v4 finance snapshot。精简 runner 会自行为三个 fold 构建快照；下面单独构建
+一次是为了在最大 fold 上做资源准入：
+
+```bash
+uv run facdigger dataset build \
+  --config configs/datasets/eodhd_historical_liquid_transformer.yaml
+```
+
+使用输出的 dataset ID 执行 100 个监督 update 和 100 个 local 预训练 update（另测 market
+update）。这只是测量任务，正式配置仍保留全部数据和 epoch：
+
+```bash
+uv run facdigger train finance-benchmark \
+  --supervised-config configs/experiments/finance_patch_transformer_scratch.yaml \
+  --pretraining-config configs/experiments/finance_patch_pretrain.yaml \
+  --dataset data/snapshots/<largest_fold_dataset_id> \
+  --updates 100 \
+  --output artifacts/benchmarks/finance-transformer-rtx2070s.json
+```
+
+开始矩阵前必须检查报告：
+
+- `device=cuda`、`precision=fp16`；
+- CUDA peak allocated/reserved 没有逼近 8 GB；
+- 宿主 RAM 没有持续接近 16 GB 或 swap；
+- `admission.cuda_fp16_verified=true`；
+- `admission.within_memory_budget=true`（峰值显存不超过 7.2 GiB、进程峰值 RAM 不超过
+  13 GiB）；
+- `admission.within_fourteen_days=true`；
+- `admission.admitted=true`。
+
+估时按最大 fold 保守地套用到 3 次预训练和 6 个监督 cell，再增加 10% overhead。报告明确
+标记 probe 时间没有直接测量；第一个真实预训练 epoch 若 probe 超过该余量，应暂停并修正估时。
+`transformer-run` 会强制读取配置中的 `admission_report`，校验至少 100 个 update、两份训练
+配置哈希和最大 fold dataset ID；不能用 CPU、较小 fold 或另一套模型的报告启动正式矩阵。
+
+## 9. 启动和观察 9 个长阶段
+
+先确认 runner 不会注册旧完整矩阵：
+
+```bash
+uv run facdigger research transformer-plan \
+  --config configs/research/finance_transformer_streamlined.yaml
+```
+
+输出必须是 3 次 pretraining、6 个 supervised cell、seed 42，共 9 个长阶段。随后运行：
+
+```bash
+uv run facdigger research transformer-run \
+  --config configs/research/finance_transformer_streamlined.yaml
+```
+
+另开终端监控 GPU 和当前 stage：
+
+```bash
+nvidia-smi -l 2
+tail -f artifacts/transformer_comparison/<research_run_id>/runs/<fold>/<stage>/<run_id>/progress.jsonl
+```
+
+进程或网络中断后恢复同一个研究目录：
+
+```bash
+uv run facdigger research transformer-run \
+  --config configs/research/finance_transformer_streamlined.yaml \
+  --resume-run artifacts/transformer_comparison/<research_run_id>
+```
+
+runner 会校验已完成 stage 的 manifest 哈希，只续跑未完成阶段。scratch 和 pretrained 使用
+完全相同的模型、数据、监督学习率和 10/6 epoch；pretrained 只多一个同 fold
+`best_encoder.pt` 初始化。
+
+## 10. 当前停止条件
+
+出现以下任一情况应暂停，不要通过缩数据或缩模型继续：
+
+- benchmark 没有实际启用 CUDA/FP16，或保守投影超过 14 天；
+- snapshot build、benchmark 或训练被系统 OOM 杀死；
+- 8 GB 显存 OOM 且把 physical `batch_size` 从 16 调为 8 后仍失败；
+- replay 等价检查失败、loss/梯度非有限、checkpoint 不落盘；
+- progress 中 GPU 长时间空闲，或 probe 时间突破估时余量。
+
+finance 模型使用 LayerNorm，physical batch 只控制单股时间 encoder 的 activation；精确
+embedding replay 保留完整日 Set Transformer 目标。OOM 时可以把两个监督配置的
+`training.batch_size` 同步从 16 降为 8，并为 pretraining 选择不 OOM 的同类 batch；不得修改
+股票池、日期、512 日上下文、patch、`d_model`、层数、样本行或 10 epoch 上限。改变正式配置
+后应重新运行 benchmark，并确保 scratch/pretrained 仍完全配对。
+
+## 11. 旧 E0—E3/M6 操作（当前可忽略）
+
+> 以下内容只供复现历史 E0—E3/M6。当前 Transformer 实验不要执行这些命令。
 
 先构建一个普通快照，记录系统 RAM 峰值：
 
@@ -246,7 +337,7 @@ artifacts2 中单 epoch 约 1.5—1.9 万个 optimizer steps 且 encoder 相对 
 若验证可行后升级硬件并扩大训练预算，必须预注册新配置和新 research ID 全量
 重跑，不能把扩预算 cell 补进本轮矩阵。
 
-## 9. 首轮停止条件
+## 12. 旧 E0—E3 首轮停止条件（当前可忽略）
 
 遇到以下任一情况先停止并修复：
 

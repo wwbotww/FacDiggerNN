@@ -1,0 +1,87 @@
+experiment_id: finance_patch_transformer_pretrained
+initialization: finance_pretrained
+pretrained_checkpoint: artifacts/finance_pretrain/REPLACE_WITH_FOLD_RUN/checkpoints/best_encoder.pt
+seed: 42
+output_root: artifacts/finance_transformer/pretrained
+evaluation_split: valid
+unlock_test: false
+minimum_coverage: 0.98
+selection_fraction: 0.15
+
+channels:
+  - r_close
+  - r_gap
+  - r_intraday
+  - range
+  - dlog_volume
+  - vol20
+  - dollar_volume_z20
+  - rank_r_close
+  - rank_r_gap
+  - rank_r_intraday
+  - rank_range
+  - rank_dlog_volume
+  - rank_vol20
+  - rank_dollar_volume_z20
+market_channels:
+  - market_return_median
+  - market_breadth
+  - market_return_dispersion
+  - market_range_median
+  - market_volume_activity
+  - market_vol20
+horizons: [1, 5, 20]
+primary_horizon: 5
+costs_bps: [0, 10, 20, 50]
+
+model:
+  patch_length: 16
+  patch_stride: 8
+  local_d_model: 64
+  local_num_attention_heads: 8
+  local_num_hidden_layers: 4
+  local_ffn_dim: 256
+  market_d_model: 32
+  market_num_attention_heads: 4
+  market_num_hidden_layers: 2
+  market_ffn_dim: 128
+  embedding_dim: 128
+  cross_num_attention_heads: 4
+  cross_num_hidden_layers: 2
+  cross_ffn_dim: 256
+  statistics_output_dim: 64
+  statistics_windows: [5, 20, 60, 120, 252]
+  dropout: 0.1
+
+training:
+  batch_size: 16
+  max_epochs: 10
+  minimum_epochs: 6
+  patience: 3
+  encoder_learning_rate: 0.0001
+  head_learning_rate: 0.0003
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  warmup_fraction: 0.05
+  minimum_learning_rate_ratio: 0.1
+  dates_per_optimizer_step: 4
+  max_grad_norm: 1.0
+  device: auto
+  precision: fp16
+  num_workers: 0
+  replay_relative_tolerance: 0.0001
+  replay_absolute_tolerance: 0.00001
+  objective:
+    name: cross_sectional_rank_correlation_surrogate_v2_full_date
+    epsilon: 0.000001
+    minimum_cross_section_size: 32
+    minimum_selection_dates: 20
+    minimum_selection_coverage: 0.99
+    horizon_weights:
+      1: 0.2
+      5: 0.6
+      20: 0.2
+    scale_regularization: 0.01
+    selection_stability_penalty: 0.25
+    selection_subperiods: 3

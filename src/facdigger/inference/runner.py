@@ -16,7 +16,12 @@ import yaml
 
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
-from facdigger.datasets.window import SnapshotWindowDataset
+from facdigger.datasets.window import (
+    FinanceTransformerWindowDataset,
+    MarketFeatureStore,
+    SecurityFeatureStore,
+    SnapshotWindowDataset,
+)
 from facdigger.environment import collect_environment
 from facdigger.evaluation.contracts import prediction_coverage
 from facdigger.evaluation.metrics import evaluate_predictions
@@ -38,6 +43,8 @@ from facdigger.models.baselines import (
 from facdigger.training.common import (
     apply_source_readiness_gate,
     build_prediction_frame,
+    load_required_market_features,
+    load_required_snapshot_features,
     load_source_provenance,
     load_training_snapshot,
 )
@@ -51,6 +58,7 @@ SUPPORTED_MODEL_TYPES = {
     "random_patchtst",
     "etth1_transferred_patchtst",
     "financial_pretrained_patchtst",
+    "finance_patch_transformer",
 }
 
 
@@ -99,7 +107,10 @@ def _load_source_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any], Pat
 def _validate_dataset(
     manifest: dict[str, Any], dataset_path: Path
 ) -> tuple[dict[str, Any], dict[str, pl.DataFrame]]:
-    dataset_manifest, frames = load_training_snapshot(dataset_path)
+    dataset_manifest, frames = load_training_snapshot(
+        dataset_path,
+        include_features=manifest.get("model_type") != "finance_patch_transformer",
+    )
     if dataset_manifest["dataset_id"] != manifest["dataset_id"]:
         raise DataContractError("inference dataset_id does not match source run")
     expected_hash = manifest["dataset_manifest_hash"]
@@ -225,6 +236,91 @@ def _predict_patchtst(
         "precision": precision,
         "checkpoint_epoch": checkpoint.get("epoch"),
         "checkpoint_best_epoch": checkpoint.get("best_epoch"),
+    }
+
+
+def _predict_finance_transformer(
+    *,
+    manifest: dict[str, Any],
+    config_payload: dict[str, Any],
+    checkpoint_path: Path,
+    dataset_path: Path,
+    split: InferenceSplit,
+    device_preference: str,
+) -> tuple[np.ndarray, pl.DataFrame, dict[str, Any]]:
+    import torch
+
+    from facdigger.training.finance_transformer_config import (
+        FinanceTransformerExperimentConfig,
+    )
+    from facdigger.training.finance_transformer_engine import (
+        FINANCE_TRANSFORMER_CHECKPOINT,
+        build_finance_transformer_model,
+        predict_finance_transformer,
+    )
+
+    config = FinanceTransformerExperimentConfig.model_validate(config_payload)
+    dataset_manifest, frames = load_training_snapshot(
+        dataset_path, include_features=False
+    )
+    sample_index = frames["sample_index"]
+    required_rows = sample_index.filter(pl.col("split") == split).select(
+        "security_id", "feature_start", "asof_date"
+    )
+    feature_store = SecurityFeatureStore(
+        features=load_required_snapshot_features(
+            dataset_path, dataset_manifest, required_rows
+        ),
+        channels=config.channels,
+        presorted=True,
+    )
+    market_store = MarketFeatureStore(
+        features=load_required_market_features(
+            dataset_path, dataset_manifest, required_rows
+        ),
+        channels=config.market_channels,
+    )
+    dataset = FinanceTransformerWindowDataset(
+        feature_store=feature_store,
+        market_store=market_store,
+        sample_index=sample_index,
+        channels=config.channels,
+        market_channels=config.market_channels,
+        context_length=int(dataset_manifest["config"]["features"]["context_length"]),
+        split=split,
+        horizons=config.horizons,
+        primary_horizon=config.primary_horizon,
+    )
+    selected_device = select_device(device_preference)
+    model = build_finance_transformer_model(
+        config, context_length=dataset.context_length
+    ).to(selected_device)
+    checkpoint = torch.load(
+        checkpoint_path, map_location=selected_device, weights_only=False
+    )
+    if checkpoint.get("contract") != FINANCE_TRANSFORMER_CHECKPOINT:
+        raise DataContractError("checkpoint is not a finance Transformer checkpoint")
+    if checkpoint.get("dataset_id") != manifest["dataset_id"]:
+        raise DataContractError(
+            "finance Transformer checkpoint dataset_id does not match source run"
+        )
+    model.load_state_dict(checkpoint["model_state"], strict=True)
+    precision = config.training.precision if selected_device == "cuda" else "fp32"
+    scores = predict_finance_transformer(
+        model,
+        dataset,
+        batch_size=config.training.batch_size,
+        device=selected_device,
+        precision=precision,
+        num_workers=config.training.num_workers,
+    )
+    return scores, dataset.sample_rows, {
+        "loader": "strict_finance_transformer_state_dict",
+        "device": selected_device,
+        "precision": precision,
+        "checkpoint_epoch": checkpoint.get("epoch"),
+        "checkpoint_best_epoch": checkpoint.get("best_epoch"),
+        "full_date_cross_section": True,
     }
 
 
@@ -427,6 +523,15 @@ def run_inference(
             checkpoint_path=checkpoint_path,
             frames=frames,
             context_length=context_length,
+            split=requested_split,
+            device_preference=device,
+        )
+    elif manifest["model_type"] == "finance_patch_transformer":
+        scores, rows, loader_audit = _predict_finance_transformer(
+            manifest=manifest,
+            config_payload=config_payload,
+            checkpoint_path=checkpoint_path,
+            dataset_path=dataset_path,
             split=requested_split,
             device_preference=device,
         )

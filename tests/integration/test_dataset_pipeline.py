@@ -25,10 +25,17 @@ from facdigger.data.inference_snapshots import (
 from facdigger.data.provenance import build_standardization_contract
 from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
 from facdigger.datasets.splits import assign_chronological_splits
+from facdigger.features.cross_sectional import (
+    append_cross_sectional_ranks,
+    build_market_context_features,
+)
 from facdigger.features.price_volume import build_price_volume_features
 from facdigger.features.scaling import fit_train_robust_scaler
 from facdigger.inference.releases import ModelReleaseManifest
-from facdigger.labels.forward_return import build_forward_excess_return_labels
+from facdigger.labels.forward_return import (
+    build_forward_excess_return_labels,
+    build_multi_horizon_excess_return_labels,
+)
 
 
 def sessions(count: int) -> list[date]:
@@ -130,6 +137,38 @@ def test_scaler_does_not_fit_validation_or_test_values() -> None:
     assert original_scaler == mutated_scaler
 
 
+def test_cross_sectional_features_rank_only_eligible_rows_and_build_market_state() -> None:
+    bars, universe = synthetic_frames(40)
+    target_date = sessions(40)[25]
+    universe = universe.with_columns(
+        pl.when(
+            (pl.col("security_id") == "sec-b")
+            & (pl.col("trade_date") == target_date)
+        )
+        .then(False)
+        .otherwise(pl.col("eligible"))
+        .alias("eligible")
+    )
+    raw = build_price_volume_features(validate_bars(bars), validate_universe(universe))
+    ranked = append_cross_sectional_ranks(raw, validate_universe(universe))
+    target_rows = ranked.filter(pl.col("trade_date") == target_date).sort("security_id")
+    assert target_rows["rank_r_close"].null_count() == 2
+
+    fully_eligible = synthetic_frames(40)[1]
+    ranked = append_cross_sectional_ranks(raw, validate_universe(fully_eligible))
+    target_rows = ranked.filter(pl.col("trade_date") == target_date).sort("security_id")
+    assert target_rows["rank_r_close"].to_list() == [1.0, -1.0]
+    assert target_rows["observed_rank_r_close"].to_list() == [True, True]
+
+    market = build_market_context_features(raw, validate_universe(fully_eligible))
+    row = market.filter(pl.col("trade_date") == target_date).row(0, named=True)
+    expected_median = sum(target_rows["r_close"].to_list()) / 2
+    assert row["market_return_median"] == pytest.approx(expected_median)
+    assert row["market_breadth"] == pytest.approx(1.0)
+    assert row["market_return_dispersion"] >= 0
+    assert row["observed_market_vol20"] is True
+
+
 def test_forward_label_matches_execution_definition_and_cross_sectional_benchmark() -> None:
     bars, universe = synthetic_frames(40)
     bars = validate_bars(bars)
@@ -143,6 +182,24 @@ def test_forward_label_matches_execution_definition_and_cross_sectional_benchmar
     assert rows[0]["raw_return"] == pytest.approx(raw_a)
     assert rows[0]["target"] == pytest.approx(raw_a - benchmark)
     assert rows[1]["target"] == pytest.approx(raw_b - benchmark)
+
+
+def test_multi_horizon_labels_keep_primary_target_and_longest_boundary() -> None:
+    bars, universe = synthetic_frames(50)
+    labels = build_multi_horizon_excess_return_labels(
+        validate_bars(bars),
+        validate_universe(universe),
+        horizons=[1, 5, 20],
+        primary_horizon=5,
+    )
+    row = labels.filter(
+        (pl.col("security_id") == "sec-a")
+        & (pl.col("asof_date") == sessions(50)[20])
+    ).row(0, named=True)
+    assert row["target"] == pytest.approx(row["target_5"])
+    assert row["raw_return"] == pytest.approx(row["raw_return_5"])
+    assert row["label_end"] == row["label_end_20"]
+    assert row["label_end_1"] < row["label_end_5"] < row["label_end_20"]
 
 
 def test_embargo_skips_configured_sessions() -> None:
@@ -308,7 +365,7 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
     assert json.loads((first_dir / "source_manifest.json").read_text())["provider"] == ("synthetic")
     inference_index = pl.read_parquet(first_dir / "inference_index.parquet")
     sample_index = pl.read_parquet(first_dir / "sample_index.parquet")
-    assert first_manifest["schema_version"] == 3
+    assert first_manifest["schema_version"] == 4
     assert "target" not in inference_index.columns
     assert inference_index["asof_date"].max() == calendar[-1]
     assert inference_index["asof_date"].max() > sample_index["asof_date"].max()
@@ -318,6 +375,73 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
     moved_dir, moved_manifest = build_dataset_snapshot(moved_config)
     assert moved_dir.parent != first_dir.parent
     assert moved_manifest["dataset_id"] == first_manifest["dataset_id"]
+
+
+def test_finance_transformer_snapshot_contains_full_context_and_multi_horizon_targets(
+    tmp_path,
+) -> None:
+    bars, universe = synthetic_frames(90)
+    bars_path = tmp_path / "bars.parquet"
+    universe_path = tmp_path / "universe.parquet"
+    bars.write_parquet(bars_path)
+    universe.write_parquet(universe_path)
+    calendar = sessions(90)
+    channels = [
+        "r_close",
+        "r_gap",
+        "r_intraday",
+        "range",
+        "dlog_volume",
+        "vol20",
+        "dollar_volume_z20",
+    ]
+    config = DatasetBuildConfig.model_validate(
+        {
+            "sources": {"bars": bars_path, "universe": universe_path},
+            "output_root": tmp_path / "snapshots",
+            "features": {
+                "name": "finance_transformer",
+                "context_length": 20,
+                "channels": [*channels, *[f"rank_{channel}" for channel in channels]],
+                "market_channels": [
+                    "market_return_median",
+                    "market_breadth",
+                    "market_return_dispersion",
+                    "market_range_median",
+                    "market_volume_activity",
+                    "market_vol20",
+                ],
+            },
+            "label": {"horizon": 5, "auxiliary_horizons": [1, 20]},
+            "split": {
+                "train_end": calendar[40],
+                "valid_end": calendar[63],
+                "test_end": calendar[87],
+                "embargo_sessions": 2,
+            },
+        }
+    )
+
+    snapshot, manifest = build_dataset_snapshot(config)
+
+    assert manifest["artifacts"]["market_features"] == "market_features.parquet"
+    features = pl.read_parquet(snapshot / "features.parquet")
+    market = pl.read_parquet(snapshot / "market_features.parquet")
+    sample_index = pl.read_parquet(snapshot / "sample_index.parquet")
+    pretraining_index = pl.read_parquet(snapshot / "pretraining_index.parquet")
+    scaler = json.loads((snapshot / "scaler.json").read_text(encoding="utf-8"))
+    assert set(config.features.channels).issubset(features.columns)
+    assert set(config.features.market_channels).issubset(market.columns)
+    assert {"target_1", "target_5", "target_20"}.issubset(sample_index.columns)
+    assert not any(
+        column.startswith("target") for column in pretraining_index.columns
+    )
+    assert pretraining_index["future_end"].max() <= config.split.train_end
+    assert manifest["artifacts"]["pretraining_index"] == "pretraining_index.parquet"
+    assert sample_index.null_count().select(
+        "target_1", "target_5", "target_20"
+    ).sum_horizontal().item() == 0
+    assert set(scaler) == {"local", "market", "method", "rank_channels"}
 
 
 def test_inference_snapshot_reuses_release_scaler_without_labels_or_fit(

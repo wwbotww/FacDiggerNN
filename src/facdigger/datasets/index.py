@@ -12,6 +12,8 @@ def build_sample_index(
     labels_with_split: pl.DataFrame,
     universe: pl.DataFrame,
     context_length: int,
+    additional_label_columns: list[str] | None = None,
+    required_target_columns: list[str] | None = None,
 ) -> pl.DataFrame:
     if context_length < 1:
         raise ValueError("context_length must be positive")
@@ -19,6 +21,33 @@ def build_sample_index(
         pl.col("trade_date").shift(context_length - 1).over("security_id").alias("feature_start"),
         pl.col("trade_date").alias("feature_end"),
     )
+    extra_columns = list(additional_label_columns or [])
+    required_targets = list(required_target_columns or ["target"])
+    missing = sorted(
+        (set(extra_columns) | set(required_targets)) - set(labels_with_split.columns)
+    )
+    if missing:
+        raise DataContractError(f"labels missing requested sample columns: {missing}")
+    duplicate_output = sorted(
+        set(extra_columns)
+        & {
+            "sample_id",
+            "security_id",
+            "symbol",
+            "asof_date",
+            "feature_start",
+            "feature_end",
+            "label_start",
+            "label_end",
+            "split",
+            "target",
+            "raw_return",
+            "benchmark_return",
+            "crosses_delisting",
+        }
+    )
+    if duplicate_output:
+        raise ValueError(f"additional label columns duplicate canonical fields: {duplicate_output}")
     samples = (
         feature_bounds.select("security_id", "trade_date", "feature_start", "feature_end")
         .join(
@@ -36,7 +65,9 @@ def build_sample_index(
         )
         .filter(
             pl.col("feature_start").is_not_null()
-            & pl.col("target").is_not_null()
+            & pl.all_horizontal(
+                *[pl.col(column).is_not_null() for column in required_targets]
+            )
             & pl.col("split").is_not_null()
             & pl.col("eligible")
         )
@@ -61,6 +92,7 @@ def build_sample_index(
             "raw_return",
             "benchmark_return",
             "crosses_delisting",
+            *extra_columns,
         )
         .sort(["asof_date", "security_id"])
     )
@@ -139,4 +171,62 @@ def build_inference_index(
         raise DataContractError("inference_index contains duplicate sample_id values")
     if index.filter(pl.col("feature_end") != pl.col("asof_date")).height:
         raise DataContractError("inference_index contains invalid feature window bounds")
+    return index
+
+
+def build_finance_pretraining_index(
+    features: pl.DataFrame,
+    universe: pl.DataFrame,
+    *,
+    context_length: int,
+    future_horizon: int,
+    train_end: object,
+) -> pl.DataFrame:
+    """Build target-free Train endpoints whose future summary stays in Train.
+
+    The index deliberately carries no supervised return or split membership.  It
+    is derived only from the immutable feature grid, point-in-time eligibility,
+    the market calendar and the configured outer Train boundary.
+    """
+
+    if future_horizon < 1:
+        raise ValueError("future_horizon must be positive")
+    inference = build_inference_index(features, universe, context_length)
+    calendar = (
+        features.select("trade_date")
+        .unique()
+        .sort("trade_date")
+        .with_columns(
+            pl.col("trade_date").shift(-1).alias("future_start"),
+            pl.col("trade_date")
+            .shift(-future_horizon)
+            .alias("future_end"),
+        )
+        .rename({"trade_date": "asof_date"})
+    )
+    index = (
+        inference.join(calendar, on="asof_date", how="left", validate="m:1")
+        .filter(
+            pl.col("future_end").is_not_null()
+            & (pl.col("asof_date") <= pl.lit(train_end))
+            & (pl.col("future_end") <= pl.lit(train_end))
+        )
+        .select(
+            "sample_id",
+            "security_id",
+            "symbol",
+            "asof_date",
+            "feature_start",
+            "feature_end",
+            "future_start",
+            "future_end",
+        )
+        .sort(["asof_date", "security_id"])
+    )
+    if index.is_empty():
+        raise DataContractError("finance pretraining index is empty")
+    if index.filter(pl.col("feature_end") >= pl.col("future_start")).height:
+        raise DataContractError("finance pretraining index has overlapping history/future")
+    if index.filter(pl.col("future_end") > pl.lit(train_end)).height:
+        raise DataContractError("finance pretraining future target crosses Train boundary")
     return index

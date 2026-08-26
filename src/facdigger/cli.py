@@ -310,6 +310,153 @@ def train_e2_command(
     )
 
 
+@train_app.command("finance-transformer")
+def train_finance_transformer_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
+    resume: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, readable=True, help="Resume from last.pt."),
+    ] = None,
+) -> None:
+    """Train the finance-native full-date Transformer factor model."""
+
+    from facdigger.training.finance_transformer import run_finance_transformer
+    from facdigger.training.finance_transformer_config import (
+        load_finance_transformer_config,
+    )
+
+    try:
+        run_dir, metrics = run_finance_transformer(
+            load_finance_transformer_config(config),
+            dataset,
+            repository_root=Path.cwd(),
+            resume_from=resume,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    raw = metrics["metrics"]["raw"]
+    typer.echo(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "dataset_id": metrics["dataset_id"],
+                "evaluation_split": metrics["evaluation_split"],
+                "coverage": metrics["coverage"]["coverage"],
+                "mean_rank_ic": raw["rank_ic"]["mean"],
+                "rank_icir": raw["rank_ic"]["ir"],
+                "gross_q_high_minus_low": raw["portfolio"].get(
+                    "gross_q_high_minus_low"
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@train_app.command("finance-pretrain")
+def train_finance_pretrain_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
+    resume: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, readable=True, help="Resume from last.pt."),
+    ] = None,
+) -> None:
+    """Pretrain finance-native encoders on one fold's Train partition."""
+
+    from facdigger.training.finance_pretrain import run_finance_pretraining
+    from facdigger.training.finance_pretrain_config import (
+        load_finance_pretraining_config,
+    )
+
+    try:
+        run_dir, audit = run_finance_pretraining(
+            load_finance_pretraining_config(config),
+            dataset,
+            repository_root=Path.cwd(),
+            resume_from=resume,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "best_epoch": audit["best_epoch"],
+                "best_probe_rank_ic": audit["best_probe_rank_ic"],
+                "pretraining_rows": audit["pretraining_rows"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@train_app.command("finance-benchmark")
+def train_finance_benchmark_command(
+    supervised_config: Annotated[
+        Path, typer.Option(exists=True, dir_okay=False, readable=True)
+    ],
+    pretraining_config: Annotated[
+        Path, typer.Option(exists=True, dir_okay=False, readable=True)
+    ],
+    dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
+    output: Annotated[
+        Path, typer.Option(help="JSON report path for the RTX admission decision.")
+    ],
+    updates: Annotated[
+        int,
+        typer.Option(
+            min=100,
+            help="Measured optimizer updates per main update type; admission requires 100.",
+        ),
+    ] = 100,
+) -> None:
+    """Benchmark unchanged full-size model updates before the nine-stage run."""
+
+    from facdigger.training.finance_benchmark import (
+        run_finance_training_benchmark,
+        write_finance_training_benchmark,
+    )
+    from facdigger.training.finance_pretrain_config import (
+        load_finance_pretraining_config,
+    )
+    from facdigger.training.finance_transformer_config import (
+        load_finance_transformer_config,
+    )
+
+    try:
+        report = run_finance_training_benchmark(
+            load_finance_transformer_config(supervised_config),
+            load_finance_pretraining_config(pretraining_config),
+            dataset,
+            optimizer_updates=updates,
+        )
+        destination = write_finance_training_benchmark(output, report)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "report": str(destination),
+                "projected_days": report["matrix_projection"]["projected_days"],
+                "cuda_fp16_verified": report["admission"]["cuda_fp16_verified"],
+                "admitted": report["admission"]["admitted"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 @train_app.command("e3")
 def train_e3_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
@@ -1007,6 +1154,85 @@ def research_plan_command(
             indent=2,
             sort_keys=True,
             default=str,
+        )
+    )
+
+
+@research_app.command("transformer-plan")
+def transformer_research_plan_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+) -> None:
+    """Display the fixed nine-stage scratch/pretrained Transformer protocol."""
+
+    from facdigger.experiments.manifest import sha256_json
+    from facdigger.research.transformer_config import (
+        load_transformer_comparison_config,
+        validate_transformer_experiment_paths,
+    )
+
+    research = load_transformer_comparison_config(config)
+    paths = validate_transformer_experiment_paths(research)
+    typer.echo(
+        json.dumps(
+            {
+                "research_id": research.research_id,
+                "config_hash": sha256_json(research.model_dump(mode="json")),
+                "folds": [fold.model_dump(mode="json") for fold in research.folds],
+                "seed": research.seed,
+                "experiments": {key: str(value) for key, value in paths.items()},
+                "required_admission_report": str(research.admission_report.resolve()),
+                "pretraining_runs": 3,
+                "supervised_cells": 6,
+                "long_stages": 9,
+                "methods": ["scratch", "finance_pretrained"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@research_app.command("transformer-run")
+def transformer_research_run_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    resume_run: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Resume a failed streamlined Transformer comparison.",
+        ),
+    ] = None,
+) -> None:
+    """Run exactly three pretrains and six paired supervised cells."""
+
+    from facdigger.research.transformer_config import (
+        load_transformer_comparison_config,
+    )
+    from facdigger.research.transformer_runner import run_transformer_comparison
+
+    try:
+        run_dir, manifest = run_transformer_comparison(
+            load_transformer_comparison_config(config),
+            repository_root=Path.cwd(),
+            resume_run=resume_run,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "status": manifest["status"],
+                "acceptance": manifest.get("acceptance"),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
         )
     )
 
