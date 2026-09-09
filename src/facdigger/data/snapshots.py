@@ -14,9 +14,6 @@ import polars as pl
 
 from facdigger.data.adapters import StandardParquetAdapter
 from facdigger.data.config import (
-    DEFAULT_CHANNELS,
-    MARKET_CONTEXT_CHANNELS,
-    RANK_CHANNELS,
     DatasetBuildConfig,
 )
 from facdigger.datasets.index import (
@@ -26,12 +23,11 @@ from facdigger.datasets.index import (
 )
 from facdigger.datasets.splits import assign_chronological_splits
 from facdigger.experiments.manifest import sha256_json
-from facdigger.features.cross_sectional import (
-    append_cross_sectional_ranks,
-    build_market_context_features,
+from facdigger.features.pipeline import (
+    apply_feature_scaler,
+    build_raw_feature_tables,
+    fit_feature_scaler,
 )
-from facdigger.features.price_volume import build_price_volume_features
-from facdigger.features.scaling import apply_robust_scaler, fit_train_robust_scaler
 from facdigger.labels.forward_return import (
     build_forward_excess_return_labels,
     build_multi_horizon_excess_return_labels,
@@ -128,48 +124,19 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
         delistings = bundle.delistings
         del bundle
 
-        raw_price_volume = build_price_volume_features(bars, universe)
-        market_features: pl.DataFrame | None = None
-        if config.features.name == "finance_transformer":
-            raw_features = append_cross_sectional_ranks(raw_price_volume, universe)
-            raw_market_features = build_market_context_features(
-                raw_price_volume, universe
-            )
-            local_scaler = fit_train_robust_scaler(
-                raw_features,
-                DEFAULT_CHANNELS,
-                config.split.train_end,
-                winsor_lower=config.features.winsor_lower,
-                winsor_upper=config.features.winsor_upper,
-            )
-            market_scaler = fit_train_robust_scaler(
-                raw_market_features,
-                MARKET_CONTEXT_CHANNELS,
-                config.split.train_end,
-                winsor_lower=config.features.winsor_lower,
-                winsor_upper=config.features.winsor_upper,
-            )
-            features = apply_robust_scaler(raw_features, local_scaler)
-            market_features = apply_robust_scaler(
-                raw_market_features, market_scaler
-            )
-            scaler = {
-                "method": "finance_transformer_train_global_robust",
-                "local": local_scaler,
-                "market": market_scaler,
-                "rank_channels": RANK_CHANNELS,
-            }
-            del raw_features, raw_market_features
-        else:
-            scaler = fit_train_robust_scaler(
-                raw_price_volume,
-                config.features.channels,
-                config.split.train_end,
-                winsor_lower=config.features.winsor_lower,
-                winsor_upper=config.features.winsor_upper,
-            )
-            features = apply_robust_scaler(raw_price_volume, scaler)
-        del raw_price_volume
+        raw_features, raw_market_features = build_raw_feature_tables(
+            bars, universe, feature_set=config.features.name
+        )
+        scaler = fit_feature_scaler(
+            raw_features,
+            raw_market_features,
+            channels=config.features.channels,
+            train_end=config.split.train_end,
+            winsor_lower=config.features.winsor_lower,
+            winsor_upper=config.features.winsor_upper,
+        )
+        features, market_features = apply_feature_scaler(raw_features, raw_market_features, scaler)
+        del raw_features, raw_market_features
 
         if config.label.auxiliary_horizons:
             labels = build_multi_horizon_excess_return_labels(
@@ -193,17 +160,21 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
         labels = assign_chronological_splits(labels, calendar, config.split)
         del calendar
 
-        additional_label_columns = [
-            column
-            for horizon in config.label.all_horizons
-            for column in (
-                f"label_end_{horizon}",
-                f"raw_return_{horizon}",
-                f"benchmark_return_{horizon}",
-                f"target_{horizon}",
-                f"crosses_delisting_{horizon}",
-            )
-        ] if config.label.auxiliary_horizons else []
+        additional_label_columns = (
+            [
+                column
+                for horizon in config.label.all_horizons
+                for column in (
+                    f"label_end_{horizon}",
+                    f"raw_return_{horizon}",
+                    f"benchmark_return_{horizon}",
+                    f"target_{horizon}",
+                    f"crosses_delisting_{horizon}",
+                )
+            ]
+            if config.label.auxiliary_horizons
+            else []
+        )
         required_targets = (
             [f"target_{horizon}" for horizon in config.label.all_horizons]
             if config.label.auxiliary_horizons
@@ -268,13 +239,10 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
                 "maximum_asof_date": pretraining_index["asof_date"].max().isoformat(),
                 "maximum_future_end": pretraining_index["future_end"].max().isoformat(),
                 "contains_supervised_target": any(
-                    column.startswith("target")
-                    for column in pretraining_index.columns
+                    column.startswith("target") for column in pretraining_index.columns
                 ),
             }
-            pretraining_index.write_parquet(
-                temporary_dir / "pretraining_index.parquet"
-            )
+            pretraining_index.write_parquet(temporary_dir / "pretraining_index.parquet")
             del pretraining_index
         del universe
 
@@ -315,25 +283,19 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
             "artifacts": {
                 "features": "features.parquet",
                 "market_features": (
-                    "market_features.parquet"
-                    if market_features_audit is not None
-                    else None
+                    "market_features.parquet" if market_features_audit is not None else None
                 ),
                 "labels": "labels.parquet",
                 "sample_index": "sample_index.parquet",
                 "sample_metadata": "sample_metadata.parquet",
                 "inference_index": "inference_index.parquet",
                 "pretraining_index": (
-                    "pretraining_index.parquet"
-                    if pretraining_index_audit is not None
-                    else None
+                    "pretraining_index.parquet" if pretraining_index_audit is not None else None
                 ),
                 "audit": "audit.json",
                 "scaler": "scaler.json",
                 "source_manifest": (
-                    "source_manifest.json"
-                    if config.sources.source_manifest is not None
-                    else None
+                    "source_manifest.json" if config.sources.source_manifest is not None else None
                 ),
             },
         }

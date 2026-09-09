@@ -87,10 +87,6 @@ def _load_fixed_release(config: ProductionServiceConfig) -> tuple[Path, ModelRel
     release = load_model_release(release_dir)
     if release.release_id != config.model.release_id:
         raise DataContractError("loaded ModelRelease differs from fixed production release_id")
-    if release.model_type != "financial_pretrained_patchtst":
-        raise DataContractError("daily production requires an E3 ModelRelease")
-    if release.feature_contract.identity_policy != "eodhd_isin_only":
-        raise DataContractError("daily EODHD production requires an EODHD ISIN-only release")
     return release_dir, release
 
 
@@ -300,6 +296,8 @@ def run_production_tick(
         )
         try:
             release_dir, release = _load_fixed_release(config)
+            if config.factor_batch.delivery is None:
+                raise DataContractError("daily production requires an explicit delivery profile")
             history_sessions = _history_sessions(config, release)
             try:
                 current = load_current_revision(config.data.store_root)
@@ -339,9 +337,9 @@ def run_production_tick(
                         config.data.store_root,
                         history_sessions=history_sessions,
                         minimum_candidate_rows=(
-                            config.factor_batch.minimum_candidate_rows
+                            config.inference.minimum_candidate_rows
                         ),
-                        minimum_eligible_rows=config.factor_batch.minimum_eligible_rows,
+                        minimum_eligible_rows=config.inference.minimum_eligible_rows,
                     )
                 except AdjustmentBackfillRequired as required:
                     revision = backfill_adjusted_histories(
@@ -359,9 +357,9 @@ def run_production_tick(
                         config.data.store_root,
                         history_sessions=history_sessions,
                         minimum_candidate_rows=(
-                            config.factor_batch.minimum_candidate_rows
+                            config.inference.minimum_candidate_rows
                         ),
-                        minimum_eligible_rows=config.factor_batch.minimum_eligible_rows,
+                        minimum_eligible_rows=config.inference.minimum_eligible_rows,
                     )
             snapshot_dir, snapshot_manifest = build_inference_snapshot(
                 _source_config(config, current),
@@ -369,20 +367,20 @@ def run_production_tick(
                 asof_date=window.target_date,
             )
             _, snapshot_frames = load_inference_snapshot(snapshot_dir, release)
-            delivery_universe = snapshot_frames["delivery_universe"]
-            stable_candidates = delivery_universe.height
-            scorable_candidates = int(delivery_universe["eligible"].sum())
-            if stable_candidates < config.factor_batch.minimum_candidate_rows:
+            computational_universe = snapshot_frames["delivery_universe"]
+            candidate_count = computational_universe.height
+            scorable_count = int(computational_universe["eligible"].sum())
+            if candidate_count < config.inference.minimum_candidate_rows:
                 raise TargetSessionIncomplete(
-                    "stable target delivery universe is incomplete: "
-                    f"{stable_candidates} < "
-                    f"{config.factor_batch.minimum_candidate_rows}"
+                    "target computational candidate universe is incomplete: "
+                    f"{candidate_count} < "
+                    f"{config.inference.minimum_candidate_rows}"
                 )
-            if scorable_candidates < config.factor_batch.minimum_eligible_rows:
+            if scorable_count < config.inference.minimum_eligible_rows:
                 raise TargetSessionIncomplete(
-                    "scorable target delivery universe is incomplete: "
-                    f"{scorable_candidates} < "
-                    f"{config.factor_batch.minimum_eligible_rows}"
+                    "target computational eligible universe is incomplete: "
+                    f"{scorable_count} < "
+                    f"{config.inference.minimum_eligible_rows}"
                 )
             destination, factor_manifest = run_signal_inference(
                 release_dir,
@@ -391,19 +389,13 @@ def run_production_tick(
                 asof=window.target_date.isoformat(),
                 device=config.model.device,
                 before_publish=lambda: _publish_guard(window.cutoff_at, clock),
+                delivery=config.factor_batch.delivery,
             )
             del destination
             if factor_manifest["time"]["maximum_asof_date"] != (
                 window.target_date.isoformat()
             ):
                 raise DataContractError("published FactorBatch date differs from target")
-            coverage = factor_manifest["coverage"]
-            if coverage["candidate_rows"] < config.factor_batch.minimum_candidate_rows:
-                raise DataContractError("published FactorBatch candidate count is below gate")
-            if coverage["expected_eligible_rows"] < (
-                config.factor_batch.minimum_eligible_rows
-            ):
-                raise DataContractError("published FactorBatch eligible count is below gate")
             record = state.put(
                 window.target_date,
                 config.model.release_id,

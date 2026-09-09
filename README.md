@@ -227,9 +227,10 @@ uv run facdigger research transformer-run \
 tail -f artifacts/transformer_comparison/<research_run_id>/runs/<fold>/<stage>/<run_id>/progress.jsonl
 ```
 
-新监督 checkpoint 是 schema v4。`facdigger predict` 已支持在原训练 snapshot 上严格回放；
-面向生产的 target-free snapshot、ModelRelease 与 FactorBatch 仍只接受已验证的 E3，等本轮因子
-通过配对门禁后再扩展，避免把尚未证明有效的模型接入每日发布。
+新监督 checkpoint 是 schema v4。训练快照回放、ModelRelease、target-free 快照、每日和
+全历史 FactorBatch 已共用多模型推理入口，支持 E1—E3 与 `finance_patch_transformer`
+（scratch / finance_pretrained）。工程可发布不代表因子有效；模型选择与真实部署仍需单独审阅
+实验结论、实际交付身份和真实 Git 谱系。
 
 ### 4. 旧 Walk-forward engineering research（保留，不作为当前默认矩阵）
 
@@ -261,15 +262,16 @@ uv run facdigger research run \
 构建 refit snapshot 并核对冻结的 2025 test 键，再重新训练和一次性评价。2025 test 不进入
 训练、scaler 拟合或 checkpoint selection。
 
-### 5. 发布 E3 日频因子
+### 5. 发布日频因子（E1—E3 / Finance Transformer）
 
-先选择由 clean Git 工作树训练出的完整 E3 run，再创建 ModelRelease；发布命令可以在后续
-clean 提交上运行，但 release 固定记录训练 run 的原始 commit。随后用它的冻结 scaler 构建
+先选择完整监督 run，再创建 ModelRelease；默认要求训练与发布工作树 clean，联调可显式
+追加 `--allow-dirty`，如实保留 dirty 来源，不影响产物哈希验证。release 固定记录训练 run 的
+原始 commit。随后用它的冻结 scaler 构建
 无标签推理快照，最后发布一个交易日的 FactorBatch：
 
 ```bash
 uv run facdigger release create \
-  --run artifacts/e3/<run_id> \
+  --run artifacts/finance_transformer/<run_id> \
   --output-root artifacts/releases
 
 uv run facdigger dataset build-inference \
@@ -280,18 +282,30 @@ uv run facdigger signal \
   --release artifacts/releases/<release_id> \
   --dataset data/inference_snapshots/<snapshot_id> \
   --output-root artifacts/factor_batches \
+  --delivery-config configs/inference/heyboss_delivery.local.yaml \
   --asof latest
 ```
 
-发布目录只含 `factors.parquet` 和 `manifest.json`，这是 HeyBoss 的唯一输入。当前生产入口
-只接受 E3；研究 `predict` 只生成 predictions/metrics/report，不再维护第二种因子格式。
+发布目录只含 `factors.parquet` 和 `manifest.json`，这是 HeyBoss 的唯一输入。模型类型由
+release 自动选择，五列数据格式相同，消费者只校验排序语义，不按模型名称分支。
+研究 `predict` 只生成 predictions/metrics/report，不再维护第二种因子格式。
+交付前将 [HeyBoss 清单模板](configs/inference/heyboss_delivery.example.yaml) 复制为本地配置，
+填写双方确认的 `targets` 与有明确有效期/依据的 `identities`。计算仍使用完整横截面，之后
+才筛选和映射交付证券；训练中其他股票缺 ISIN 不阻止 release。目标身份缺失、过期、歧义或
+缺交则拒绝整批，不自动猜 ticker。未传 profile 的通用研究导出不声明 HeyBoss 身份已验证。
+映射与计算/交付数量的旁路审计保存在 `artifacts/factor_batches_delivery_audits/`，不放入
+交给 HeyBoss 的两文件目录；历史回放的清单/审计则保存在父级 resolved config/plan。
+Windows 训练后迁移到本机时，可在 `release create` 追加 `--dataset <本机训练快照目录>`；
+只覆盖文件定位，仍核对原 snapshot ID 和 manifest/scaler 哈希，不改写原 run 或 snapshot。
+研究矩阵中的 run 请使用对应监督 cell 的实际目录；预训练 encoder 本身不能直接发布。
 需要把同一 release 已绑定的原始评价 predictions 用于 HeyBoss 隔离回放时：
 
 ```bash
 uv run facdigger factor-batch from-predictions \
-  --predictions artifacts/e3/<run_id>/predictions.parquet \
+  --predictions artifacts/finance_transformer/<run_id>/predictions.parquet \
   --release artifacts/releases/<release_id> \
-  --output-root artifacts/factor_batches
+  --output-root artifacts/factor_batches \
+  --delivery-config configs/inference/heyboss_delivery.local.yaml
 
 uv run facdigger factor-batch verify \
   --bundle artifacts/factor_batches/<delivery_id>
@@ -299,15 +313,17 @@ uv run facdigger factor-batch verify \
 
 适配器输出 `source.kind=evaluation_predictions`，只有 eligible 已评分行，不能用于 paper。
 它要求 predictions 文件字节与 ModelRelease 绑定值完全一致；旧 Huber、v1 chunked ranking、
-mask 错位或未绑定 predictions/scaler 的 `artifacts2` 会被拒绝，必须等新协议 E3 重训后再联调。
+mask 错位或未绑定 predictions/scaler 的 `artifacts2` 会被拒绝，不能借接口通用化绕过门禁。
+显式 profile 中当日 active 的目标必须在原始预测中存在；需要区分不合格与缺交、覆盖动态
+股票池时，使用下述有完整候选表的历史回放，不能把缺失预测静默当成不合格。
 
-同一个已审 E3 release 需要覆盖 inference snapshot 中全部历史日期时，不要循环调用单日
+同一个已审 release 需要覆盖 inference snapshot 中全部历史日期时，不要循环调用单日
 `signal`，使用固定模型历史回放：
 
 ```bash
 cp configs/inference/e3_historical_replay.example.yaml \
   configs/inference/e3_historical_replay.local.yaml
-# 填写 release_dir、inference_snapshot_dir；按需限定日期或 security_ids
+# 填写本机路径、日期；HeyBoss 清单嵌入 delivery，且 security_ids 留空
 
 uv run facdigger factor-history plan \
   --config configs/inference/e3_historical_replay.local.yaml
@@ -317,7 +333,11 @@ uv run facdigger factor-history verify \
   --export artifacts/factor_history/<history_id>
 ```
 
-该路径不读取 label、target 或原 predictions；它加载一次固定 E3 checkpoint，复用每日推理的
+目录搬迁后，`factor-history plan/run` 可追加 `--release <本机 release>`、
+`--dataset <本机 inference snapshot>`、`--output-root <本机历史输出根目录>`；`verify` 可追加
+前两个参数。原 resolved config 不改写，续跑仍核对相同 release/snapshot 身份、交付计划和分片。
+
+该路径不读取 label、target 或原 predictions；它加载一次固定 checkpoint，复用每日推理的
 模型构建、窗口和评分代码，并按自然年原子发布、校验和恢复标准 FactorBatch。父目录中的
 plan/state/manifest 只用于 FacDigger 续跑和审计，交给 HeyBoss 的仍是每个
 `factor_batches/<delivery_id>/` 两文件目录。所有历史分片标记为
@@ -326,6 +346,10 @@ plan/state/manifest 只用于 FacDigger 续跑和审计，交给 HeyBoss 的仍�
 证据，禁止用于 paper 或据此宣称 Alpha。
 `run` 会在 stderr 输出每个年份的 `scoring/published/verified` JSON 进度，最终汇总仍单独写到
 stdout，便于终端观察和脚本解析。
+
+Finance Transformer 始终先在快照中该日全部 eligible 股票上运行横截面网络，再按配置中的
+`security_ids` 筛选交付。`batch_size` 只控制个股编码分块，不裁小模型的横截面。
+示例配置沿用 `e3_historical_replay` 文件名，但内容适用于全部已支持的 release。
 
 HeyBoss 侧的精确验收与流程测试计划见
 [HeyBoss 因子联调交接](docs/HeyBoss因子联调交接.md)。
@@ -350,16 +374,21 @@ New York 交易时钟、重试状态和单实例锁，因此同一镜像可部�
 失败时每 30 分钟重试，到下一 regular session 09:30 ET 截止。只有 D 完整通过才发布；
 不会使用旧 FactorBatch，也不会改写 `data/snapshots/` 或
 `data/walk_forward_snapshots/`。FactorBatch 永久保留。生产 source
-只保存约 `context_length + 20` 个 session 的 bars、当前日 universe 和当前/上一修订，避免
+只保存约 `context_length + 20` 个 session 的 bars、同窗口逐日 universe 和当前/上一修订，避免
 每天复制全历史；内部 source revision 只用不透明 ID 标识原子状态，不扫描全表生成内容哈希。
 历史 bronze 与训练 snapshot 保持独立、只读。
+
+若已有旧 production store 只保存单日 universe，新代码会拒绝加载。请将本地生产配置的
+`data.store_root` 指向新空目录，再从已验证历史 bronze 执行 `production bootstrap`；不要用今日
+成员补写历史，也不要修改训练 snapshot。日常修订会连同修订区间及缺口日期重建成员资格，
+保留区间外的历史状态；ADV20 预热不足时停止发布。
 
 首次配置：
 
 ```bash
 cp configs/production/eodhd_daily.example.yaml \
   configs/production/eodhd_daily.local.yaml
-# 编辑 local YAML，将 model.release_id 替换成已验证 E3 release 的 64 位 ID
+# 编辑 local YAML，将 model.release_id 替换成已验证 release 的 64 位 ID
 
 set -a
 source .env.local
@@ -405,7 +434,7 @@ docker compose exec facdigger-production facdigger production health \
 | `configs/data/eodhd_historical_liquid.yaml` | 历史动态 top-1000 主数据路径 | 自动 research-ready |
 | `configs/data/eodhd_daily_production.yaml` | fresh bulk EOD 日常修订 | 全历史重新采集 |
 | `configs/datasets/eodhd_historical_liquid_inference.yaml` | 冻结 scaler 的无标签推理快照 | 训练或标签评价 |
-| `configs/inference/e3_historical_replay.example.yaml` | 固定 E3 release 的全历史回测分片 | 严格样本外或 paper 信号 |
+| `configs/inference/e3_historical_replay.example.yaml` | 固定 release 的全历史回测分片，适用全部已支持模型 | 严格样本外或 paper 信号 |
 | `configs/experiments/*_smoke.yaml` | 快速端到端测试 | 正式模型结论 |
 | `configs/experiments/*_paid_pilot.yaml` | 真实规模资源验证 | 多 seed 正式对照 |
 | `configs/experiments/e1_random.yaml`、`e2_etth1.yaml`、`e3_financial_pretrain.yaml` | 完整模型配置 | 独立于 M6 的正式结论 |

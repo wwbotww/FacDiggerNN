@@ -10,12 +10,20 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
 from facdigger.datasets.sampler import FullDateBatchSampler
 from facdigger.datasets.window import FinanceTransformerWindowDataset
 from facdigger.experiments.manifest import sha256_json
-from facdigger.models.finance_patch_transformer import FinancePatchTransformer
+from facdigger.models.finance_patch_transformer import (
+    FinancePatchTransformer,
+    build_finance_transformer_model,
+)
+from facdigger.models.finance_scoring import (
+    _device_microbatches,
+    _full_date_loader,
+    _market_tensors,
+    predict_finance_transformer,
+)
 from facdigger.training.e1_engine import (
     _dates_in_current_optimizer_step,
     _restore_rng_state,
@@ -37,60 +45,6 @@ from facdigger.training.ranking import (
 FINANCE_TRANSFORMER_OBJECTIVE = "multi_horizon_full_date_rank_correlation"
 FINANCE_TRANSFORMER_CHECKPOINT = "finance_patch_transformer_checkpoint"
 FINANCE_PRETRAIN_ENCODER_CHECKPOINT = "finance_patch_pretrain_encoder"
-
-
-def build_finance_transformer_model(
-    config: FinanceTransformerExperimentConfig,
-    *,
-    context_length: int,
-) -> FinancePatchTransformer:
-    return build_finance_transformer_architecture(
-        config.model,
-        context_length=context_length,
-        num_local_channels=len(config.channels),
-        num_market_channels=len(config.market_channels),
-        horizons=tuple(config.horizons),
-    )
-
-
-def build_finance_transformer_architecture(
-    model: Any,
-    *,
-    context_length: int,
-    num_local_channels: int,
-    num_market_channels: int,
-    horizons: tuple[int, ...],
-) -> FinancePatchTransformer:
-    """Construct the one architecture shared by scratch, pretrain and replay."""
-
-    if model.patch_length > context_length:
-        raise ValueError("patch_length cannot exceed snapshot context_length")
-    if model.statistics_windows[-1] > context_length:
-        raise ValueError("statistics windows cannot exceed snapshot context_length")
-    return FinancePatchTransformer(
-        context_length=context_length,
-        num_local_channels=num_local_channels,
-        num_market_channels=num_market_channels,
-        num_asset_channels=7,
-        horizons=horizons,
-        patch_length=model.patch_length,
-        patch_stride=model.patch_stride,
-        local_d_model=model.local_d_model,
-        local_num_attention_heads=model.local_num_attention_heads,
-        local_num_hidden_layers=model.local_num_hidden_layers,
-        local_ffn_dim=model.local_ffn_dim,
-        market_d_model=model.market_d_model,
-        market_num_attention_heads=model.market_num_attention_heads,
-        market_num_hidden_layers=model.market_num_hidden_layers,
-        market_ffn_dim=model.market_ffn_dim,
-        embedding_dim=model.embedding_dim,
-        cross_num_attention_heads=model.cross_num_attention_heads,
-        cross_num_hidden_layers=model.cross_num_hidden_layers,
-        cross_ffn_dim=model.cross_ffn_dim,
-        statistics_output_dim=model.statistics_output_dim,
-        statistics_windows=tuple(model.statistics_windows),
-        dropout=model.dropout,
-    )
 
 
 def load_finance_pretrained_encoders(
@@ -126,72 +80,6 @@ def load_finance_pretrained_encoders(
     }
 
 
-def _full_date_loader(
-    dataset: FinanceTransformerWindowDataset,
-    *,
-    shuffle: bool,
-    seed: int,
-    num_workers: int,
-    minimum_group_size: int,
-) -> tuple[DataLoader, FullDateBatchSampler]:
-    sampler = FullDateBatchSampler(
-        dataset.asof_dates,
-        shuffle=shuffle,
-        seed=seed,
-        minimum_group_size=minimum_group_size,
-    )
-    return (
-        DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            persistent_workers=num_workers > 0,
-        ),
-        sampler,
-    )
-
-
-def _device_microbatches(
-    full_date_batch: dict[str, torch.Tensor], *, batch_size: int
-) -> list[dict[str, torch.Tensor]]:
-    rows = int(full_date_batch["sample_index"].numel())
-    if rows < 1 or batch_size < 1:
-        raise ValueError("complete-date batch and physical batch size must be positive")
-    chunk_count = (rows + batch_size - 1) // batch_size
-    base_size, larger_chunks = divmod(rows, chunk_count)
-    result: list[dict[str, torch.Tensor]] = []
-    start = 0
-    for chunk_index in range(chunk_count):
-        size = base_size + (1 if chunk_index < larger_chunks else 0)
-        stop = start + size
-        result.append(
-            {
-                "values": full_date_batch["values"][start:stop],
-                "observed_mask": full_date_batch["observed_mask"][start:stop],
-                "sample_index": full_date_batch["sample_index"][start:stop],
-            }
-        )
-        start = stop
-    return result
-
-
-def _market_tensors(
-    dataset: FinanceTransformerWindowDataset,
-    sample_indices: torch.Tensor,
-    *,
-    device: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    window = dataset.market_window_for_sample_indices(sample_indices.cpu().numpy())
-    values = torch.from_numpy(window.values).unsqueeze(0).to(
-        device=device, dtype=torch.float32, non_blocking=True
-    )
-    observed = torch.from_numpy(window.observed_mask).unsqueeze(0).to(
-        device=device, dtype=torch.bool, non_blocking=True
-    )
-    return values, observed
-
-
 def _multi_horizon_loss(
     scores: torch.Tensor,
     target_ranks: torch.Tensor,
@@ -213,9 +101,7 @@ def _multi_horizon_loss(
         )
         score_std = scores[:, column].float().std(unbiased=False)
         total = total + weight * horizon_loss
-        scale_penalty = scale_penalty + weight * torch.log(
-            score_std + epsilon
-        ).square()
+        scale_penalty = scale_penalty + weight * torch.log(score_std + epsilon).square()
         audit[f"rank_loss_{horizon}"] = float(horizon_loss.detach().cpu())
         audit[f"score_std_{horizon}"] = float(score_std.detach().cpu())
     total = total + scale_regularization * scale_penalty
@@ -266,35 +152,25 @@ def backward_complete_date_with_embedding_replay(
 ) -> dict[str, Any]:
     """Backpropagate one exact full-date hierarchy with bounded temporal graphs."""
 
-    microbatches = _device_microbatches(
-        full_date_batch, batch_size=physical_microbatch_size
-    )
+    microbatches = _device_microbatches(full_date_batch, batch_size=physical_microbatch_size)
     local_rng_states: list[dict[str, Any]] = []
     detached_local: list[torch.Tensor] = []
     with torch.no_grad():
         for microbatch in microbatches:
             local_rng_states.append(_rng_state())
-            values = microbatch["values"].to(
-                device=device, dtype=torch.float32, non_blocking=True
-            )
+            values = microbatch["values"].to(device=device, dtype=torch.float32, non_blocking=True)
             observed = microbatch["observed_mask"].to(
                 device=device, dtype=torch.bool, non_blocking=True
             )
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-            ):
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
                 local = model.encode_local(values, observed).embedding
             detached_local.append(local.detach().float())
         market_values, market_observed = _market_tensors(
             dataset, full_date_batch["sample_index"], device=device
         )
         market_rng_state = _rng_state()
-        with torch.autocast(
-            device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-        ):
-            detached_market = model.encode_market(
-                market_values, market_observed
-            ).detach().float()
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+            detached_market = model.encode_market(market_values, market_observed).detach().float()
 
     local_leaf = torch.cat(detached_local, dim=0).requires_grad_(True)
     market_leaf = detached_market.requires_grad_(True)
@@ -325,9 +201,7 @@ def backward_complete_date_with_embedding_replay(
         microbatches, local_rng_states, detached_local, strict=True
     ):
         _restore_rng_state(rng_state)
-        values = microbatch["values"].to(
-            device=device, dtype=torch.float32, non_blocking=True
-        )
+        values = microbatch["values"].to(device=device, dtype=torch.float32, non_blocking=True)
         observed = microbatch["observed_mask"].to(
             device=device, dtype=torch.bool, non_blocking=True
         )
@@ -399,58 +273,6 @@ def _daily_rank_ics(
             result.append(correlation)
         start = stop
     return np.asarray(result, dtype=np.float64)
-
-
-def predict_finance_transformer(
-    model: FinancePatchTransformer,
-    dataset: FinanceTransformerWindowDataset,
-    *,
-    batch_size: int,
-    device: str,
-    precision: str,
-    num_workers: int,
-) -> np.ndarray:
-    loader, sampler = _full_date_loader(
-        dataset,
-        shuffle=False,
-        seed=0,
-        num_workers=num_workers,
-        minimum_group_size=1,
-    )
-    sampler.set_epoch(0)
-    amp_enabled = device == "cuda" and precision == "fp16"
-    primary_column = model.horizons.index(dataset.primary_horizon)
-    predictions = np.empty(len(dataset), dtype=np.float64)
-    model.eval()
-    with torch.no_grad():
-        for full_date_batch in loader:
-            local_chunks: list[torch.Tensor] = []
-            for microbatch in _device_microbatches(
-                full_date_batch, batch_size=batch_size
-            ):
-                values = microbatch["values"].to(
-                    device=device, dtype=torch.float32, non_blocking=True
-                )
-                observed = microbatch["observed_mask"].to(
-                    device=device, dtype=torch.bool, non_blocking=True
-                )
-                with torch.autocast(
-                    device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-                ):
-                    local_chunks.append(model.encode_local(values, observed).embedding)
-            market_values, market_observed = _market_tensors(
-                dataset, full_date_batch["sample_index"], device=device
-            )
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-            ):
-                market = model.encode_market(market_values, market_observed)
-                scores = model.score_date(
-                    torch.cat(local_chunks, dim=0), market
-                ).scores[:, primary_column]
-            indices = full_date_batch["sample_index"].numpy()
-            predictions[indices] = scores.detach().float().cpu().numpy()
-    return predictions
 
 
 def evaluate_finance_transformer_selection(
@@ -544,9 +366,7 @@ def _optimizer_parameter_groups(
         groups.append(
             {
                 "params": parameters,
-                "lr": (
-                    encoder_learning_rate if family == "encoder" else head_learning_rate
-                ),
+                "lr": (encoder_learning_rate if family == "encoder" else head_learning_rate),
                 "weight_decay": weight_decay if decay else 0.0,
                 "group_name": f"{family}_{'decay' if decay else 'no_decay'}",
             }
@@ -604,9 +424,7 @@ def _save_checkpoint(
                 "unit": "complete_date",
                 "method": "exact_leaf_embedding_replay",
                 "physical_microbatch_size": config_payload["training"]["batch_size"],
-                "dates_per_optimizer_step": config_payload["training"][
-                    "dates_per_optimizer_step"
-                ],
+                "dates_per_optimizer_step": config_payload["training"]["dates_per_optimizer_step"],
             },
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
@@ -646,11 +464,9 @@ def train_finance_transformer(
     seed_everything(config.seed)
     device = select_device(config.training.device)
     amp_enabled = device == "cuda" and config.training.precision == "fp16"
-    model = build_finance_transformer_model(
-        config, context_length=train_dataset.context_length
-    )
+    model = build_finance_transformer_model(config, context_length=train_dataset.context_length)
     initialization_audit: dict[str, Any] = {"method": config.initialization}
-    if config.initialization == "finance_pretrained":
+    if config.initialization == "finance_pretrained" and resume_from is None:
         assert config.pretrained_checkpoint is not None
         initialization_audit.update(
             load_finance_pretrained_encoders(
@@ -680,9 +496,7 @@ def train_finance_transformer(
         num_workers=config.training.num_workers,
         minimum_group_size=config.training.objective.minimum_cross_section_size,
     )
-    updates_per_epoch = math.ceil(
-        len(train_loader) / config.training.dates_per_optimizer_step
-    )
+    updates_per_epoch = math.ceil(len(train_loader) / config.training.dates_per_optimizer_step)
     total_update_budget = updates_per_epoch * config.training.max_epochs
     warmup_steps = math.ceil(total_update_budget * config.training.warmup_fraction)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -728,6 +542,7 @@ def train_finance_transformer(
             raise ValueError("resume checkpoint dataset_id does not match")
         if checkpoint["protocol_hash"] != protocol_hash:
             raise ValueError("resume checkpoint training protocol does not match")
+        initialization_audit = dict(checkpoint["initialization"])
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -780,9 +595,7 @@ def train_finance_transformer(
                     target_rank_lookup=target_rank_lookup,
                     horizon_weights=config.training.objective.horizon_weights,
                     epsilon=config.training.objective.epsilon,
-                    scale_regularization=(
-                        config.training.objective.scale_regularization
-                    ),
+                    scale_regularization=(config.training.objective.scale_regularization),
                     amp_enabled=amp_enabled,
                     scaler=scaler,
                     physical_microbatch_size=config.training.batch_size,
@@ -814,9 +627,7 @@ def train_finance_transformer(
             clipped_steps += int(gradient_norm > config.training.max_grad_norm)
             global_step += 1
             scheduler.step()
-            if progress_callback is not None and (
-                global_step == 1 or global_step % 25 == 0
-            ):
+            if progress_callback is not None and (global_step == 1 or global_step % 25 == 0):
                 progress_callback(
                     {
                         "event": "optimizer_progress",
@@ -838,15 +649,11 @@ def train_finance_transformer(
             device=device,
             precision=config.training.precision,
             num_workers=config.training.num_workers,
-            minimum_cross_section_size=(
-                config.training.objective.minimum_cross_section_size
-            ),
+            minimum_cross_section_size=(config.training.objective.minimum_cross_section_size),
             minimum_dates=config.training.objective.minimum_selection_dates,
             minimum_coverage=config.training.objective.minimum_selection_coverage,
             subperiods=config.training.objective.selection_subperiods,
-            stability_penalty=(
-                config.training.objective.selection_stability_penalty
-            ),
+            stability_penalty=(config.training.objective.selection_stability_penalty),
         )
         selection_score = float(selection["selection_score"])
         improved = selection_score > best_selection_score + 1e-12
@@ -875,8 +682,7 @@ def train_finance_transformer(
                     int(audit["physical_microbatches"]) for audit in date_audits
                 ),
                 "maximum_local_replay_error": max(
-                    float(audit["maximum_local_replay_error"])
-                    for audit in date_audits
+                    float(audit["maximum_local_replay_error"]) for audit in date_audits
                 ),
                 "maximum_market_replay_error": max(
                     float(audit["market_replay_error"]) for audit in date_audits
@@ -896,8 +702,7 @@ def train_finance_transformer(
                 "amp_skipped_optimizer_steps": amp_skipped_optimizer_steps,
                 "selection": selection,
                 "learning_rates": {
-                    str(group["group_name"]): float(group["lr"])
-                    for group in optimizer.param_groups
+                    str(group["group_name"]): float(group["lr"]) for group in optimizer.param_groups
                 },
                 "context_gate": date_audits[-1]["context_gate"],
                 "global_step": global_step,
@@ -997,9 +802,7 @@ def benchmark_finance_transformer_updates(
     seed_everything(config.seed)
     device = select_device(config.training.device)
     amp_enabled = device == "cuda" and config.training.precision == "fp16"
-    model = build_finance_transformer_model(
-        config, context_length=train_dataset.context_length
-    )
+    model = build_finance_transformer_model(config, context_length=train_dataset.context_length)
     if config.initialization == "finance_pretrained":
         assert config.pretrained_checkpoint is not None
         load_finance_pretrained_encoders(
@@ -1028,9 +831,7 @@ def benchmark_finance_transformer_updates(
         num_workers=config.training.num_workers,
         minimum_group_size=config.training.objective.minimum_cross_section_size,
     )
-    updates_per_epoch = math.ceil(
-        len(loader) / config.training.dates_per_optimizer_step
-    )
+    updates_per_epoch = math.ceil(len(loader) / config.training.dates_per_optimizer_step)
     total_update_budget = updates_per_epoch * config.training.max_epochs
     target_rank_lookup = torch.stack(
         [

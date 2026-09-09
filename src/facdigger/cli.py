@@ -24,7 +24,7 @@ research_app = typer.Typer(help="Run and freeze walk-forward E0-E3 research.")
 release_app = typer.Typer(help="Create and inspect immutable model releases.")
 factor_batch_app = typer.Typer(help="Publish and verify cross-project factor deliveries.")
 factor_history_app = typer.Typer(
-    help="Replay one fixed E3 release into annual backtest-only FactorBatch files."
+    help="Replay one fixed model release into annual backtest-only FactorBatch files."
 )
 production_app = typer.Typer(help="Run the fail-closed daily EODHD production service.")
 app.add_typer(data_app, name="data")
@@ -592,8 +592,21 @@ def release_create_command(
         Path,
         typer.Option(help="Root for content-addressed immutable model releases."),
     ] = Path("artifacts/releases"),
+    dataset: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Relocated training snapshot; its identity must still match the source run.",
+        ),
+    ] = None,
+    allow_dirty: Annotated[
+        bool,
+        typer.Option(help="Allow dirty publisher/source Git state for integration testing."),
+    ] = False,
 ) -> None:
-    """Freeze a clean completed run into an immutable inference release."""
+    """Freeze a completed run; dirty Git state requires explicit test opt-in."""
 
     from facdigger.inference.releases import create_model_release
 
@@ -602,6 +615,8 @@ def release_create_command(
             run,
             output_root,
             repository_root=Path.cwd(),
+            dataset_dir=dataset,
+            allow_dirty=allow_dirty,
         )
     except Exception as exc:
         typer.echo(str(exc), err=True)
@@ -613,6 +628,7 @@ def release_create_command(
                 "model_id": manifest.model_id,
                 "model_type": manifest.model_type,
                 "path": str(destination),
+                "source_git_clean": manifest.source.git_clean,
             },
             ensure_ascii=False,
             indent=2,
@@ -666,9 +682,14 @@ def factor_batch_from_predictions_command(
         Path,
         typer.Option(help="Root for content-addressed FactorBatch deliveries."),
     ] = Path("artifacts/factor_batches"),
+    delivery_config: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, readable=True, help="Consumer delivery profile."),
+    ] = None,
 ) -> None:
-    """Publish verified E3 evaluation predictions as an isolated replay batch."""
+    """Publish verified evaluation predictions as an isolated replay batch."""
 
+    from facdigger.inference.delivery import load_delivery_config
     from facdigger.inference.factor_batch import publish_evaluation_factor_batch
 
     try:
@@ -676,6 +697,7 @@ def factor_batch_from_predictions_command(
             predictions,
             release,
             output_root,
+            delivery=None if delivery_config is None else load_delivery_config(delivery_config),
         )
     except Exception as exc:
         typer.echo(str(exc), err=True)
@@ -730,6 +752,9 @@ def factor_batch_verify_command(
 @factor_history_app.command("plan")
 def factor_history_plan_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    release: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    dataset: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    output_root: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Validate a fixed-release historical replay without scoring rows."""
 
@@ -739,7 +764,9 @@ def factor_history_plan_command(
     )
 
     try:
-        plan = plan_historical_replay(load_historical_replay_config(config))
+        plan = plan_historical_replay(load_historical_replay_config(
+            config, release_dir=release, inference_snapshot_dir=dataset, output_root=output_root,
+        ))
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
@@ -749,6 +776,9 @@ def factor_history_plan_command(
 @factor_history_app.command("run")
 def factor_history_run_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    release: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    dataset: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    output_root: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Publish resumable annual FactorBatch partitions for historical backtests."""
 
@@ -775,7 +805,10 @@ def factor_history_run_command(
 
     try:
         destination, manifest = run_historical_replay(
-            load_historical_replay_config(config),
+            load_historical_replay_config(
+                config, release_dir=release,
+                inference_snapshot_dir=dataset, output_root=output_root,
+            ),
             on_partition=report_partition,
         )
     except Exception as exc:
@@ -812,13 +845,17 @@ def factor_history_verify_command(
         Path,
         typer.Option(exists=True, file_okay=False, readable=True),
     ],
+    release: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
+    dataset: Annotated[Path | None, typer.Option(exists=True, file_okay=False)] = None,
 ) -> None:
     """Revalidate one completed historical replay and every annual FactorBatch."""
 
     from facdigger.inference.history import verify_historical_replay
 
     try:
-        manifest = verify_historical_replay(export)
+        manifest = verify_historical_replay(
+            export, release_dir=release, inference_snapshot_dir=dataset,
+        )
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
@@ -844,7 +881,7 @@ def factor_history_verify_command(
 def signal_command(
     release: Annotated[
         Path,
-        typer.Option(exists=True, file_okay=False, readable=True, help="Verified E3 ModelRelease."),
+        typer.Option(exists=True, file_okay=False, readable=True, help="Verified ModelRelease."),
     ],
     dataset: Annotated[
         Path,
@@ -864,9 +901,14 @@ def signal_command(
         typer.Option(help="latest or one YYYY-MM-DD trading date."),
     ] = "latest",
     device: Annotated[str, typer.Option(help="Inference device: cpu, cuda or auto.")] = "cpu",
+    delivery_config: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, readable=True, help="Consumer delivery profile."),
+    ] = None,
 ) -> None:
-    """Generate one strict FactorBatch from an E3 release and inference snapshot."""
+    """Generate one strict FactorBatch from a model release and inference snapshot."""
 
+    from facdigger.inference.delivery import load_delivery_config
     from facdigger.inference.runner import run_signal_inference
 
     if device not in {"cpu", "cuda", "auto"}:
@@ -879,6 +921,7 @@ def signal_command(
             dataset_dir=dataset,
             asof=asof,
             device=device,
+            delivery=None if delivery_config is None else load_delivery_config(delivery_config),
         )
     except Exception as exc:
         typer.echo(str(exc), err=True)

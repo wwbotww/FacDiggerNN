@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from facdigger.datasets.sampler import DateGroupedBatchSampler, FullDateBatchSampler
-from facdigger.datasets.window import SnapshotWindowDataset
+from facdigger.datasets.window import SnapshotInferenceWindowDataset, SnapshotWindowDataset
 from facdigger.experiments.manifest import sha256_json
 from facdigger.models.patchtst_alpha import PatchTSTAlphaModel
 from facdigger.training.e1_config import E1ExperimentConfig
@@ -94,7 +94,7 @@ def build_e1_model(
 
 
 def _loader(
-    dataset: SnapshotWindowDataset,
+    dataset: SnapshotWindowDataset | SnapshotInferenceWindowDataset,
     *,
     batch_size: int,
     shuffle: bool,
@@ -344,7 +344,7 @@ def evaluate_e1_selection(
 
 def predict_e1(
     model: PatchTSTAlphaModel,
-    dataset: SnapshotWindowDataset,
+    dataset: SnapshotWindowDataset | SnapshotInferenceWindowDataset,
     *,
     batch_size: int,
     device: str,

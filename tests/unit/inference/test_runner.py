@@ -12,8 +12,9 @@ pytest.importorskip("transformers")
 
 from facdigger.data.contracts import DataContractError  # noqa: E402
 from facdigger.experiments.manifest import sha256_json  # noqa: E402
-from facdigger.inference.runner import _load_source_run, _select_signal_inputs  # noqa: E402
-from facdigger.inference.scoring import patch_config  # noqa: E402
+from facdigger.inference.backends import load_checkpoint_backend, patch_config  # noqa: E402
+from facdigger.inference.runner import _select_signal_inputs  # noqa: E402
+from facdigger.inference.source import _load_source_run  # noqa: E402
 
 
 def _model() -> dict:
@@ -70,6 +71,13 @@ def test_patch_config_dispatches_all_e1_e2_e3_manifests() -> None:
     assert e1.model.d_model == e2.model.d_model == e3.model.d_model == 8
     assert e1_training.max_epochs == 1
     assert e2_training.head_only_epochs == e3_training.head_only_epochs == 1
+
+
+def test_unknown_backend_cannot_fall_back_to_e3() -> None:
+    with pytest.raises(DataContractError, match="unsupported inference model_type"):
+        load_checkpoint_backend("unknown_model")
+    with pytest.raises(DataContractError, match="unsupported PatchTST model_type"):
+        patch_config("unknown_model", {})
 
 
 def test_source_run_loader_rejects_checkpoint_tampering_and_path_escape(tmp_path) -> None:

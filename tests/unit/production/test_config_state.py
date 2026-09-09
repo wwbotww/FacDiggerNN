@@ -51,8 +51,8 @@ def test_config_rejects_generated_paths_inside_training_snapshots(
 
 def test_config_rejects_unordered_minimums_and_release_placeholder(tmp_path) -> None:
     base = _config(tmp_path).model_dump()
-    base["factor_batch"]["minimum_candidate_rows"] = 10
-    base["factor_batch"]["minimum_eligible_rows"] = 20
+    base["inference"]["minimum_candidate_rows"] = 10
+    base["inference"]["minimum_eligible_rows"] = 20
     with pytest.raises(ValueError, match="cannot exceed"):
         ProductionServiceConfig.model_validate(base)
 

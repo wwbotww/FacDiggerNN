@@ -23,6 +23,7 @@ from facdigger.evaluation.contracts import prediction_coverage
 from facdigger.evaluation.metrics import evaluate_predictions
 from facdigger.evaluation.report import write_evaluation_report
 from facdigger.experiments.manifest import collect_git_state, sha256_json
+from facdigger.models.finance_scoring import predict_finance_transformer
 from facdigger.training.common import (
     apply_source_readiness_gate,
     build_prediction_frame,
@@ -36,7 +37,6 @@ from facdigger.training.finance_transformer_config import (
     FinanceTransformerExperimentConfig,
 )
 from facdigger.training.finance_transformer_engine import (
-    predict_finance_transformer,
     train_finance_transformer,
 )
 

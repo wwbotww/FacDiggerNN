@@ -23,12 +23,17 @@ model:
 inference:
   output_root: data/inference_snapshots/production
   retention_sessions: 10
+  # Full computational universe, not the smaller HeyBoss delivery scope.
+  minimum_candidate_rows: 100
+  minimum_eligible_rows: 100
 
 factor_batch:
   output_root: artifacts/factor_batches
   retention: forever
-  minimum_candidate_rows: 100
-  minimum_eligible_rows: 100
+  # Required before running ticks: replace null with the complete mapping from
+  # configs/inference/heyboss_delivery.example.yaml, confirmed by both projects.
+  # This is an embedded mapping (targets + identities), not a filename.
+  delivery: null
 
 state_database: data/production/production.sqlite3
 poll_seconds: 60

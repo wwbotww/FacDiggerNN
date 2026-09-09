@@ -88,8 +88,14 @@ def _input_for_frame(
     )
 
 
-def test_factor_batch_is_semantically_addressed_and_idempotent(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "model_type",
+    ["random_patchtst", "etth1_transferred_patchtst", "financial_pretrained_patchtst",
+     "finance_patch_transformer", "lightgbm"],
+)
+def test_factor_batch_is_semantically_addressed_and_idempotent(tmp_path, model_type) -> None:
     source, model, input_metadata, time_metadata = _metadata()
+    model = FactorBatchModel.model_validate({**model.model_dump(), "model_type": model_type})
     first, first_manifest = publish_factor_batch(
         _frame(),
         tmp_path,
@@ -121,6 +127,7 @@ def test_factor_batch_is_semantically_addressed_and_idempotent(tmp_path) -> None
         "manifest.json",
     }
     assert load_factor_batch(first).delivery_id == first_manifest.delivery_id
+    assert load_factor_batch(first).model.model_type == model_type
 
 
 def test_factor_batch_identity_changes_when_semantics_change(tmp_path) -> None:

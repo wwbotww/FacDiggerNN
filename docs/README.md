@@ -41,9 +41,12 @@
 - 跨项目生产侧已具备不可变 ModelRelease、冻结 scaler 的 target-free inference snapshot
   和单日 FactorBatch；固定 release 的 target-free 全历史回放可按年生成 backtest-only
   FactorBatch 并断点续跑。FacDigger 每日 EODHD 修订、指定日期推理、30 分钟重试、截止门禁及
-  保留策略由 Docker 常驻服务统一编排，不依赖宿主 `launchd`；HeyBoss 已有
-  importer/NT Catalog/Actor 骨架，但消费者仍需按
-  [联调交接](HeyBoss因子联调交接.md)同步现行 semantic delivery ID 与 manifest 字段；
+  保留策略由 Docker 常驻服务统一编排，不依赖宿主 `launchd`。E1—E3 与金融原生 Transformer
+  共用 release/runtime/FactorBatch；HeyBoss 导入器已按排序语义解耦模型名称，实际交易联调
+  仍须按[联调交接](HeyBoss因子联调交接.md)核对身份、价格、日期与消费模式；
+- 交付 profile 将目标集合与身份有效期分开；完整计算池不因交付子集/缺 ISIN 被裁剪。
+  release/predict 与历史 plan/run/verify 支持本机路径重定位，联调可显式允许 dirty 来源而不
+  放宽产物绑定；生产配置的计算池最低数量位于 `inference`，必须提供 `factor_batch.delivery`；
 - 监督阶段以完整日横截面排序相关性为目标；E1—E3 通过 CPU 整日组装、GPU
   physical microbatch 和两遍回放计算精确整日梯度，LightGBM 使用按完整日分组的
   LambdaRank；
@@ -82,7 +85,8 @@ configs/
 │   └── eodhd_historical_liquid_transformer.yaml # 14+6 路新主 snapshot
 ├── experiments/                      # E0—E3 与 finance Transformer 配置
 ├── inference/
-│   └── e3_historical_replay.example.yaml  # 固定 release 的 backtest-only 全历史回放
+│   ├── e3_historical_replay.example.yaml  # 固定 release 的 backtest-only 全历史回放
+│   └── heyboss_delivery.example.yaml     # 目标范围与有明确有效期/依据的身份映射
 ├── production/
 │   └── eodhd_daily.example.yaml      # Docker 生产模板；本地副本固定 release ID
 └── research/

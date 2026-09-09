@@ -12,27 +12,26 @@ from typing import Any, Literal
 
 import numpy as np
 import polars as pl
-import yaml
 
 from facdigger.data.contracts import DataContractError
+from facdigger.data.paths import artifact_path
 from facdigger.data.snapshots import sha256_file
-from facdigger.datasets.window import (
-    FinanceTransformerWindowDataset,
-    MarketFeatureStore,
-    SecurityFeatureStore,
-    SnapshotWindowDataset,
-)
 from facdigger.environment import collect_environment
 from facdigger.evaluation.contracts import prediction_coverage
 from facdigger.evaluation.metrics import evaluate_predictions
 from facdigger.evaluation.report import write_evaluation_report
 from facdigger.experiments.manifest import sha256_json
-from facdigger.inference.scoring import (
-    build_patchtst_model,
-    load_e3_inference_runtime,
-    patch_config,
-    score_e3_inference_rows,
+from facdigger.inference.backends import load_checkpoint_backend
+from facdigger.inference.delivery import (
+    DeliveryConfig,
+    delivery_identity_policy,
+    resolve_delivery,
 )
+from facdigger.inference.scoring import (
+    load_factor_inference_runtime,
+    score_inference_rows,
+)
+from facdigger.inference.source import _load_source_run, resolve_training_snapshot
 from facdigger.models.baselines import (
     TabularPreprocessor,
     build_multiscale_features,
@@ -43,23 +42,13 @@ from facdigger.models.baselines import (
 from facdigger.training.common import (
     apply_source_readiness_gate,
     build_prediction_frame,
-    load_required_market_features,
-    load_required_snapshot_features,
     load_source_provenance,
     load_training_snapshot,
 )
 from facdigger.training.e0_config import E0ExperimentConfig
-from facdigger.training.e1_engine import predict_e1, select_device
+from facdigger.training.e1_engine import select_device
 
 InferenceSplit = Literal["train", "valid", "test"]
-SUPPORTED_MODEL_TYPES = {
-    "mlp",
-    "lightgbm",
-    "random_patchtst",
-    "etth1_transferred_patchtst",
-    "financial_pretrained_patchtst",
-    "finance_patch_transformer",
-}
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -69,47 +58,12 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
-def _resolve_inside(root: Path, relative: str, label: str) -> Path:
-    path = (root / relative).resolve()
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise DataContractError(f"{label} escapes source run directory") from exc
-    if not path.is_file():
-        raise FileNotFoundError(f"{label} does not exist: {path}")
-    return path
-
-
-def _load_source_run(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
-    root = run_dir.resolve()
-    manifest_path = root / "manifest.json"
-    config_path = root / "resolved_config.yaml"
-    if not manifest_path.is_file() or not config_path.is_file():
-        raise FileNotFoundError(f"run is missing manifest or resolved config: {root}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("status", "complete") != "complete":
-        raise ValueError("inference requires a complete source run")
-    model_type = str(manifest.get("model_type"))
-    if model_type not in SUPPORTED_MODEL_TYPES:
-        raise ValueError(f"unsupported source run model_type: {model_type}")
-    config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    if not isinstance(config_payload, dict):
-        raise ValueError("source resolved configuration must be a mapping")
-    if sha256_json(config_payload) != manifest["config_hash"]:
-        raise DataContractError("source resolved configuration hash does not match manifest")
-    checkpoint_info = manifest.get("checkpoint") or {}
-    checkpoint_path = _resolve_inside(root, str(checkpoint_info["file"]), "checkpoint")
-    if sha256_file(checkpoint_path) != checkpoint_info["sha256"]:
-        raise DataContractError("source checkpoint hash does not match manifest")
-    return manifest, config_payload, checkpoint_path
-
-
 def _validate_dataset(
     manifest: dict[str, Any], dataset_path: Path
 ) -> tuple[dict[str, Any], dict[str, pl.DataFrame]]:
     dataset_manifest, frames = load_training_snapshot(
         dataset_path,
-        include_features=manifest.get("model_type") != "finance_patch_transformer",
+        include_features=manifest.get("model_type") in {"mlp", "lightgbm"},
     )
     if dataset_manifest["dataset_id"] != manifest["dataset_id"]:
         raise DataContractError("inference dataset_id does not match source run")
@@ -124,7 +78,7 @@ def _load_preprocessor(
 ) -> tuple[TabularPreprocessor, dict[str, Any]]:
     declared = (manifest.get("checkpoint") or {}).get("preprocessing")
     if declared:
-        path = _resolve_inside(run_dir, str(declared["file"]), "preprocessing checkpoint")
+        path = artifact_path(run_dir, str(declared["file"]), "preprocessing checkpoint")
         if sha256_file(path) != declared["sha256"]:
             raise DataContractError("preprocessing checkpoint hash does not match manifest")
     else:
@@ -165,9 +119,7 @@ def _predict_e0(
         raise DataContractError("reconstructed E0 feature columns differ from source run")
     if manifest["model_type"] == "mlp":
         device = select_device(device_preference)
-        model, preprocessor, payload = load_mlp_checkpoint(
-            checkpoint_path, device=device
-        )
+        model, preprocessor, payload = load_mlp_checkpoint(checkpoint_path, device=device)
         scores = predict_mlp(model, preprocessor.transform(rows), device)
         audit = {
             "loader": "embedded_mlp_checkpoint",
@@ -176,9 +128,7 @@ def _predict_e0(
             "checkpoint_seed": payload.get("seed"),
         }
     else:
-        preprocessor, preprocessing_audit = _load_preprocessor(
-            run_dir, manifest, checkpoint_path
-        )
+        preprocessor, preprocessing_audit = _load_preprocessor(run_dir, manifest, checkpoint_path)
         scores = predict_lightgbm_checkpoint(checkpoint_path, preprocessor.transform(rows))
         audit = {
             "loader": "isolated_lightgbm_checkpoint",
@@ -190,138 +140,36 @@ def _predict_e0(
     return scores, rows, audit
 
 
-def _predict_patchtst(
-    *,
-    manifest: dict[str, Any],
-    config_payload: dict[str, Any],
-    checkpoint_path: Path,
-    frames: dict[str, pl.DataFrame],
-    context_length: int,
-    split: InferenceSplit,
-    device_preference: str,
-) -> tuple[np.ndarray, pl.DataFrame, dict[str, Any]]:
-    import torch
-
-    config, inference_config = patch_config(manifest["model_type"], config_payload)
-    dataset = SnapshotWindowDataset(
-        features=frames["features"],
-        sample_index=frames["sample_index"],
-        channels=config.channels,
-        context_length=context_length,
-        split=split,
-    )
-    device = select_device(device_preference)
-    model = build_patchtst_model(
-        config.model,
-        context_length=context_length,
-        num_channels=len(config.channels),
-    ).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    checkpoint_dataset_id = checkpoint.get("dataset_id")
-    if checkpoint_dataset_id != manifest["dataset_id"]:
-        raise DataContractError("PatchTST checkpoint dataset_id does not match source run")
-    model.load_state_dict(checkpoint["model_state"], strict=True)
-    precision = inference_config.precision if device == "cuda" else "fp32"
-    scores = predict_e1(
-        model,
-        dataset,
-        batch_size=inference_config.batch_size,
-        device=device,
-        precision=precision,
-        num_workers=inference_config.num_workers,
-    )
-    return scores, dataset.sample_rows, {
-        "loader": "strict_patchtst_state_dict",
-        "device": device,
-        "precision": precision,
-        "checkpoint_epoch": checkpoint.get("epoch"),
-        "checkpoint_best_epoch": checkpoint.get("best_epoch"),
-    }
-
-
-def _predict_finance_transformer(
+def _predict_factor_model(
     *,
     manifest: dict[str, Any],
     config_payload: dict[str, Any],
     checkpoint_path: Path,
     dataset_path: Path,
+    dataset_manifest: dict[str, Any],
+    frames: dict[str, pl.DataFrame],
     split: InferenceSplit,
     device_preference: str,
 ) -> tuple[np.ndarray, pl.DataFrame, dict[str, Any]]:
-    import torch
-
-    from facdigger.training.finance_transformer_config import (
-        FinanceTransformerExperimentConfig,
-    )
-    from facdigger.training.finance_transformer_engine import (
-        FINANCE_TRANSFORMER_CHECKPOINT,
-        build_finance_transformer_model,
-        predict_finance_transformer,
-    )
-
-    config = FinanceTransformerExperimentConfig.model_validate(config_payload)
-    dataset_manifest, frames = load_training_snapshot(
-        dataset_path, include_features=False
-    )
-    sample_index = frames["sample_index"]
-    required_rows = sample_index.filter(pl.col("split") == split).select(
-        "security_id", "feature_start", "asof_date"
-    )
-    feature_store = SecurityFeatureStore(
-        features=load_required_snapshot_features(
-            dataset_path, dataset_manifest, required_rows
-        ),
-        channels=config.channels,
-        presorted=True,
-    )
-    market_store = MarketFeatureStore(
-        features=load_required_market_features(
-            dataset_path, dataset_manifest, required_rows
-        ),
-        channels=config.market_channels,
-    )
-    dataset = FinanceTransformerWindowDataset(
-        feature_store=feature_store,
-        market_store=market_store,
-        sample_index=sample_index,
-        channels=config.channels,
-        market_channels=config.market_channels,
+    rows = frames["sample_index"].filter(pl.col("split") == split).sort("asof_date", "security_id")
+    backend = load_checkpoint_backend(
+        manifest["model_type"],
+        config_payload=config_payload,
+        checkpoint_path=checkpoint_path,
+        training_dataset_id=manifest["dataset_id"],
         context_length=int(dataset_manifest["config"]["features"]["context_length"]),
-        split=split,
-        horizons=config.horizons,
-        primary_horizon=config.primary_horizon,
+        device=device_preference,
     )
-    selected_device = select_device(device_preference)
-    model = build_finance_transformer_model(
-        config, context_length=dataset.context_length
-    ).to(selected_device)
-    checkpoint = torch.load(
-        checkpoint_path, map_location=selected_device, weights_only=False
-    )
-    if checkpoint.get("contract") != FINANCE_TRANSFORMER_CHECKPOINT:
-        raise DataContractError("checkpoint is not a finance Transformer checkpoint")
-    if checkpoint.get("dataset_id") != manifest["dataset_id"]:
-        raise DataContractError(
-            "finance Transformer checkpoint dataset_id does not match source run"
-        )
-    model.load_state_dict(checkpoint["model_state"], strict=True)
-    precision = config.training.precision if selected_device == "cuda" else "fp32"
-    scores = predict_finance_transformer(
-        model,
-        dataset,
-        batch_size=config.training.batch_size,
-        device=selected_device,
-        precision=precision,
-        num_workers=config.training.num_workers,
-    )
-    return scores, dataset.sample_rows, {
-        "loader": "strict_finance_transformer_state_dict",
-        "device": selected_device,
-        "precision": precision,
-        "checkpoint_epoch": checkpoint.get("epoch"),
-        "checkpoint_best_epoch": checkpoint.get("best_epoch"),
-        "full_date_cross_section": True,
-    }
+    # Research eligibility and split selection remain outside the label-free scorer.
+    score_index = rows.select(
+        "sample_id", "security_id", "symbol", "asof_date", "feature_start", "feature_end"
+    ).with_columns(pl.lit(True).alias("eligible"))
+    scores = backend.predict(dataset_path, dataset_manifest, score_index)
+    if not scores.select("security_id", "asof_date").equals(
+        rows.select("security_id", "asof_date")
+    ):
+        raise DataContractError("replayed model score keys differ from source sample index")
+    return scores["score"].to_numpy(), rows, backend.audit
 
 
 def _verify_replay(
@@ -380,13 +228,9 @@ def _select_signal_inputs(
     """Select one declared candidate date without silently falling back to stale scores."""
 
     selected_date = (
-        delivery_universe["asof_date"].max()
-        if asof == "latest"
-        else date.fromisoformat(asof)
+        delivery_universe["asof_date"].max() if asof == "latest" else date.fromisoformat(asof)
     )
-    candidates = delivery_universe.filter(
-        pl.col("asof_date") == selected_date
-    ).sort("security_id")
+    candidates = delivery_universe.filter(pl.col("asof_date") == selected_date).sort("security_id")
     if candidates.is_empty():
         raise DataContractError("requested signal date is absent from the delivery universe")
     rows = index.filter(pl.col("asof_date") == selected_date).sort("security_id")
@@ -401,6 +245,7 @@ def run_signal_inference(
     asof: str = "latest",
     device: Literal["auto", "cpu", "cuda"] = "cpu",
     before_publish: Callable[[], None] | None = None,
+    delivery: DeliveryConfig | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Score one target-free inference snapshot and publish a FactorBatch."""
 
@@ -414,7 +259,8 @@ def run_signal_inference(
         factor_universe_sha256,
         publish_factor_batch,
     )
-    runtime = load_e3_inference_runtime(release_dir, device=device)
+
+    runtime = load_factor_inference_runtime(release_dir, device=device)
     release = runtime.release
     dataset_path = Path(dataset_dir).resolve()
     dataset_manifest, frames = load_inference_snapshot(dataset_path, release)
@@ -433,25 +279,24 @@ def run_signal_inference(
             }
         )
     else:
-        scored_rows = score_e3_inference_rows(
+        scored_rows = score_inference_rows(
             runtime,
             snapshot_dir=dataset_path,
             snapshot_manifest=dataset_manifest,
             rows=rows,
         ).select("security_id", "asof_date", "score")
-    candidate_universe = candidate_universe.select(
-        "security_id", "symbol", "asof_date", "eligible"
-    )
-    factors = build_factor_frame(candidate_universe, scored_rows)
-    source_metadata, model_metadata = factor_batch_metadata(
-        release, source_kind="signal_inference"
-    )
+    candidate_universe = candidate_universe.select("security_id", "symbol", "asof_date", "eligible")
+    # Check the whole computational cross-section before any delivery projection.
+    build_factor_frame(candidate_universe, scored_rows)
+    selection = resolve_delivery(candidate_universe, delivery)
+    factors = build_factor_frame(selection.candidates, selection.project_scores(scored_rows))
+    source_metadata, model_metadata = factor_batch_metadata(release, source_kind="signal_inference")
     input_metadata = FactorBatchInput(
         snapshot_id=str(dataset_manifest["snapshot_id"]),
         snapshot_manifest_sha256=sha256_file(dataset_path / "manifest.json"),
         universe_semantics="complete_candidate_cross_section",
-        universe_sha256=factor_universe_sha256(candidate_universe),
-        identity_policy=release.feature_contract.identity_policy,
+        universe_sha256=factor_universe_sha256(selection.candidates),
+        identity_policy=delivery_identity_policy(selection.candidates),
     )
     time_metadata = FactorBatchTime(
         calendar_version=CALENDAR_VERSION,
@@ -466,6 +311,7 @@ def run_signal_inference(
         input_metadata=input_metadata,
         time_metadata=time_metadata,
         before_commit=before_publish,
+        delivery_audit=selection.audit,
     )
     return destination, factor_manifest.model_dump(mode="json")
 
@@ -487,7 +333,7 @@ def run_inference(
         raise ValueError("inference split must be train, valid or test")
     if requested_split == "test" and not unlock_test:
         raise ValueError("test inference requires unlock_test=true")
-    dataset_path = Path(dataset_dir or manifest["dataset_path"]).resolve()
+    dataset_path = resolve_training_snapshot(manifest, dataset_dir)
     dataset_manifest, frames = _validate_dataset(manifest, dataset_path)
     context_length = int(dataset_manifest["config"]["features"]["context_length"])
     channels = list(dataset_manifest["config"]["features"]["channels"])
@@ -526,22 +372,14 @@ def run_inference(
             split=requested_split,
             device_preference=device,
         )
-    elif manifest["model_type"] == "finance_patch_transformer":
-        scores, rows, loader_audit = _predict_finance_transformer(
+    else:
+        scores, rows, loader_audit = _predict_factor_model(
             manifest=manifest,
             config_payload=config_payload,
             checkpoint_path=checkpoint_path,
             dataset_path=dataset_path,
-            split=requested_split,
-            device_preference=device,
-        )
-    else:
-        scores, rows, loader_audit = _predict_patchtst(
-            manifest=manifest,
-            config_payload=config_payload,
-            checkpoint_path=checkpoint_path,
+            dataset_manifest=dataset_manifest,
             frames=frames,
-            context_length=context_length,
             split=requested_split,
             device_preference=device,
         )

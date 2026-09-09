@@ -16,7 +16,11 @@ from facdigger.inference.factor_batch import (
     load_factor_batch,
     publish_evaluation_factor_batch,
 )
-from facdigger.inference.releases import create_model_release, load_model_release
+from facdigger.inference.releases import (
+    create_model_release,
+    load_model_release,
+    model_release_id,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -176,10 +180,45 @@ def test_model_release_binds_checkpoint_config_scaler_and_lineage(
     assert manifest.training_data.dataset_id == "dataset-1"
     assert manifest.feature_contract.scaler_contract == "train_global_robust"
     assert load_model_release(release).release_id == manifest.release_id
+    # New model inputs must not inject defaults into already immutable E3 identities.
+    payload = json.loads((release / "manifest.json").read_text(encoding="utf-8"))
+    assert set(payload["feature_contract"]) == {
+        "feature_set", "channels", "context_length", "scaler_sha256", "scaler_contract",
+        "identity_policy",
+    }
+    payload.pop("created_at")
+    payload.pop("release_id")
+    assert sha256_json(payload) == manifest.release_id
     source, model = factor_batch_metadata(manifest, source_kind="signal_inference")
     assert source.run_manifest_sha256 == manifest.source.run_manifest_sha256
     assert model.release_id == manifest.release_id
     assert model.checkpoint_sha256 == manifest.artifacts["checkpoint"].sha256
+
+
+def test_model_release_accepts_relocated_snapshot_without_rewriting_source(
+    tmp_path, monkeypatch
+) -> None:
+    run, dataset = _source_run(tmp_path)
+    source_path = run / "manifest.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["dataset_path"] = r"D:\FacDiggerNN\data\snapshots\dataset-1"
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    original_bytes = source_path.read_bytes()
+    monkeypatch.setattr(
+        "facdigger.inference.releases.collect_git_state",
+        lambda _: {"commit": "1" * 40, "branch": "test", "dirty": False},
+    )
+    release_dir, release = create_model_release(
+        run, tmp_path / "releases", repository_root=tmp_path, dataset_dir=dataset
+    )
+    assert load_model_release(release_dir).release_id == release.release_id
+    assert source_path.read_bytes() == original_bytes
+    assert (release_dir / "source_run_manifest.json").read_bytes() == original_bytes
+    (dataset / "manifest.json").write_text('{"dataset_id": "different"}', encoding="utf-8")
+    with pytest.raises(DataContractError, match="dataset manifest hash"):
+        create_model_release(
+            run, tmp_path / "rejected", repository_root=tmp_path, dataset_dir=dataset
+        )
 
 
 def test_verified_e3_predictions_publish_through_the_factor_batch_contract(
@@ -392,7 +431,7 @@ def test_model_release_rejects_unbound_or_modified_predictions(
         create_model_release(run, tmp_path / "releases", repository_root=tmp_path)
 
 
-def test_model_release_rejects_unstable_eodhd_identity(tmp_path, monkeypatch) -> None:
+def test_model_release_does_not_gate_unrelated_training_identities(tmp_path, monkeypatch) -> None:
     commit = "1" * 40
     run, dataset = _source_run(tmp_path, commit=commit)
     _write_source_provenance(
@@ -409,19 +448,22 @@ def test_model_release_rejects_unstable_eodhd_identity(tmp_path, monkeypatch) ->
         },
     )
 
-    with pytest.raises(DataContractError, match="provider-symbol fallback"):
-        create_model_release(run, tmp_path / "releases", repository_root=tmp_path)
+    release_dir, manifest = create_model_release(
+        run, tmp_path / "releases", repository_root=tmp_path
+    )
+    assert load_model_release(release_dir).release_id == manifest.release_id
+    assert manifest.feature_contract.identity_policy == "provider_neutral_security_id"
 
 
 @pytest.mark.parametrize(
-    ("security_id", "expected_policy", "error"),
+    "security_id",
     [
-        ("eodhd:isin:US0000000001", "eodhd_isin_only", None),
-        ("eodhd:symbol:UNKNOWN.US", None, "provider-symbol fallback"),
+        "eodhd:isin:US0000000001",
+        "eodhd:symbol:UNKNOWN.US",
     ],
 )
-def test_model_release_verifies_eodhd_identity_in_training_features(
-    tmp_path, monkeypatch, security_id, expected_policy, error
+def test_model_release_leaves_cross_system_identity_to_delivery(
+    tmp_path, monkeypatch, security_id
 ) -> None:
     commit = "1" * 40
     run, dataset = _source_run(tmp_path, commit=commit)
@@ -451,11 +493,122 @@ def test_model_release_verifies_eodhd_identity_in_training_features(
         },
     )
 
-    if error is not None:
-        with pytest.raises(DataContractError, match=error):
-            create_model_release(run, tmp_path / "releases", repository_root=tmp_path)
-        return
     _, manifest = create_model_release(
         run, tmp_path / "releases", repository_root=tmp_path
     )
-    assert manifest.feature_contract.identity_policy == expected_policy
+    assert manifest.feature_contract.identity_policy == "provider_neutral_security_id"
+
+
+@pytest.mark.parametrize(
+    "publisher_dirty,source_dirty", [(True, False), (False, True), (True, True)],
+)
+def test_dirty_opt_in_is_truthful_and_still_checks_integrity(
+    tmp_path, monkeypatch, caplog, publisher_dirty, source_dirty,
+):
+    run, _ = _source_run(tmp_path)
+    source_path = run / "manifest.json"
+    payload = json.loads(source_path.read_text())
+    payload["git"]["dirty"] = source_dirty
+    source_path.write_text(json.dumps(payload))
+    original = source_path.read_bytes()
+    monkeypatch.setattr("facdigger.inference.releases.collect_git_state", lambda _: {
+        "commit": "1" * 40, "dirty": publisher_dirty,
+    })
+    with pytest.raises(DataContractError, match="clean Git worktree"):
+        create_model_release(run, tmp_path / "releases", repository_root=tmp_path)
+    release_dir, release = create_model_release(
+        run, tmp_path / "releases", repository_root=tmp_path, allow_dirty=True,
+    )
+    assert release.source.git_clean is (not source_dirty)
+    assert "Allowing dirty" in caplog.text
+    assert load_model_release(release_dir) == release
+    assert source_path.read_bytes() == original
+    checkpoint = release_dir / release.artifacts["checkpoint"].file
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"tamper")
+    with pytest.raises(DataContractError, match="integrity failure"):
+        load_model_release(release_dir)
+
+
+def test_release_cannot_falsely_label_a_dirty_source_clean(tmp_path, monkeypatch):
+    run, _ = _source_run(tmp_path)
+    source_path = run / "manifest.json"
+    payload = json.loads(source_path.read_text())
+    payload["git"]["dirty"] = True
+    source_path.write_text(json.dumps(payload))
+    monkeypatch.setattr("facdigger.inference.releases.collect_git_state", lambda _: {
+        "commit": "1" * 40, "dirty": False,
+    })
+    release_dir, release = create_model_release(
+        run, tmp_path / "releases", repository_root=tmp_path, allow_dirty=True,
+    )
+    forged = release.model_copy(update={
+        "source": release.source.model_copy(update={"git_clean": True}),
+    })
+    forged = forged.model_copy(update={"release_id": model_release_id(forged)})
+    (release_dir / "manifest.json").write_text(forged.model_dump_json())
+    forged_dir = release_dir.with_name(forged.release_id)
+    release_dir.rename(forged_dir)
+    with pytest.raises(DataContractError, match="Git lineage"):
+        load_model_release(forged_dir)
+
+
+def test_release_cli_can_publish_relocated_dirty_run(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from facdigger.cli import app
+
+    run, dataset = _source_run(tmp_path)
+    source_path = run / "manifest.json"
+    payload = json.loads(source_path.read_text())
+    payload["git"]["dirty"] = True
+    payload["dataset_path"] = r"D:\missing\dataset"
+    source_path.write_text(json.dumps(payload))
+    monkeypatch.setattr("facdigger.inference.releases.collect_git_state", lambda _: {
+        "commit": "1" * 40, "dirty": True,
+    })
+    result = CliRunner().invoke(app, [
+        "release", "create", "--run", str(run), "--dataset", str(dataset),
+        "--output-root", str(tmp_path / "releases"), "--allow-dirty",
+    ])
+    assert result.exit_code == 0, result.output
+    assert '"source_git_clean": false' in result.output
+
+
+def test_release_loads_legacy_isin_policy_without_changing_its_identity(tmp_path, monkeypatch):
+    run, _ = _source_run(tmp_path)
+    monkeypatch.setattr("facdigger.inference.releases.collect_git_state", lambda _: {
+        "commit": "1" * 40, "dirty": False,
+    })
+    release_dir, release = create_model_release(
+        run, tmp_path / "releases", repository_root=tmp_path,
+    )
+    legacy = release.model_copy(update={"feature_contract": release.feature_contract.model_copy(
+        update={"identity_policy": "eodhd_isin_only"},
+    )})
+    legacy = legacy.model_copy(update={"release_id": model_release_id(legacy)})
+    (release_dir / "manifest.json").write_text(legacy.model_dump_json())
+    legacy_dir = release_dir.with_name(legacy.release_id)
+    release_dir.rename(legacy_dir)
+    assert load_model_release(legacy_dir) == legacy
+
+
+@pytest.mark.parametrize("problem", ["status", "git_state", "checkpoint"])
+def test_allow_dirty_does_not_allow_incomplete_or_unverifiable_sources(
+    tmp_path, monkeypatch, problem,
+):
+    run, _ = _source_run(tmp_path)
+    path = run / "manifest.json"
+    payload = json.loads(path.read_text())
+    if problem == "status":
+        payload.pop("status")
+    elif problem == "git_state":
+        payload["git"]["dirty"] = None
+    else:
+        (run / payload["checkpoint"]["file"]).write_bytes(b"modified checkpoint")
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr("facdigger.inference.releases.collect_git_state", lambda _: {
+        "commit": "1" * 40, "dirty": True,
+    })
+    with pytest.raises(DataContractError, match="complete|Git state|checkpoint hash"):
+        create_model_release(run, tmp_path / "releases", repository_root=tmp_path, allow_dirty=True)
+    assert not (tmp_path / "releases").exists()

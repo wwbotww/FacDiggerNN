@@ -19,6 +19,7 @@ from facdigger.datasets.window import (
     FinanceTransformerWindowDataset,
 )
 from facdigger.experiments.manifest import sha256_json
+from facdigger.models.finance_patch_transformer import build_finance_transformer_architecture
 from facdigger.models.finance_pretrain import FinanceNativePretrainer
 from facdigger.training.e1_engine import (
     _restore_rng_state,
@@ -32,7 +33,6 @@ from facdigger.training.finance_pretrain_config import (
 )
 from facdigger.training.finance_transformer_engine import (
     FINANCE_PRETRAIN_ENCODER_CHECKPOINT,
-    build_finance_transformer_architecture,
 )
 from facdigger.training.ranking import (
     cross_sectional_rank_correlation_loss,

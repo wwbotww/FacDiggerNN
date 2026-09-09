@@ -1,4 +1,4 @@
-# Backtest-only replay of one immutable E3 ModelRelease over one target-free
+# Backtest-only replay of any supported immutable ModelRelease over one target-free
 # inference snapshot. This is deliberately not a strict out-of-sample experiment.
 history_id: e3_fixed_release_history
 release_dir: artifacts/releases/<release_id>
@@ -12,6 +12,11 @@ end_date: null
 # Empty means every eligible security in the snapshot. Otherwise use exact
 # provider-neutral security_id values, never ticker aliases.
 security_ids: []
+
+# For HeyBoss, embed the confirmed targets + identities mapping from
+# heyboss_delivery.example.yaml here and leave security_ids empty.
+# An expired identity mapping blocks delivery instead of shrinking the scope.
+delivery: null
 
 device: cpu
 batch_size: 128

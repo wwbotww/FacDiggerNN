@@ -61,6 +61,10 @@ provider -> 标准 Parquet + provenance 契约 -> 内容寻址快照 -> E0–E3 
 - 正式对照中 E0–E3 必须复用相同快照、预测契约和 evaluator；最新信号路径不能读取
   labels、target 或 test membership。
 - CLI、配置字段、Parquet schema、manifest 和 checkpoint 布局都是需要谨慎维护的接口。
+- 跨系统身份在实际交付集合校验；不得因未交付训练股票缺 ISIN 拒绝 release，也不得为交付
+  子集提前缩小模型的完整计算横截面。目标集合与映射有效期分离，过期映射不得静默缩小覆盖率分母。
+- 本机资产路径可显式重定位，但不改原始 manifest/config/hash。联调仅可通过 `--allow-dirty`
+  放行真实记录的 dirty Git 状态，不得伪造 `git_clean=true` 或跳过其他产物验证。
 - 领域层使用明确异常并保留根因；CLI 可以转换为非零退出码。不要在输出、缓存或
   manifest 中泄露 token。
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -529,3 +530,57 @@ class FinancePatchTransformer(nn.Module):
 
 def count_trainable_parameters(module: nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+
+
+def build_finance_transformer_model(
+    config: Any,
+    *,
+    context_length: int,
+) -> FinancePatchTransformer:
+    return build_finance_transformer_architecture(
+        config.model,
+        context_length=context_length,
+        num_local_channels=len(config.channels),
+        num_market_channels=len(config.market_channels),
+        horizons=tuple(config.horizons),
+    )
+
+
+def build_finance_transformer_architecture(
+    model: Any,
+    *,
+    context_length: int,
+    num_local_channels: int,
+    num_market_channels: int,
+    horizons: tuple[int, ...],
+) -> FinancePatchTransformer:
+    """Construct the one architecture shared by scratch, pretrain and replay."""
+
+    if model.patch_length > context_length:
+        raise ValueError("patch_length cannot exceed snapshot context_length")
+    if model.statistics_windows[-1] > context_length:
+        raise ValueError("statistics windows cannot exceed snapshot context_length")
+    return FinancePatchTransformer(
+        context_length=context_length,
+        num_local_channels=num_local_channels,
+        num_market_channels=num_market_channels,
+        num_asset_channels=7,
+        horizons=horizons,
+        patch_length=model.patch_length,
+        patch_stride=model.patch_stride,
+        local_d_model=model.local_d_model,
+        local_num_attention_heads=model.local_num_attention_heads,
+        local_num_hidden_layers=model.local_num_hidden_layers,
+        local_ffn_dim=model.local_ffn_dim,
+        market_d_model=model.market_d_model,
+        market_num_attention_heads=model.market_num_attention_heads,
+        market_num_hidden_layers=model.market_num_hidden_layers,
+        market_ffn_dim=model.market_ffn_dim,
+        embedding_dim=model.embedding_dim,
+        cross_num_attention_heads=model.cross_num_attention_heads,
+        cross_num_hidden_layers=model.cross_num_hidden_layers,
+        cross_ffn_dim=model.cross_ffn_dim,
+        statistics_output_dim=model.statistics_output_dim,
+        statistics_windows=tuple(model.statistics_windows),
+        dropout=model.dropout,
+    )

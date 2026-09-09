@@ -108,6 +108,13 @@ def load_current_revision(store_root: str | Path) -> ProductionSourceRevision:
         path = revision_root / evidence["file"]
         if not path.is_file() or sha256_file(path) != evidence["sha256"]:
             raise DataContractError(f"production revision artifact integrity failure: {name}")
+    universe_dates = (
+        pl.scan_parquet(revision_root / PRODUCTION_SOURCE_FILES["universe"])
+        .select("trade_date")
+        .unique()
+        .collect()
+    )
+    _require_universe_history(universe_dates, manifest)
     return ProductionSourceRevision(revision_id, revision_root, manifest)
 
 
@@ -119,12 +126,25 @@ def _history_start(days: list[date], history_sessions: int) -> date:
     return days[max(0, len(days) - history_sessions)]
 
 
+def _require_universe_history(universe: pl.DataFrame, manifest: dict[str, Any]) -> None:
+    expected = regular_sessions(
+        date.fromisoformat(manifest["resolved_start"]),
+        date.fromisoformat(manifest["resolved_end"]),
+    )
+    if universe["trade_date"].unique().sort().to_list() != expected:
+        raise DataContractError(
+            "production source lacks complete historical universe membership; "
+            "re-bootstrap from historical bronze into a new store_root"
+        )
+
+
 def _write_revision(
     store_root: Path,
     revision_id: str,
     frames: dict[str, pl.DataFrame],
     manifest: dict[str, Any],
 ) -> None:
+    _require_universe_history(frames["universe"], manifest)
     destination = store_root / "revisions" / revision_id
     if destination.exists():
         return
@@ -201,7 +221,7 @@ def bootstrap_production_store(
     )
     universe = validate_universe(
         pl.scan_parquet(universe_path)
-        .filter(pl.col("trade_date") == session_dates[-1])
+        .filter(pl.col("trade_date").is_in(retained_dates))
         .collect()
     )
     revision_metadata = {
@@ -314,17 +334,17 @@ def _listed_day_offsets(
     hot_bars: pl.DataFrame,
     calendar_days: list[date],
     target_date: date,
+    universe_start: date,
 ) -> pl.DataFrame:
     if target_date not in calendar_days:
         raise DataContractError("target date is absent from production source calendar")
     position = {day: index for index, day in enumerate(calendar_days)}
-    short_start_index = max(0, len(calendar_days) - 20)
-    old_date = old_universe["trade_date"].max()
-    old_position = position.get(old_date) if old_date is not None else None
+    short_start_index = position[universe_start]
+    latest_membership = old_universe.sort("trade_date").unique("security_id", keep="last")
     old_listed = {
-        security_id: int(listed_days)
-        for security_id, listed_days in old_universe.select(
-            "security_id", "listed_days"
+        security_id: (position.get(old_date), int(listed_days))
+        for security_id, old_date, listed_days in latest_membership.select(
+            "security_id", "trade_date", "listed_days"
         ).iter_rows()
     }
     records: list[dict[str, Any]] = []
@@ -335,8 +355,9 @@ def _listed_day_offsets(
         if first_position is None:
             continue
         raw_count = len(calendar_days) - max(first_position, short_start_index)
-        if security_id in old_listed and old_position is not None:
-            desired = old_listed[security_id] + len(calendar_days) - 1 - old_position
+        old_position, old_count = old_listed.get(security_id, (None, 0))
+        if old_position is not None:
+            desired = old_count + len(calendar_days) - 1 - old_position
         else:
             desired = len(calendar_days) - first_position
         records.append(
@@ -470,7 +491,15 @@ def publish_daily_source_revision(
     _history_start(sessions, history_sessions)
     retained_sessions = set(sessions[-history_sessions:])
     retained_start = sessions[max(0, len(sessions) - history_sessions)]
-    universe_calendar_days = sessions[-20:]
+    # Rebuild all revised/gap sessions with ADV20 warm-up; preserve actual membership
+    # outside the revision window, rather than projecting today's stock pool backwards.
+    rebuild_dates = [day for day in sessions if day >= revision.revision_start]
+    if not rebuild_dates:
+        raise DataContractError("daily revision has no retained universe sessions")
+    rebuild_position = sessions.index(rebuild_dates[0])
+    if rebuild_position < 19:
+        raise DataContractError("daily universe revision has insufficient ADV20 warm-up history")
+    universe_calendar_days = sessions[rebuild_position - 19:]
     hot_calendar = pl.DataFrame(
         {"trade_date": universe_calendar_days},
         schema={"trade_date": pl.Date},
@@ -479,7 +508,7 @@ def publish_daily_source_revision(
         clean_bars.filter(pl.col("trade_date").is_in(retained_sessions))
     )
     universe = build_universe(
-        hot_bars,
+        clean_bars,
         min_listed_sessions=config.min_listed_sessions,
         min_price=config.min_price,
         min_adv20_usd=config.min_adv20_usd,
@@ -487,13 +516,20 @@ def publish_daily_source_revision(
         calendar=hot_calendar,
         listed_day_offsets=_listed_day_offsets(
             old_universe,
-            hot_bars,
+            clean_bars,
             sessions,
             revision.target_date,
+            universe_calendar_days[0],
         ),
     )
     universe = validate_universe(
-        universe.filter(pl.col("trade_date") == revision.target_date)
+        pl.concat(
+            [
+                old_universe.filter(pl.col("trade_date") < rebuild_dates[0]),
+                universe.filter(pl.col("trade_date") >= rebuild_dates[0]),
+            ],
+            how="vertical_relaxed",
+        ).filter(pl.col("trade_date").is_in(retained_sessions))
     )
     observed_target_rows = hot_bars.filter(
         pl.col("trade_date") == revision.target_date

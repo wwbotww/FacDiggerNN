@@ -1,9 +1,9 @@
 # Transformer 因子质量优化设计
 
-> **状态：工程实现完成，真实 RTX 实验待运行。** 输入/标签、模型、监督 embedding replay、
+> **状态：工程实现完成，实验结论以具体 run 为准。** 输入/标签、模型、监督 embedding replay、
 > 金融预训练、Train 内 linear probe、100-update 资源准入、训练快照回放和 9 阶段精简 runner
-> 已落地并通过小型测试。面向生产的 target-free snapshot、ModelRelease 和 FactorBatch 暂不扩展，
-> 等本轮模型通过配对门禁后再接入。现行 E0—E3 继续作为历史基线。
+> 已落地并通过小型测试。后续接入改造已补齐共用的 target-free snapshot、ModelRelease、
+> 每日及全历史 FactorBatch；接口可用不表示模型通过研究决策或适合交易。现行 E0—E3 继续作为历史基线。
 
 ## 1. 决策摘要
 
@@ -652,10 +652,11 @@ configs/research/
 现有 `training/ranking.py` 的 target rank、日度审计和评价逻辑继续复用。新完整日引擎只替换
 “如何获得全日 score 并把梯度传回时间编码器”，不能复制出第二套 Rank IC 定义。
 
-训练 snapshot 的 `facdigger predict` 已增加 full-date scoring adapter：先分块产生 local
-embedding，再对目标日期执行一次 Set Transformer，并交给现有 prediction evaluator。生产侧
-仍保持 E3-only；新模型确认有效后再扩展无标签 inference snapshot、ModelRelease 和
-FactorBatch，避免提前形成两套生产路径。
+训练评价与 `facdigger predict`、每日/全历史推理共用 `models/finance_scoring.py`：先分块产生
+local embedding，再对目标日期执行一次 Set Transformer。release 自动选择
+`inference/backends.py` 的模型实现；Finance 无标签窗口不伪造 target 或 split。原始特征构建与
+冻结 scaler 应用也共用 `features/pipeline.py`。具体接口及计算/交付横截面边界见
+[开发文档 §11](开发文档.md#111-modelrelease-与-factorbatch)。
 
 ## 16. 实施状态
 
@@ -693,8 +694,9 @@ FactorBatch，避免提前形成两套生产路径。
 - 训练 snapshot checkpoint 回放；
 - 更新实验设计、开发文档和复盘。
 
-生产 target-free 每日/全历史推理和 ModelRelease 接入明确推迟到配对实验 `go` 以后，不属于
-本轮开始训练的前置条件。
+后续多模型接入改造已完成 target-free 每日/全历史推理与 ModelRelease，外部仍只有五列
+FactorBatch，不改变本节训练矩阵、损失或配对决策。它既不替代 `go/no-go` 判断，也不自动选取
+或部署实验胜者；不合格来源与旧训练协议仍拒绝发布。
 
 各阶段已经分别完成相关单元和小型集成测试；只有 RTX 资源门禁通过，才开始真实完整训练。
 

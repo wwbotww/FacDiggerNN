@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import polars as pl
+import torch
 
 from facdigger.data.config import (
     FINANCE_TRANSFORMER_CHANNELS,
@@ -91,9 +92,8 @@ def _datasets() -> tuple[FinanceTransformerWindowDataset, FinanceTransformerWind
     return dataset("train_fit"), dataset("inner_selection")
 
 
-def test_finance_transformer_trains_one_epoch_and_writes_replay_checkpoint(tmp_path) -> None:
-    train, selection = _datasets()
-    config = FinanceTransformerExperimentConfig.model_validate(
+def _config() -> FinanceTransformerExperimentConfig:
+    return FinanceTransformerExperimentConfig.model_validate(
         {
             "model": {
                 "patch_length": 8,
@@ -134,8 +134,10 @@ def test_finance_transformer_trains_one_epoch_and_writes_replay_checkpoint(tmp_p
         }
     )
 
+def test_finance_transformer_trains_one_epoch_and_writes_replay_checkpoint(tmp_path) -> None:
+    train, selection = _datasets()
     _, audit = train_finance_transformer(
-        config,
+        _config(),
         train_dataset=train,
         valid_dataset=selection,
         dataset_id="synthetic-finance-transformer",
@@ -147,3 +149,49 @@ def test_finance_transformer_trains_one_epoch_and_writes_replay_checkpoint(tmp_p
     assert audit["history"][0]["maximum_local_replay_error"] == 0.0
     assert (tmp_path / "checkpoints" / "best.pt").is_file()
     assert (tmp_path / "checkpoints" / "last.pt").is_file()
+
+
+def test_pretrained_resume_after_move_does_not_need_initial_encoder(tmp_path) -> None:
+    from facdigger.models.finance_patch_transformer import build_finance_transformer_model
+
+    torch.set_num_threads(1)
+    train, selection = _datasets()
+    encoder_path = tmp_path / "pretraining.pt"
+    payload = _config().model_dump()
+    payload.update({"initialization": "finance_pretrained", "pretrained_checkpoint": encoder_path})
+    payload["training"].update({"max_epochs": 2, "minimum_epochs": 2, "patience": 2})
+    config = FinanceTransformerExperimentConfig.model_validate(payload)
+    encoder = build_finance_transformer_model(config, context_length=32)
+    torch.save({
+        "contract": "finance_patch_pretrain_encoder", "dataset_id": "fixture",
+        "context_length": 32, "channels": config.channels,
+        "market_channels": config.market_channels,
+        "local_encoder_state": encoder.local_encoder.state_dict(),
+        "market_encoder_state": encoder.market_encoder.state_dict(),
+    }, encoder_path)
+    full, full_audit = train_finance_transformer(
+        config, train_dataset=train, valid_dataset=selection, dataset_id="fixture",
+        checkpoint_dir=tmp_path / "continuous",
+    )
+    partial = tmp_path / "original-checkpoints"
+    train_finance_transformer(
+        config, train_dataset=train, valid_dataset=selection, dataset_id="fixture",
+        checkpoint_dir=partial, stop_after_epoch=1,
+    )
+    encoder_path.rename(tmp_path / "offline-pretraining.pt")
+    relocated = tmp_path / "relocated-checkpoints"
+    partial.rename(relocated)
+    resumed, audit = train_finance_transformer(
+        config, train_dataset=train, valid_dataset=selection, dataset_id="fixture",
+        checkpoint_dir=relocated, resume_from=relocated / "last.pt",
+    )
+    assert audit["resumed_from_epoch"] == 1
+    assert audit["epochs_completed"] == 2
+    assert audit["initialization"] == full_audit["initialization"]
+    for name, expected in full.state_dict().items():
+        torch.testing.assert_close(resumed.state_dict()[name], expected, rtol=0, atol=0)
+    full_last = torch.load(tmp_path / "continuous" / "last.pt", weights_only=False)
+    resumed_last = torch.load(relocated / "last.pt", weights_only=False)
+    assert resumed_last["global_step"] == full_last["global_step"]
+    assert resumed_last["scheduler_state"] == full_last["scheduler_state"]
+    assert resumed_last["sampler_state"] == full_last["sampler_state"]

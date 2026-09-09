@@ -11,6 +11,7 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from facdigger.data.config import StrictModel
+from facdigger.inference.delivery import DeliveryConfig
 
 _RELEASE_ID = re.compile(r"^[0-9a-f]{64}$")
 
@@ -48,13 +49,14 @@ class ProductionModelConfig(StrictModel):
 class ProductionInferenceConfig(StrictModel):
     output_root: Path = Path("data/inference_snapshots/production")
     retention_sessions: int = Field(default=10, ge=1, le=120)
+    minimum_candidate_rows: int = Field(default=100, ge=1)
+    minimum_eligible_rows: int = Field(default=100, ge=1)
 
 
 class ProductionFactorBatchConfig(StrictModel):
     output_root: Path = Path("artifacts/factor_batches")
     retention: Literal["forever"] = "forever"
-    minimum_candidate_rows: int = Field(default=100, ge=1)
-    minimum_eligible_rows: int = Field(default=100, ge=1)
+    delivery: DeliveryConfig | None = None
 
 
 class ProductionServiceConfig(StrictModel):
@@ -95,7 +97,7 @@ class ProductionServiceConfig(StrictModel):
                 except ValueError:
                     continue
                 raise ValueError(f"{label} must not be inside {training_root}")
-        if self.factor_batch.minimum_eligible_rows > self.factor_batch.minimum_candidate_rows:
+        if self.inference.minimum_eligible_rows > self.inference.minimum_candidate_rows:
             raise ValueError("minimum_eligible_rows cannot exceed minimum_candidate_rows")
         return self
 

@@ -20,6 +20,11 @@ from facdigger.data.config import StrictModel
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
 from facdigger.experiments.manifest import sha256_json
+from facdigger.inference.delivery import (
+    DeliveryConfig,
+    delivery_identity_policy,
+    resolve_delivery,
+)
 
 if TYPE_CHECKING:
     from facdigger.inference.releases import ModelReleaseManifest
@@ -47,7 +52,7 @@ class FactorBatchSource(StrictModel):
 class FactorBatchModel(StrictModel):
     release_id: str
     model_id: str = Field(min_length=1)
-    model_type: Literal["financial_pretrained_patchtst"]
+    model_type: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
     checkpoint_sha256: str
     training_dataset_id: str = Field(min_length=1)
     higher_score_is_better: Literal[True] = True
@@ -351,6 +356,7 @@ def publish_factor_batch(
     time_metadata: FactorBatchTime | Mapping[str, Any],
     created_at: datetime | None = None,
     before_commit: Callable[[], None] | None = None,
+    delivery_audit: Mapping[str, Any] | None = None,
 ) -> tuple[Path, FactorBatchManifest]:
     """Validate and atomically publish one immutable FactorBatch directory."""
 
@@ -421,6 +427,23 @@ def publish_factor_batch(
             update={"delivery_id": factor_batch_delivery_id(provisional)}
         )
         destination = root / manifest.delivery_id
+        if delivery_audit is not None:
+            # Operational receipt is outside the immutable two-file delivery.
+            # Historical replay instead embeds the profile in its resolved request.
+            audit_root = root.parent / f"{root.name}_delivery_audits"
+            audit_root.mkdir(parents=True, exist_ok=True)
+            receipt = {
+                "delivery_id": manifest.delivery_id,
+                "snapshot_id": input_value.snapshot_id,
+                "release_id": model_value.release_id,
+                **delivery_audit,
+            }
+            audit_temporary = audit_root / f".tmp-{uuid.uuid4().hex}.json"
+            try:
+                _write_json(audit_temporary, receipt)
+                audit_temporary.replace(audit_root / f"{manifest.delivery_id}.json")
+            finally:
+                audit_temporary.unlink(missing_ok=True)
         if destination.exists():
             existing = load_factor_batch(destination)
             if existing.delivery_id != manifest.delivery_id:
@@ -444,8 +467,6 @@ def factor_batch_metadata(
 ) -> tuple[FactorBatchSource, FactorBatchModel]:
     """Derive cross-project lineage from a fully verified internal ModelRelease."""
 
-    if release.model_type != "financial_pretrained_patchtst":
-        raise DataContractError("cross-project FactorBatch accepts only an E3 ModelRelease")
     return (
         FactorBatchSource(
             kind=source_kind,
@@ -472,8 +493,9 @@ def publish_evaluation_factor_batch(
     output_root: str | Path,
     *,
     created_at: datetime | None = None,
+    delivery: DeliveryConfig | None = None,
 ) -> tuple[Path, FactorBatchManifest]:
-    """Convert verified E3 research predictions into the sole external factor contract."""
+    """Convert verified research predictions into the sole external factor contract."""
 
     from facdigger.data.providers.eodhd.market_calendar import CALENDAR_VERSION
     from facdigger.evaluation.contracts import validate_predictions
@@ -484,8 +506,6 @@ def publish_evaluation_factor_batch(
         raise FileNotFoundError(f"predictions file does not exist: {prediction_path}")
     release_path = Path(release_dir).resolve()
     release = load_model_release(release_path)
-    if release.model_type != "financial_pretrained_patchtst":
-        raise DataContractError("evaluation FactorBatch accepts only an E3 ModelRelease")
     predictions = validate_predictions(pl.read_parquet(prediction_path))
     if predictions.is_empty():
         raise DataContractError("evaluation predictions must not be empty")
@@ -522,7 +542,11 @@ def publish_evaluation_factor_batch(
         "asof_date",
         pl.col("score_raw").cast(pl.Float64).alias("score"),
     ).sort("asof_date", "security_id")
-    factors = build_factor_frame(candidate_universe, scored_rows)
+    build_factor_frame(candidate_universe, scored_rows)
+    selection = resolve_delivery(
+        candidate_universe, delivery, eligible_only=True
+    )
+    factors = build_factor_frame(selection.candidates, selection.project_scores(scored_rows))
     source_metadata, model_metadata = factor_batch_metadata(
         release, source_kind="evaluation_predictions"
     )
@@ -530,8 +554,8 @@ def publish_evaluation_factor_batch(
         snapshot_id=release.training_data.dataset_id,
         snapshot_manifest_sha256=release.training_data.dataset_manifest_sha256,
         universe_semantics="eligible_scored_cross_section",
-        universe_sha256=factor_universe_sha256(candidate_universe),
-        identity_policy=release.feature_contract.identity_policy,
+        universe_sha256=factor_universe_sha256(selection.candidates),
+        identity_policy=delivery_identity_policy(selection.candidates),
     )
     time_metadata = FactorBatchTime(
         calendar_version=CALENDAR_VERSION,
@@ -546,6 +570,7 @@ def publish_evaluation_factor_batch(
         input_metadata=input_metadata,
         time_metadata=time_metadata,
         created_at=created_at,
+        delivery_audit=selection.audit,
     )
 
 

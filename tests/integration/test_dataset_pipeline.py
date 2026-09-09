@@ -444,8 +444,9 @@ def test_finance_transformer_snapshot_contains_full_context_and_multi_horizon_ta
     assert set(scaler) == {"local", "market", "method", "rank_channels"}
 
 
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["unix", "windows"])
 def test_inference_snapshot_reuses_release_scaler_without_labels_or_fit(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, newline
 ) -> None:
     bars, universe = synthetic_frames(90)
     bars_path = tmp_path / "bars.parquet"
@@ -472,10 +473,10 @@ def test_inference_snapshot_reuses_release_scaler_without_labels_or_fit(
     release_dir = tmp_path / "release"
     release_dir.mkdir()
     scaler_path = release_dir / "scaler.json"
-    scaler_path.write_text(
-        (training_snapshot / "scaler.json").read_text(encoding="utf-8"),
-        encoding="utf-8",
+    scaler_path.write_bytes(
+        (training_snapshot / "scaler.json").read_bytes().replace(b"\n", newline)
     )
+    (release_dir / "training_dataset_manifest").write_text(json.dumps(training_manifest))
     release = ModelReleaseManifest.model_validate(
         {
             "release_id": "1" * 64,
@@ -528,7 +529,7 @@ def test_inference_snapshot_reuses_release_scaler_without_labels_or_fit(
         "facdigger.data.inference_snapshots.load_model_release", lambda _: release
     )
     monkeypatch.setattr(
-        "facdigger.data.snapshots.fit_train_robust_scaler",
+        "facdigger.features.pipeline.fit_train_robust_scaler",
         lambda *args, **kwargs: pytest.fail("inference path must not fit a scaler"),
     )
 
@@ -546,9 +547,7 @@ def test_inference_snapshot_reuses_release_scaler_without_labels_or_fit(
     assert "labels" not in manifest["artifacts"]
     assert "sample_index" not in manifest["artifacts"]
     assert (snapshot / "delivery_universe.parquet").is_file()
-    assert (snapshot / "scaler.json").read_text(encoding="utf-8") == (
-        json.dumps(scaler, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    )
+    assert (snapshot / "scaler.json").read_bytes() == scaler_path.read_bytes()
     assert pl.read_parquet(snapshot / "features.parquet").equals(
         pl.read_parquet(training_snapshot / "features.parquet"),
         null_equal=True,
@@ -589,6 +588,9 @@ def test_inference_snapshot_loader_rejects_eligibility_drift(
     )
     release_dir = tmp_path / "release"
     release_dir.mkdir()
+    (release_dir / "training_dataset_manifest").write_text(
+        '{"artifacts": {"source_manifest": null}}'
+    )
     scaler_path = release_dir / "scaler.json"
     scaler_path.write_text(
         json.dumps(scaler, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -699,6 +701,9 @@ def test_exact_date_inference_snapshot_is_partitioned_and_contains_only_target(
     )
     release_dir = tmp_path / "release"
     release_dir.mkdir()
+    (release_dir / "training_dataset_manifest").write_text(
+        '{"artifacts": {"source_manifest": null}}'
+    )
     scaler_path = release_dir / "scaler.json"
     scaler_path.write_text(json.dumps(scaler, sort_keys=True), encoding="utf-8")
     release = ModelReleaseManifest.model_validate(

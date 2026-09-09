@@ -123,9 +123,22 @@ class MarketFeatureStore:
             observed_mask=self.observed[start : end + 1],
         )
 
-    def future_window(
-        self, asof_date: Any, *, future_horizon: int
+    def window_for_samples(
+        self,
+        sample_rows: pl.DataFrame,
+        sample_indices: np.ndarray | list[int],
+        *,
+        context_length: int,
     ) -> MarketFeatureWindow:
+        indices = np.asarray(sample_indices, dtype=np.int64)
+        if indices.ndim != 1 or len(indices) < 1:
+            raise ValueError("sample_indices must be a non-empty one-dimensional array")
+        dates = sample_rows[indices.tolist(), "asof_date"].unique().to_list()
+        if len(dates) != 1:
+            raise DataContractError("market context lookup requires one complete date")
+        return self.window(dates[0], context_length=context_length)
+
+    def future_window(self, asof_date: Any, *, future_horizon: int) -> MarketFeatureWindow:
         if future_horizon < 1:
             raise ValueError("future_horizon must be positive")
         target = np.datetime64(asof_date, "D")
@@ -144,19 +157,17 @@ class MarketFeatureStore:
         )
 
 
-class SnapshotWindowDataset:
-    """Materialize one `[context_length, channels]` window per indexed sample."""
+class _IndexedFeatureWindows:
+    """Shared feature storage and window lookup, independent of labels and splits."""
 
     def __init__(
         self,
         *,
         features: pl.DataFrame | None = None,
         feature_store: SecurityFeatureStore | None = None,
-        sample_index: pl.DataFrame,
+        sample_rows: pl.DataFrame,
         channels: list[str],
         context_length: int,
-        split: str,
-        retained_columns: list[str] | None = None,
     ) -> None:
         if context_length < 1:
             raise ValueError("context_length must be positive")
@@ -173,35 +184,11 @@ class SnapshotWindowDataset:
             )
         self.channels = list(channels)
         self.context_length = context_length
-        self.split = split
         self.feature_store = feature_store
         self.blocks = feature_store.blocks
-        selected_columns = (
-            retained_columns
-            if retained_columns is not None
-            else [
-                "sample_id",
-                "security_id",
-                "symbol",
-                "asof_date",
-                "feature_start",
-                "feature_end",
-                "split",
-                "target",
-            ]
-        )
-        retained_columns = [
-            column
-            for column in selected_columns
-            if column in sample_index.columns
-        ]
-        self.sample_rows = (
-            sample_index.filter(pl.col("split") == split)
-            .select(retained_columns)
-            .sort(["asof_date", "security_id"])
-        )
+        self.sample_rows = sample_rows.sort(["asof_date", "security_id"])
         if self.sample_rows.is_empty():
-            raise DataContractError(f"sample_index has no rows for split={split!r}")
+            raise DataContractError("sample index contains no feature windows")
         self._block_indices = np.empty(self.sample_rows.height, dtype=np.int32)
         self._starts = np.empty(self.sample_rows.height, dtype=np.int32)
         for index, row in enumerate(self.sample_rows.iter_rows(named=True)):
@@ -223,6 +210,65 @@ class SnapshotWindowDataset:
                 )
             self._block_indices[index] = block_index
             self._starts[index] = start
+
+    @property
+    def asof_dates(self) -> list[Any]:
+        return self.sample_rows["asof_date"].to_list()
+
+    def __len__(self) -> int:
+        return len(self._starts)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        start = int(self._starts[index])
+        block = self.feature_store.block_at(int(self._block_indices[index]))
+        stop = start + self.context_length
+        return {
+            "values": block.values[start:stop],
+            "observed_mask": block.observed[start:stop],
+            "sample_index": index,
+        }
+
+
+class SnapshotWindowDataset(_IndexedFeatureWindows):
+    """Materialize one `[context_length, channels]` window per indexed sample."""
+
+    def __init__(
+        self,
+        *,
+        features: pl.DataFrame | None = None,
+        feature_store: SecurityFeatureStore | None = None,
+        sample_index: pl.DataFrame,
+        channels: list[str],
+        context_length: int,
+        split: str,
+        retained_columns: list[str] | None = None,
+    ) -> None:
+        self.split = split
+        selected_columns = (
+            retained_columns
+            if retained_columns is not None
+            else [
+                "sample_id",
+                "security_id",
+                "symbol",
+                "asof_date",
+                "feature_start",
+                "feature_end",
+                "split",
+                "target",
+            ]
+        )
+        retained_columns = [column for column in selected_columns if column in sample_index.columns]
+        rows = sample_index.filter(pl.col("split") == split).select(retained_columns)
+        if rows.is_empty():
+            raise DataContractError(f"sample_index has no rows for split={split!r}")
+        super().__init__(
+            features=features,
+            feature_store=feature_store,
+            sample_rows=rows,
+            channels=channels,
+            context_length=context_length,
+        )
 
     @classmethod
     def from_snapshot(
@@ -249,26 +295,14 @@ class SnapshotWindowDataset:
             split=split,
         )
 
-    @property
-    def asof_dates(self) -> list[Any]:
-        return self.sample_rows["asof_date"].to_list()
-
-    def __len__(self) -> int:
-        return len(self._starts)
-
     def __getitem__(self, index: int) -> dict[str, Any]:
-        start = int(self._starts[index])
-        block = self.feature_store.block_at(int(self._block_indices[index]))
-        stop = start + self.context_length
         return {
-            "values": block.values[start:stop],
-            "observed_mask": block.observed[start:stop],
+            **super().__getitem__(index),
             "target": np.float32(self.sample_rows["target"][index]),
-            "sample_index": index,
         }
 
 
-class SnapshotInferenceWindowDataset(SnapshotWindowDataset):
+class SnapshotInferenceWindowDataset(_IndexedFeatureWindows):
     """Materialize target-free windows selected from a schema-v3 inference index."""
 
     def __init__(
@@ -289,39 +323,62 @@ class SnapshotInferenceWindowDataset(SnapshotWindowDataset):
         missing = sorted(required - set(inference_index.columns))
         if missing:
             raise DataContractError(f"inference_index missing required columns: {missing}")
-        if "target" in inference_index.columns:
-            raise DataContractError("inference_index must not contain target")
-        rows = inference_index.with_columns(pl.lit("inference").alias("split"))
+        if any(
+            column.startswith("target") or column in {"label", "split"}
+            for column in inference_index.columns
+        ):
+            raise DataContractError("inference_index must not contain targets, labels or split")
+        columns = [
+            "sample_id",
+            "security_id",
+            "symbol",
+            "asof_date",
+            "feature_start",
+            "feature_end",
+            "eligible",
+            "industry_code",
+            "float_market_cap",
+            "log_float_market_cap",
+        ]
         super().__init__(
             features=features,
-            sample_index=rows,
+            sample_rows=inference_index.select(
+                [column for column in columns if column in inference_index.columns]
+            ),
             channels=channels,
             context_length=context_length,
-            split="inference",
-            retained_columns=[
-                "sample_id",
-                "security_id",
-                "symbol",
-                "asof_date",
-                "feature_start",
-                "feature_end",
-                "split",
-                "eligible",
-                "industry_code",
-                "float_market_cap",
-                "log_float_market_cap",
-            ],
         )
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        start = int(self._starts[index])
-        block = self.feature_store.block_at(int(self._block_indices[index]))
-        stop = start + self.context_length
-        return {
-            "values": block.values[start:stop],
-            "observed_mask": block.observed[start:stop],
-            "sample_index": index,
-        }
+
+class FinanceTransformerInferenceWindowDataset(SnapshotInferenceWindowDataset):
+    """Local windows and full-date market context without supervised fields."""
+
+    def __init__(
+        self,
+        *,
+        features: pl.DataFrame,
+        market_features: pl.DataFrame,
+        inference_index: pl.DataFrame,
+        channels: list[str],
+        market_channels: list[str],
+        context_length: int,
+        primary_horizon: int,
+    ) -> None:
+        super().__init__(
+            features=features,
+            inference_index=inference_index,
+            channels=channels,
+            context_length=context_length,
+        )
+        self.primary_horizon = primary_horizon
+        self.market_store = MarketFeatureStore(features=market_features, channels=market_channels)
+
+    def market_window_for_sample_indices(
+        self, sample_indices: np.ndarray | list[int]
+    ) -> MarketFeatureWindow:
+        return self.market_store.window_for_samples(
+            self.sample_rows, sample_indices, context_length=self.context_length
+        )
 
 
 class FinanceTransformerWindowDataset(SnapshotWindowDataset):
@@ -407,9 +464,7 @@ class FinanceTransformerWindowDataset(SnapshotWindowDataset):
         if not isinstance(market_artifact, str):
             raise DataContractError("finance transformer snapshot has no market features")
         label_config = manifest["config"]["label"]
-        horizons = sorted(
-            [label_config["horizon"], *label_config.get("auxiliary_horizons", [])]
-        )
+        horizons = sorted([label_config["horizon"], *label_config.get("auxiliary_horizons", [])])
         return cls(
             features=pl.read_parquet(root / manifest["artifacts"]["features"]),
             market_features=pl.read_parquet(root / market_artifact),
@@ -425,13 +480,9 @@ class FinanceTransformerWindowDataset(SnapshotWindowDataset):
     def market_window_for_sample_indices(
         self, sample_indices: np.ndarray | list[int]
     ) -> MarketFeatureWindow:
-        indices = np.asarray(sample_indices, dtype=np.int64)
-        if indices.ndim != 1 or len(indices) < 1:
-            raise ValueError("sample_indices must be a non-empty one-dimensional array")
-        dates = self.sample_rows[indices.tolist(), "asof_date"].unique().to_list()
-        if len(dates) != 1:
-            raise DataContractError("market context lookup requires one complete date")
-        return self.market_store.window(dates[0], context_length=self.context_length)
+        return self.market_store.window_for_samples(
+            self.sample_rows, sample_indices, context_length=self.context_length
+        )
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = super().__getitem__(index)
@@ -442,7 +493,7 @@ class FinanceTransformerWindowDataset(SnapshotWindowDataset):
         return sample
 
 
-class FinancePretrainingWindowDataset(SnapshotWindowDataset):
+class FinancePretrainingWindowDataset(_IndexedFeatureWindows):
     """Target-free local histories with self-supervised future feature windows."""
 
     def __init__(
@@ -463,36 +514,32 @@ class FinancePretrainingWindowDataset(SnapshotWindowDataset):
             raise ValueError("future_horizon must be positive")
         if not 1 <= future_local_channels <= len(channels):
             raise ValueError("future_local_channels must fit inside local channels")
-        missing = sorted(
-            {"future_start", "future_end"} - set(pretraining_index.columns)
-        )
+        missing = sorted({"future_start", "future_end"} - set(pretraining_index.columns))
         if missing:
-            raise DataContractError(
-                f"pretraining index missing future bounds: {missing}"
-            )
-        if any(column.startswith("target") for column in pretraining_index.columns):
-            raise DataContractError("pretraining index must not contain supervised targets")
-        indexed = pretraining_index.with_columns(
-            pl.lit("finance_pretrain").alias("split")
-        )
+            raise DataContractError(f"pretraining index missing future bounds: {missing}")
+        if any(
+            column.startswith("target") or column in {"label", "split"}
+            for column in pretraining_index.columns
+        ):
+            raise DataContractError("pretraining index must not contain targets, labels or split")
+        columns = [
+            "sample_id",
+            "security_id",
+            "symbol",
+            "asof_date",
+            "feature_start",
+            "feature_end",
+            "future_start",
+            "future_end",
+        ]
         super().__init__(
             features=features,
             feature_store=feature_store,
-            sample_index=indexed,
+            sample_rows=pretraining_index.select(
+                [column for column in columns if column in pretraining_index.columns]
+            ),
             channels=channels,
             context_length=context_length,
-            split="finance_pretrain",
-            retained_columns=[
-                "sample_id",
-                "security_id",
-                "symbol",
-                "asof_date",
-                "feature_start",
-                "feature_end",
-                "future_start",
-                "future_end",
-                "split",
-            ],
         )
         self.future_horizon = future_horizon
         self.future_local_channels = future_local_channels
@@ -509,8 +556,7 @@ class FinancePretrainingWindowDataset(SnapshotWindowDataset):
                 row["future_end"], "D"
             ):
                 raise DataContractError(
-                    "pretraining future bounds disagree with feature grid: "
-                    f"{row['sample_id']}"
+                    f"pretraining future bounds disagree with feature grid: {row['sample_id']}"
                 )
             self._future_starts[index] = location
 
@@ -534,14 +580,10 @@ class FinancePretrainingWindowDataset(SnapshotWindowDataset):
     def unique_asof_dates(self) -> list[Any]:
         return self.sample_rows["asof_date"].unique(maintain_order=True).to_list()
 
-    def market_pair(
-        self, asof_date: Any
-    ) -> tuple[MarketFeatureWindow, MarketFeatureWindow]:
+    def market_pair(self, asof_date: Any) -> tuple[MarketFeatureWindow, MarketFeatureWindow]:
         return (
             self.market_store.window(asof_date, context_length=self.context_length),
-            self.market_store.future_window(
-                asof_date, future_horizon=self.future_horizon
-            ),
+            self.market_store.future_window(asof_date, future_horizon=self.future_horizon),
         )
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -553,9 +595,7 @@ class FinancePretrainingWindowDataset(SnapshotWindowDataset):
         return {
             "values": block.values[start:stop],
             "observed_mask": block.observed[start:stop],
-            "future_values": block.values[
-                future_start:future_stop, : self.future_local_channels
-            ],
+            "future_values": block.values[future_start:future_stop, : self.future_local_channels],
             "future_observed_mask": block.observed[
                 future_start:future_stop, : self.future_local_channels
             ],

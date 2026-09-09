@@ -63,6 +63,7 @@ def test_finance_pretraining_dataset_is_target_free_and_returns_future_windows()
 
     sample = dataset[0]
     assert "target" not in sample
+    assert "split" not in dataset.sample_rows.columns
     np.testing.assert_array_equal(sample["values"][:, 0], [2.0, 3.0, 4.0])
     np.testing.assert_array_equal(sample["future_values"][:, 0], [5.0, 6.0, 7.0])
     history, future = dataset.market_pair(dates[4])
@@ -273,6 +274,8 @@ def test_inference_dataset_retains_target_free_factor_metadata() -> None:
     )
 
     assert "target" not in dataset.sample_rows.columns
+    assert "split" not in dataset.sample_rows.columns
+    assert set(dataset[0]) == {"values", "observed_mask", "sample_index"}
     assert dataset.sample_rows["eligible"].to_list() == [True]
     assert dataset.sample_rows["industry_code"].to_list() == ["technology"]
     assert dataset.sample_rows["log_float_market_cap"].to_list() == [13.8155]

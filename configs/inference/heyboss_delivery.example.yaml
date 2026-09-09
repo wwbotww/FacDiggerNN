@@ -1,0 +1,17 @@
+# 仅示范配置结构，不构成真实证券身份/有效期证明。复制为本地配置并由双方确认。
+# targets 是应交付集合，不能从“有 ISIN 的股票”或有效 mappings 的交集反向生成。
+targets:
+  - instrument_id: AAPL.US
+    active_from: 2026-08-01
+    active_to: null
+
+# 有效期为闭区间，必须有明确结束日；过期后整个批次失败，不静默删掉目标。
+# security_id 是双方约定的交付 ID，通常与真实 source_security_id 相同。
+# 有证据的 fallback 可以补足 ISIN，也可约定非 ISIN 的稳定交付 ID；禁止把旧 ISIN 标成新 ISIN。
+identities:
+  - instrument_id: AAPL.US
+    security_id: eodhd:isin:US0378331005
+    source_security_id: null  # null = 与 security_id 相同
+    valid_from: 2026-08-01
+    valid_to: 2026-12-31
+    evidence: "示例占位：使用前替换为已核对的 HeyBoss 标的清单及身份依据"

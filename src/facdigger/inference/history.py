@@ -19,6 +19,12 @@ from facdigger.data.contracts import DataContractError
 from facdigger.data.inference_snapshots import load_inference_snapshot
 from facdigger.data.providers.eodhd.market_calendar import CALENDAR_VERSION
 from facdigger.data.snapshots import sha256_file
+from facdigger.inference.delivery import (
+    DeliveryConfig,
+    DeliverySelection,
+    delivery_identity_policy,
+    resolve_delivery,
+)
 from facdigger.inference.factor_batch import (
     FactorBatchInput,
     FactorBatchModel,
@@ -31,9 +37,9 @@ from facdigger.inference.factor_batch import (
     publish_factor_batch,
 )
 from facdigger.inference.scoring import (
-    E3InferenceRuntime,
-    load_e3_inference_runtime,
-    score_e3_inference_rows,
+    FactorInferenceRuntime,
+    load_factor_inference_runtime,
+    score_inference_rows,
 )
 
 HISTORICAL_REPLAY_CONTRACT = "facdigger.historical_factor_replay"
@@ -57,6 +63,7 @@ class HistoricalReplayConfig(StrictModel):
     start_date: date | None = None
     end_date: date | None = None
     security_ids: list[str] = Field(default_factory=list)
+    delivery: DeliveryConfig | None = None
     device: Literal["auto", "cpu", "cuda"] = "cpu"
     batch_size: int | None = Field(default=None, ge=1)
     num_workers: int | None = Field(default=None, ge=0)
@@ -79,6 +86,8 @@ class HistoricalReplayConfig(StrictModel):
             raise ValueError("security_ids must not contain empty values")
         if len(self.security_ids) != len(set(self.security_ids)):
             raise ValueError("security_ids must be unique")
+        if self.security_ids and self.delivery is not None:
+            raise ValueError("use either security_ids or a consumer delivery profile, not both")
         return self
 
 
@@ -127,7 +136,7 @@ class HistoricalReplayManifest(StrictModel):
     checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     snapshot_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     snapshot_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    security_scope: Literal["all_eligible", "explicit_ids"]
+    security_scope: Literal["all_eligible", "explicit_ids", "delivery_profile"]
     requested_security_ids: list[str]
     requested_start_date: date | None
     requested_end_date: date | None
@@ -177,24 +186,39 @@ HistoricalReplayProgress = Callable[
 @dataclass(frozen=True)
 class _ResolvedReplay:
     config: HistoricalReplayConfig
-    runtime: E3InferenceRuntime
+    runtime: FactorInferenceRuntime
     snapshot_manifest: dict[str, Any]
     rows: pl.DataFrame
     plan: dict[str, Any]
+    delivery: DeliverySelection
 
 
-def load_historical_replay_config(path: str | Path) -> HistoricalReplayConfig:
+def load_historical_replay_config(
+    path: str | Path,
+    *,
+    release_dir: str | Path | None = None,
+    inference_snapshot_dir: str | Path | None = None,
+    output_root: str | Path | None = None,
+) -> HistoricalReplayConfig:
     config_path = Path(path)
     if not config_path.is_file():
         raise FileNotFoundError(f"historical replay configuration not found: {config_path}")
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"configuration root must be a mapping: {config_path}")
+    for key, value in {
+        "release_dir": release_dir, "inference_snapshot_dir": inference_snapshot_dir,
+        "output_root": output_root,
+    }.items():
+        if value is not None:
+            raw[key] = value
     return HistoricalReplayConfig.model_validate(raw)
 
 
 def _normalized_config(config: HistoricalReplayConfig) -> dict[str, Any]:
     payload = config.model_dump(mode="json")
+    if config.delivery is None:
+        payload.pop("delivery")
     for name in ("release_dir", "inference_snapshot_dir", "output_root"):
         payload[name] = str(Path(payload[name]).resolve())
     return payload
@@ -221,10 +245,13 @@ def _resolve_replay(config: HistoricalReplayConfig) -> _ResolvedReplay:
     release_dir = config.release_dir.resolve()
     snapshot_dir = config.inference_snapshot_dir.resolve()
     if not release_dir.is_dir():
-        raise FileNotFoundError(f"historical replay release does not exist: {release_dir}")
+        raise FileNotFoundError(
+            f"historical replay release does not exist: {release_dir}; specify --release locally"
+        )
     if not snapshot_dir.is_dir():
         raise FileNotFoundError(
-            f"historical replay inference snapshot does not exist: {snapshot_dir}"
+            f"historical replay inference snapshot does not exist: {snapshot_dir}; "
+            "specify --dataset locally"
         )
     destination = (config.output_root.resolve() / config.history_id).resolve()
     if _paths_overlap(destination, release_dir) or _paths_overlap(
@@ -233,7 +260,7 @@ def _resolve_replay(config: HistoricalReplayConfig) -> _ResolvedReplay:
         raise DataContractError(
             "historical replay output must not overlap its immutable release or snapshot"
         )
-    runtime = load_e3_inference_runtime(
+    runtime = load_factor_inference_runtime(
         release_dir,
         device=config.device,
         batch_size=config.batch_size,
@@ -269,12 +296,23 @@ def _resolve_replay(config: HistoricalReplayConfig) -> _ResolvedReplay:
                 f"range: {unknown}"
             )
         rows = rows.filter(pl.col("security_id").is_in(config.security_ids))
-    rows = rows.sort("asof_date", "security_id")
+    candidates = frames["delivery_universe"].filter(
+        pl.col("asof_date").is_between(requested_start, requested_end)
+    )
+    if config.security_ids:
+        candidates = candidates.filter(pl.col("security_id").is_in(config.security_ids))
+    delivery = resolve_delivery(candidates, config.delivery, eligible_only=True)
+    rows = rows.join(
+        delivery.source_candidates.select("security_id", "asof_date"),
+        on=["security_id", "asof_date"], how="semi",
+    ).sort("asof_date", "security_id")
     if rows.is_empty():
         raise DataContractError("historical replay selection contains no scorable rows")
     if not rows["eligible"].all():
         raise DataContractError("historical inference index contains non-eligible rows")
 
+    if rows.height != delivery.candidates.height:
+        raise DataContractError("historical delivery is missing eligible inference rows")
     selected_dates = rows["asof_date"].n_unique()
     available_dates = range_rows["asof_date"].n_unique()
     partition_plan = [
@@ -286,7 +324,7 @@ def _resolve_replay(config: HistoricalReplayConfig) -> _ResolvedReplay:
             "date_count": partition["asof_date"].n_unique(),
             "security_count": partition["security_id"].n_unique(),
         }
-        for year, partition in _partition_rows(rows)
+        for year, partition in _partition_rows(delivery.candidates)
     ]
     plan = {
         "contract": HISTORICAL_PLAN_CONTRACT,
@@ -314,20 +352,26 @@ def _resolve_replay(config: HistoricalReplayConfig) -> _ResolvedReplay:
         ),
         "minimum_asof_date": rows["asof_date"].min().isoformat(),
         "maximum_asof_date": rows["asof_date"].max().isoformat(),
-        "security_scope": "explicit_ids" if config.security_ids else "all_eligible",
+        "security_scope": (
+            "delivery_profile" if config.delivery is not None
+            else "explicit_ids" if config.security_ids else "all_eligible"
+        ),
         "requested_security_ids": list(config.security_ids),
         "row_count": rows.height,
         "date_count": selected_dates,
-        "security_count": rows["security_id"].n_unique(),
+        "security_count": delivery.candidates["security_id"].n_unique(),
         "omitted_date_count": available_dates - selected_dates,
         "partitions": partition_plan,
     }
+    if delivery.audit is not None:
+        plan["delivery_audit"] = delivery.audit
     return _ResolvedReplay(
         config=config,
         runtime=runtime,
         snapshot_manifest=snapshot_manifest,
         rows=rows,
         plan=plan,
+        delivery=delivery,
     )
 
 
@@ -389,7 +433,9 @@ def _prepare_export(resolved: _ResolvedReplay) -> tuple[Path, dict[str, str]]:
     config_path = destination / "resolved_config.yaml"
     if config_path.exists():
         observed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        if observed != normalized:
+        observed_config = HistoricalReplayConfig.model_validate(observed)
+        locators = {"release_dir", "inference_snapshot_dir", "output_root"}
+        if observed_config.model_dump(exclude=locators) != config.model_dump(exclude=locators):
             raise DataContractError(
                 "existing historical replay uses a different resolved configuration"
             )
@@ -492,7 +538,7 @@ def _validate_partition_bundle(
         maximum_asof_date=maximum,
         row_count=expected_rows.height,
         date_count=expected_rows["asof_date"].n_unique(),
-        security_count=expected_rows["security_id"].n_unique(),
+        security_count=candidate_universe["security_id"].n_unique(),
         delivery_id=manifest.delivery_id,
         path=f"factor_batches/{manifest.delivery_id}",
     )
@@ -508,12 +554,9 @@ def _historical_batch_contract(
     FactorBatchInput,
     FactorBatchTime,
 ]:
-    candidate_universe = (
-        rows.select("security_id", "symbol", "asof_date")
-        .with_columns(pl.lit(True).alias("eligible"))
-        .select("security_id", "symbol", "asof_date", "eligible")
-        .sort("asof_date", "security_id")
-    )
+    candidate_universe = resolved.delivery.for_dates(
+        rows["asof_date"].unique().to_list()
+    ).candidates
     source, model = factor_batch_metadata(
         resolved.runtime.release,
         source_kind="evaluation_predictions",
@@ -525,7 +568,7 @@ def _historical_batch_contract(
         ),
         universe_semantics="eligible_scored_cross_section",
         universe_sha256=factor_universe_sha256(candidate_universe),
-        identity_policy=resolved.runtime.release.feature_contract.identity_policy,
+        identity_policy=delivery_identity_policy(candidate_universe),
     )
     time = FactorBatchTime(
         calendar_version=CALENDAR_VERSION,
@@ -541,7 +584,7 @@ def _publish_partition(
     factor_root: Path,
     rows: pl.DataFrame,
 ) -> tuple[Path, HistoricalReplayPartition]:
-    scored = score_e3_inference_rows(
+    scored = score_inference_rows(
         resolved.runtime,
         snapshot_dir=resolved.config.inference_snapshot_dir,
         snapshot_manifest=resolved.snapshot_manifest,
@@ -556,7 +599,9 @@ def _publish_partition(
     ) = _historical_batch_contract(resolved, rows)
     factors = build_factor_frame(
         candidate_universe,
-        scored.select("security_id", "asof_date", "score"),
+        resolved.delivery.for_dates(rows["asof_date"].unique().to_list()).project_scores(
+            scored.select("security_id", "asof_date", "score")
+        ),
     )
     destination, _ = publish_factor_batch(
         factors,
@@ -611,7 +656,10 @@ def run_historical_replay(
     destination, completed = _prepare_export(resolved)
     manifest_path = destination / "manifest.json"
     if manifest_path.exists():
-        manifest = verify_historical_replay(destination)
+        manifest = verify_historical_replay(
+            destination, release_dir=config.release_dir,
+            inference_snapshot_dir=config.inference_snapshot_dir,
+        )
         return destination, manifest
 
     factor_root = destination / "factor_batches"
@@ -647,10 +695,18 @@ def run_historical_replay(
 
     manifest = _build_manifest(resolved, partitions)
     _write_json(manifest_path, manifest.model_dump(mode="json"), atomic=True)
-    return destination, verify_historical_replay(destination)
+    return destination, verify_historical_replay(
+        destination, release_dir=config.release_dir,
+        inference_snapshot_dir=config.inference_snapshot_dir,
+    )
 
 
-def verify_historical_replay(export_dir: str | Path) -> HistoricalReplayManifest:
+def verify_historical_replay(
+    export_dir: str | Path,
+    *,
+    release_dir: str | Path | None = None,
+    inference_snapshot_dir: str | Path | None = None,
+) -> HistoricalReplayManifest:
     """Verify the replay request and every declared annual FactorBatch."""
 
     root = Path(export_dir).resolve()
@@ -667,9 +723,12 @@ def verify_historical_replay(export_dir: str | Path) -> HistoricalReplayManifest
     )
     if not isinstance(config_payload, dict):
         raise DataContractError("historical replay resolved configuration is invalid")
-    config = HistoricalReplayConfig.model_validate(config_payload)
-    if root != (config.output_root.resolve() / config.history_id).resolve():
-        raise DataContractError("historical replay path differs from resolved configuration")
+    config = load_historical_replay_config(
+        root / "resolved_config.yaml", release_dir=release_dir,
+        inference_snapshot_dir=inference_snapshot_dir, output_root=root.parent,
+    )
+    if root.name != config.history_id:
+        raise DataContractError("historical replay directory name differs from history_id")
     resolved = _resolve_replay(config)
     if _read_json(root / "plan.json", "plan") != resolved.plan:
         raise DataContractError("historical replay plan no longer matches its inputs")

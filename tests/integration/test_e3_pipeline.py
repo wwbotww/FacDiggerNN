@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
 from types import SimpleNamespace
 
 import polars as pl
 import pytest
+from factor_fixtures import build_price_volume_snapshot, sessions
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
 from facdigger.data.config import (  # noqa: E402
-    DatasetBuildConfig,
     InferenceSnapshotConfig,
 )
 from facdigger.data.contracts import DataContractError  # noqa: E402
 from facdigger.data.inference_snapshots import build_inference_snapshot  # noqa: E402
-from facdigger.data.snapshots import build_dataset_snapshot, sha256_file  # noqa: E402
+from facdigger.data.snapshots import sha256_file  # noqa: E402
 from facdigger.inference.factor_batch import load_factor_batch  # noqa: E402
 from facdigger.inference.history import (  # noqa: E402
     HistoricalReplayConfig,
@@ -29,81 +28,6 @@ from facdigger.models.patchtst_pretrain import FinancialPatchTSTPretrainer  # no
 from facdigger.models.patchtst_transfer import module_fingerprint  # noqa: E402
 from facdigger.training.e3 import run_e3  # noqa: E402
 from facdigger.training.e3_config import E3ExperimentConfig  # noqa: E402
-
-
-def _sessions(count: int) -> list[date]:
-    sessions = []
-    current = date(2022, 1, 3)
-    while len(sessions) < count:
-        if current.weekday() < 5:
-            sessions.append(current)
-        current += timedelta(days=1)
-    return sessions
-
-
-def _snapshot(tmp_path):
-    calendar = _sessions(85)
-    bars = []
-    universe = []
-    for security_index in range(6):
-        security_id = f"sec-{security_index}"
-        for index, trade_date in enumerate(calendar):
-            close = 20.0 + security_index * 3 + index * (0.02 + security_index * 0.002)
-            volume = 1_000_000.0 + security_index * 100_000 + index
-            bars.append(
-                {
-                    "security_id": security_id,
-                    "symbol": f"S{security_index}",
-                    "trade_date": trade_date,
-                    "open": close - 0.05,
-                    "high": close + 0.2,
-                    "low": close - 0.2,
-                    "close": close,
-                    "volume": volume,
-                    "dollar_volume": close * volume,
-                    "adj_factor": 1.0,
-                    "source_revision": "synthetic-e3",
-                }
-            )
-            universe.append(
-                {
-                    "security_id": security_id,
-                    "symbol": f"S{security_index}",
-                    "trade_date": trade_date,
-                    "listed_days": 300 + index,
-                    "exchange": "XNAS",
-                    "security_type": "common_stock",
-                    "is_primary_listing": True,
-                    "is_listed": True,
-                    "is_delisted": False,
-                    "is_halted": False,
-                    "industry_code": "TECH" if security_index < 3 else "FIN",
-                    "float_market_cap": float(1_000_000_000 * (security_index + 1)),
-                    "close": close,
-                    "adv20_usd": close * volume,
-                    "eligible": True,
-                }
-            )
-    bronze = tmp_path / "bronze"
-    bronze.mkdir()
-    bars_path = bronze / "bars.parquet"
-    universe_path = bronze / "universe.parquet"
-    pl.DataFrame(bars).write_parquet(bars_path)
-    pl.DataFrame(universe).write_parquet(universe_path)
-    config = DatasetBuildConfig.model_validate(
-        {
-            "sources": {"bars": bars_path, "universe": universe_path},
-            "output_root": tmp_path / "snapshots",
-            "features": {"context_length": 20},
-            "split": {
-                "train_end": calendar[42],
-                "valid_end": calendar[62],
-                "test_end": calendar[80],
-                "embargo_sessions": 2,
-            },
-        }
-    )
-    return build_dataset_snapshot(config)[0]
 
 
 def _experiment(tmp_path) -> E3ExperimentConfig:
@@ -182,14 +106,12 @@ def _initializer() -> tuple[FinancialPatchTSTPretrainer, dict]:
         "source_model": "synthetic-test-source",
         "source_revision": "test",
         "source_weights_sha256": "synthetic-source-hash",
-        "fingerprints": {
-            "financial_pretrainer_after_transfer": module_fingerprint(model.backbone)
-        },
+        "fingerprints": {"financial_pretrainer_after_transfer": module_fingerprint(model.backbone)},
     }
 
 
 def test_e3_runner_writes_pretraining_chain_and_evaluation_artifacts(tmp_path) -> None:
-    snapshot = _snapshot(tmp_path)
+    snapshot = build_price_volume_snapshot(tmp_path)
     run_dir, metrics = run_e3(
         _experiment(tmp_path),
         snapshot,
@@ -217,21 +139,11 @@ def test_e3_runner_writes_pretraining_chain_and_evaluation_artifacts(tmp_path) -
     assert manifest["status"] == "complete"
     assert manifest["pretraining_leakage_audit"]["formal_validation_rows_used"] == 0
     assert manifest["pretraining_leakage_audit"]["formal_test_rows_used"] == 0
-    assert manifest["weight_loading"]["financial_backbone_to_alpha"][
-        "loaded_numel_ratio"
-    ] == 1.0
-    assert manifest["finetuning"]["stage_audits"]["ft0_head_only"][
-        "encoder_changed"
-    ] is False
-    assert manifest["finetuning"]["stage_audits"]["ft1_last_blocks"][
-        "encoder_changed"
-    ] is True
-    assert manifest["input"]["feature_scaler_sha256"] == sha256_file(
-        snapshot / "scaler.json"
-    )
-    assert manifest["predictions_sha256"] == sha256_file(
-        run_dir / "predictions.parquet"
-    )
+    assert manifest["weight_loading"]["financial_backbone_to_alpha"]["loaded_numel_ratio"] == 1.0
+    assert manifest["finetuning"]["stage_audits"]["ft0_head_only"]["encoder_changed"] is False
+    assert manifest["finetuning"]["stage_audits"]["ft1_last_blocks"]["encoder_changed"] is True
+    assert manifest["input"]["feature_scaler_sha256"] == sha256_file(snapshot / "scaler.json")
+    assert manifest["predictions_sha256"] == sha256_file(run_dir / "predictions.parquet")
 
     replay_dir, replay_manifest = run_inference(
         run_dir, output_dir=tmp_path / "replay", device="cpu"
@@ -242,7 +154,7 @@ def test_e3_runner_writes_pretraining_chain_and_evaluation_artifacts(tmp_path) -
 
 
 def test_e3_release_inference_snapshot_to_factor_batch(tmp_path, monkeypatch) -> None:
-    snapshot = _snapshot(tmp_path)
+    snapshot = build_price_volume_snapshot(tmp_path)
     run_dir, _ = run_e3(
         _experiment(tmp_path),
         snapshot,
@@ -295,7 +207,7 @@ def test_e3_release_inference_snapshot_to_factor_batch(tmp_path, monkeypatch) ->
     assert "labels" not in inference_manifest["artifacts"]
     assert "sample_index" not in inference_manifest["artifacts"]
     assert factors.columns == ["security_id", "symbol", "asof_date", "score", "eligible"]
-    assert factors["asof_date"].unique().to_list() == [_sessions(85)[-1]]
+    assert factors["asof_date"].unique().to_list() == [sessions(85)[-1]]
     assert batch_manifest["source"]["kind"] == "signal_inference"
     assert batch_manifest["model"]["release_id"] == release.release_id
     assert batch_manifest["input"]["snapshot_id"] == inference_manifest["snapshot_id"]
@@ -313,9 +225,7 @@ def test_e3_release_inference_snapshot_to_factor_batch(tmp_path, monkeypatch) ->
             "acknowledge_non_oos": True,
         }
     )
-    overlapping_config = history_config.model_copy(
-        update={"output_root": inference_dir}
-    )
+    overlapping_config = history_config.model_copy(update={"output_root": inference_dir})
     with pytest.raises(DataContractError, match="must not overlap"):
         run_historical_replay(overlapping_config)
     assert not (inference_dir / history_config.history_id).exists()
@@ -344,9 +254,7 @@ def test_e3_release_inference_snapshot_to_factor_batch(tmp_path, monkeypatch) ->
     assert history_factors["asof_date"].n_unique() > 1
     assert history_factors["eligible"].all()
 
-    latest_history = history_factors.filter(
-        pl.col("asof_date") == factors["asof_date"].max()
-    )
+    latest_history = history_factors.filter(pl.col("asof_date") == factors["asof_date"].max())
     assert latest_history.select("security_id", "symbol", "asof_date").equals(
         factors.select("security_id", "symbol", "asof_date")
     )
@@ -376,9 +284,9 @@ def test_e3_release_inference_snapshot_to_factor_batch(tmp_path, monkeypatch) ->
     assert resumed_dir == history_dir
     assert [item[0] for item in resume_progress] == ["verified"]
     assert resumed_manifest.partitions == history_manifest.partitions
-    assert {
-        path.name for path in (history_dir / "factor_batches").iterdir()
-    } == {history_manifest.partitions[0].delivery_id}
+    assert {path.name for path in (history_dir / "factor_batches").iterdir()} == {
+        history_manifest.partitions[0].delivery_id
+    }
 
     completed_dir, completed_manifest = run_historical_replay(history_config)
     assert completed_dir == history_dir

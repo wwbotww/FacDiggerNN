@@ -15,15 +15,18 @@ import polars as pl
 from facdigger.data.adapters import StandardParquetAdapter
 from facdigger.data.config import InferenceSnapshotConfig
 from facdigger.data.contracts import DataContractError
+from facdigger.data.paths import artifact_path
 from facdigger.data.snapshots import sha256_file
 from facdigger.datasets.index import build_inference_index
 from facdigger.experiments.manifest import sha256_json
-from facdigger.features.price_volume import build_price_volume_features
-from facdigger.features.scaling import apply_robust_scaler
+from facdigger.features.pipeline import (
+    apply_feature_scaler,
+    build_raw_feature_tables,
+    validate_feature_scaler,
+)
 from facdigger.inference.releases import (
     ModelReleaseManifest,
     load_model_release,
-    validate_release_identity_policy,
 )
 
 INFERENCE_SNAPSHOT_CONTRACT = "facdigger.inference_snapshot"
@@ -48,10 +51,7 @@ def _source_hashes(config: InferenceSnapshotConfig) -> dict[str, str | None]:
     missing = [name for name, path in paths.items() if path is not None and not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Configured inference source files do not exist: {missing}")
-    return {
-        name: sha256_file(path) if path is not None else None
-        for name, path in paths.items()
-    }
+    return {name: sha256_file(path) if path is not None else None for name, path in paths.items()}
 
 
 def _feature_audit(features: pl.DataFrame) -> dict[str, Any]:
@@ -63,15 +63,6 @@ def _feature_audit(features: pl.DataFrame) -> dict[str, Any]:
             for column in observed
         },
     }
-
-
-def _artifact_path(root: Path, relative: str, name: str) -> Path:
-    path = (root / relative).resolve()
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise DataContractError(f"inference snapshot artifact escapes directory: {name}") from exc
-    return path
 
 
 def _validate_snapshot_files(
@@ -109,20 +100,20 @@ def _validate_snapshot_files(
         raise DataContractError("existing inference snapshot identity does not match")
     expected_feature_contract = {
         "release_id": release.release_id,
-        "feature_set": release.feature_contract.feature_set,
-        "channels": release.feature_contract.channels,
-        "context_length": release.feature_contract.context_length,
-        "scaler_contract": release.feature_contract.scaler_contract,
-        "scaler_sha256": release.feature_contract.scaler_sha256,
-        "identity_policy": release.feature_contract.identity_policy,
+        **release.feature_contract.model_dump(mode="json"),
     }
     if manifest.get("feature_contract") != expected_feature_contract:
         raise DataContractError("inference snapshot feature contract differs from ModelRelease")
     artifacts = manifest.get("artifacts") or {}
     artifact_hashes = manifest.get("artifact_hashes") or {}
-    if not isinstance(artifacts, dict) or set(artifacts) != INFERENCE_SNAPSHOT_ARTIFACTS:
+    expected_artifacts = INFERENCE_SNAPSHOT_ARTIFACTS | (
+        {"market_features"}
+        if release.feature_contract.feature_set == "finance_transformer"
+        else set()
+    )
+    if not isinstance(artifacts, dict) or set(artifacts) != expected_artifacts:
         raise DataContractError("inference snapshot artifact declarations are invalid")
-    required_artifacts = INFERENCE_SNAPSHOT_ARTIFACTS - {"source_manifest"}
+    required_artifacts = expected_artifacts - {"source_manifest"}
     if any(not isinstance(artifacts[name], str) for name in required_artifacts):
         raise DataContractError("required inference snapshot artifacts must name files")
     if artifacts["source_manifest"] is not None and not isinstance(
@@ -137,21 +128,23 @@ def _validate_snapshot_files(
         relative = artifacts.get(name)
         if not isinstance(relative, str):
             raise DataContractError(f"inference snapshot artifact is undeclared: {name}")
-        path = _artifact_path(snapshot_dir, relative, name)
+        path = artifact_path(snapshot_dir, relative, name, require_file=False)
         if not path.is_file() or sha256_file(path) != expected_hash:
             raise DataContractError(f"inference snapshot artifact integrity failure: {name}")
         paths[name] = path
     expected_files = {"manifest.json"} | {
-        str(relative) for relative in artifacts.values() if relative is not None
+        artifact_path(snapshot_dir, relative, "inference artifact").relative_to(
+            snapshot_dir
+        ).as_posix()
+        for relative in artifacts.values() if relative is not None
     }
     actual_entries = {
-        str(path.relative_to(snapshot_dir)) for path in snapshot_dir.rglob("*")
+        path.relative_to(snapshot_dir).as_posix() for path in snapshot_dir.rglob("*")
     }
     if actual_entries != expected_files:
         raise DataContractError("inference snapshot contains undeclared or missing entries")
     if sha256_file(paths["scaler"]) != release.feature_contract.scaler_sha256:
         raise DataContractError("inference snapshot scaler differs from ModelRelease")
-    validate_release_identity_policy(release, paths["features"])
     return manifest, paths
 
 
@@ -159,7 +152,7 @@ def _validated_inference_tables(
     inference_index: pl.DataFrame,
     delivery_universe: pl.DataFrame,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    if "target" in inference_index.columns or "split" in inference_index.columns:
+    if any(c.startswith("target") or c in {"label", "split"} for c in inference_index.columns):
         raise DataContractError("inference index must not contain target or split")
     required_index = {
         "sample_id",
@@ -235,9 +228,7 @@ def _validated_inference_tables(
     )
     scored_candidates = inference_index.select("security_id", "symbol", "asof_date")
     if not eligible_candidates.equals(scored_candidates, null_equal=True):
-        raise DataContractError(
-            "delivery eligibility does not exactly match the inference index"
-        )
+        raise DataContractError("delivery eligibility does not exactly match the inference index")
     return inference_index, delivery_universe
 
 
@@ -263,33 +254,35 @@ def _release_scaler(
     release_dir: Path,
 ) -> tuple[ModelReleaseManifest, dict[str, Any], str]:
     release = load_model_release(release_dir)
-    if (
-        release.feature_contract.feature_set != "price_volume_v1"
-        or release.feature_contract.scaler_contract != "train_global_robust"
-    ):
-        raise DataContractError("inference builder does not support the release feature contract")
+    if release.feature_contract.scaler_contract != "train_global_robust":
+        raise DataContractError("inference builder does not support the release scaler contract")
     scaler_artifact = release.artifacts["scaler"]
     scaler_path = release_dir / scaler_artifact.file
     scaler = json.loads(scaler_path.read_text(encoding="utf-8"))
     if not isinstance(scaler, Mapping):
         raise DataContractError("release scaler must be a JSON mapping")
-    channels = list(release.feature_contract.channels)
-    if set((scaler.get("channels") or {}).keys()) != set(channels):
-        raise DataContractError("release scaler channels differ from its feature contract")
+    validate_feature_scaler(
+        scaler,
+        feature_set=release.feature_contract.feature_set,
+        channels=release.feature_contract.channels,
+        market_channels=getattr(release.feature_contract, "market_channels", []),
+    )
     return release, dict(scaler), scaler_artifact.sha256
 
 
-def _require_compatible_source(
-    config: InferenceSnapshotConfig,
-    release: ModelReleaseManifest,
+def _require_source_provenance(
+    config: InferenceSnapshotConfig, release_dir: Path, release: ModelReleaseManifest,
 ) -> None:
-    if release.feature_contract.identity_policy != "eodhd_isin_only":
-        return
-    if config.sources.source_manifest is None:
-        raise DataContractError("EODHD inference requires a source provenance manifest")
-    source = json.loads(config.sources.source_manifest.read_text(encoding="utf-8"))
-    if source.get("provider") != "eodhd":
-        raise DataContractError("EODHD release requires EODHD inference inputs")
+    """Preserve source-proof requirements independently of consumer identity policy."""
+    training_manifest = json.loads(artifact_path(
+        release_dir, release.artifacts["training_dataset_manifest"].file,
+        "release training dataset manifest",
+    ).read_text(encoding="utf-8"))
+    if (training_manifest.get("artifacts") or {}).get("source_manifest") is not None:
+        if config.sources.source_manifest is None:
+            raise DataContractError(
+                "inference requires source provenance because the training snapshot used it"
+            )
 
 
 def _delivery_universe(
@@ -308,10 +301,9 @@ def _delivery_universe(
         )
         .join(scorable, on=["security_id", "asof_date"], how="left")
         .with_columns(
-            (
-                pl.col("_source_eligible")
-                & pl.col("_has_model_window").fill_null(False)
-            ).alias("eligible")
+            (pl.col("_source_eligible") & pl.col("_has_model_window").fill_null(False)).alias(
+                "eligible"
+            )
         )
         .select("security_id", "symbol", "asof_date", "eligible")
         .sort(["asof_date", "security_id"])
@@ -328,7 +320,7 @@ def build_inference_snapshot(
 
     release_path = Path(release_dir).resolve()
     release, scaler, scaler_hash = _release_scaler(release_path)
-    _require_compatible_source(config, release)
+    _require_source_provenance(config, release_path, release)
     feature_contract = release.feature_contract.model_dump(mode="json")
     adapter = StandardParquetAdapter(config.sources)
     semantic_config = config.model_dump(mode="json")
@@ -339,23 +331,13 @@ def build_inference_snapshot(
     identity = {
         "contract": INFERENCE_SNAPSHOT_CONTRACT,
         "config": semantic_config,
-        "feature_contract": {
-            "release_id": release.release_id,
-            "feature_set": feature_contract["feature_set"],
-            "channels": feature_contract["channels"],
-            "context_length": feature_contract["context_length"],
-            "scaler_contract": feature_contract["scaler_contract"],
-            "scaler_sha256": scaler_hash,
-            "identity_policy": feature_contract["identity_policy"],
-        },
+        "feature_contract": {"release_id": release.release_id, **feature_contract},
         "input_file_hashes": _source_hashes(config),
     }
     snapshot_id = sha256_json(identity)
     base_output_root = config.output_root.resolve()
     output_root = (
-        base_output_root / asof_date.isoformat()
-        if asof_date is not None
-        else base_output_root
+        base_output_root / asof_date.isoformat() if asof_date is not None else base_output_root
     )
     final_dir = output_root / snapshot_id
     if final_dir.exists():
@@ -375,7 +357,7 @@ def build_inference_snapshot(
         universe = bundle.universe
         feature_bars = bundle.bars
         feature_universe = universe
-        if asof_date is not None:
+        if asof_date is not None and release.feature_contract.feature_set == "price_volume_v1":
             context_length = int(feature_contract["context_length"])
             session_dates = sorted(feature_bars["trade_date"].unique().to_list())
             eligible_dates = [day for day in session_dates if day <= asof_date]
@@ -391,17 +373,13 @@ def build_inference_snapshot(
                 pl.col("trade_date").is_between(feature_start, asof_date)
             )
             target_universe = universe.filter(pl.col("trade_date") == asof_date)
-            if release.feature_contract.identity_policy == "eodhd_isin_only":
-                target_universe = target_universe.filter(
-                    pl.col("security_id").str.starts_with("eodhd:isin:")
-                )
             if target_universe.is_empty():
                 raise DataContractError(
                     f"inference source has no target session {asof_date.isoformat()}"
                 )
-            scorable_ids = target_universe.filter(pl.col("eligible"))[
-                "security_id"
-            ].unique().to_list()
+            scorable_ids = (
+                target_universe.filter(pl.col("eligible"))["security_id"].unique().to_list()
+            )
             if not scorable_ids:
                 raise DataContractError("inference target has no eligible securities")
             feature_bars = feature_bars.filter(
@@ -411,9 +389,7 @@ def build_inference_snapshot(
             first_observations = feature_bars.group_by("security_id").agg(
                 pl.col("trade_date").min().alias("_first_observation")
             )
-            identities = target_universe.filter(
-                pl.col("security_id").is_in(scorable_ids)
-            ).select(
+            identities = target_universe.filter(pl.col("security_id").is_in(scorable_ids)).select(
                 "security_id",
                 "symbol",
                 "eligible",
@@ -430,14 +406,45 @@ def build_inference_snapshot(
                 .filter(pl.col("trade_date") >= pl.col("_first_observation"))
                 .drop("_first_observation")
             )
-        raw_features = build_price_volume_features(feature_bars, feature_universe)
-        features = apply_robust_scaler(raw_features, scaler)
-        del raw_features, bundle
+        elif asof_date is not None:
+            # Cross-sectional features require actual membership on every past date,
+            # including stocks which are no longer eligible on the target date.
+            dates = (
+                universe["trade_date"]
+                .filter(universe["trade_date"] <= asof_date)
+                .unique()
+                .sort()
+                .to_list()
+            )
+            history_sessions = int(feature_contract["context_length"]) + 20
+            if len(dates) < history_sessions:
+                raise DataContractError("inference source has insufficient market history")
+            feature_start = dates[-history_sessions]
+            target_universe = universe.filter(pl.col("trade_date") == asof_date)
+            if target_universe.is_empty():
+                raise DataContractError("inference source has no target session")
+            feature_universe = universe.filter(
+                pl.col("trade_date").is_between(feature_start, asof_date)
+            )
+            feature_bars = feature_bars.filter(
+                pl.col("trade_date").is_between(feature_start, asof_date)
+            )
+        raw_features, raw_market = build_raw_feature_tables(
+            feature_bars, feature_universe, feature_set=release.feature_contract.feature_set
+        )
+        features, market_features = apply_feature_scaler(raw_features, raw_market, scaler)
+        del raw_features, raw_market, bundle
         inference_index = build_inference_index(
             features,
             feature_universe,
             int(feature_contract["context_length"]),
         )
+        if market_features is not None:
+            context_length = int(feature_contract["context_length"])
+            if market_features.height < context_length:
+                raise DataContractError("inference source has insufficient market context")
+            first_scorable_date = market_features["trade_date"].sort()[context_length - 1]
+            inference_index = inference_index.filter(pl.col("asof_date") >= first_scorable_date)
         if asof_date is not None:
             inference_index = inference_index.filter(pl.col("asof_date") == asof_date)
         maximum_date = inference_index["asof_date"].max()
@@ -455,8 +462,10 @@ def build_inference_snapshot(
                 "source_manifest.json" if config.sources.source_manifest is not None else None
             ),
         }
+        if market_features is not None:
+            artifacts["market_features"] = "market_features.parquet"
+            market_features.write_parquet(temporary / artifacts["market_features"])
         features.write_parquet(temporary / artifacts["features"])
-        validate_release_identity_policy(release, temporary / artifacts["features"])
         inference_index.write_parquet(temporary / artifacts["inference_index"])
         delivery_universe.write_parquet(temporary / artifacts["delivery_universe"])
         audit = {
@@ -479,13 +488,14 @@ def build_inference_snapshot(
             },
             "scaler": {"origin": "model_release", "sha256": scaler_hash},
         }
+        if market_features is not None:
+            audit["market_features"] = _feature_audit(market_features)
         (temporary / artifacts["audit"]).write_text(
             json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        (temporary / artifacts["scaler"]).write_text(
-            json.dumps(scaler, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        shutil.copyfile(
+            release_path / release.artifacts["scaler"].file, temporary / artifacts["scaler"]
         )
         if config.sources.source_manifest is not None:
             shutil.copyfile(config.sources.source_manifest, temporary / "source_manifest.json")
