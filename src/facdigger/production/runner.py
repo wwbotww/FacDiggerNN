@@ -8,10 +8,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import polars as pl
+
 from facdigger.data.config import InferenceSnapshotConfig, ParquetSourceConfig
 from facdigger.data.contracts import DataContractError
 from facdigger.data.inference_snapshots import (
     build_inference_snapshot,
+    describe_unscorable,
     load_inference_snapshot,
 )
 from facdigger.data.providers.eodhd.client import EODHDError
@@ -39,6 +42,11 @@ from facdigger.inference.releases import ModelReleaseManifest, load_model_releas
 from facdigger.inference.runner import run_signal_inference
 from facdigger.production.calendar import NEW_YORK, ProductionWindow, production_window
 from facdigger.production.config import ProductionServiceConfig
+from facdigger.production.quality import (
+    assess_daily_quality,
+    assess_market_quality,
+    build_quality_reference,
+)
 from facdigger.production.state import ProductionRecord, ProductionState
 
 TickAction = Literal[
@@ -62,6 +70,7 @@ class ProductionTickResult:
     snapshot_id: str | None = None
     delivery_id: str | None = None
     error: str | None = None
+    quality: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +84,7 @@ class ProductionTickResult:
             "snapshot_id": self.snapshot_id,
             "delivery_id": self.delivery_id,
             "error": self.error,
+            "quality": self.quality,
         }
 
 
@@ -154,7 +164,7 @@ def _wait_record(
         now + timedelta(minutes=config.schedule.retry_minutes),
         window.cutoff_at,
     )
-    state.put(
+    record = state.put(
         window.target_date,
         config.model.release_id,
         "waiting_data",
@@ -169,6 +179,7 @@ def _wait_record(
         attempts,
         next_retry_at=next_retry,
         error=str(error),
+        quality=record.quality_report,
     )
 
 
@@ -193,6 +204,7 @@ def _expired_record(
         window.phase,
         attempts,
         error=error,
+        quality=existing.quality_report if existing else None,
     )
 
 
@@ -246,6 +258,7 @@ def run_production_tick(
                 "expired",
                 latest.attempts,
                 error="publication cutoff reached without a complete target FactorBatch",
+                quality=latest.quality_report,
             )
         if existing is not None and existing.release_id != config.model.release_id:
             raise DataContractError(
@@ -259,6 +272,7 @@ def run_production_tick(
                 existing.attempts,
                 snapshot_id=existing.snapshot_id,
                 delivery_id=existing.delivery_id,
+                quality=existing.quality_report,
             )
         if window.phase == "not_due":
             return ProductionTickResult("not_due", window.target_date, window.phase, 0)
@@ -277,6 +291,7 @@ def run_production_tick(
                 existing.attempts,
                 next_retry_at=existing.next_retry_at,
                 error=existing.error,
+                quality=existing.quality_report,
             )
         if existing is not None and existing.status == "blocked":
             return ProductionTickResult(
@@ -285,6 +300,7 @@ def run_production_tick(
                 window.phase,
                 existing.attempts,
                 error=existing.error,
+                quality=existing.quality_report,
             )
 
         attempts = (existing.attempts if existing else 0) + 1
@@ -310,77 +326,126 @@ def run_production_tick(
             current_end = date.fromisoformat(str(current.manifest["resolved_end"]))
             if current_end > window.target_date:
                 raise DataContractError("production source is newer than requested target")
-            if current_end < window.target_date:
-                provider_config = load_eodhd_config(config.data.provider_config)
-                if not provider_config.refresh or provider_config.cache_ttl_hours != 0:
-                    raise DataContractError(
-                        "daily EODHD config must use refresh=true and cache_ttl_hours=0"
+            reference = existing.quality_reference if existing else None
+            if reference is None:
+                previous_quality = (latest.quality_report or {}) if latest else {}
+                untrusted_reference = (
+                    previous_quality.get("stage") != "inference"
+                    or previous_quality.get("status") == "insufficient"
+                    or (previous_quality.get("computation") or {}).get("missing_fraction", 0) > 0
+                )
+                if (
+                    latest is not None and latest.target_date < window.target_date
+                    and latest.quality_reference is not None and untrusted_reference
+                ):
+                    # A failed/reduced day or interrupted source commit cannot
+                    # become tomorrow's smaller baseline without an inference check.
+                    reference = {
+                        **latest.quality_reference, "target_date": window.target_date.isoformat(),
+                    }
+                else:
+                    source = _source_config(config, current)
+                    reference = build_quality_reference(
+                        pl.read_parquet(source.sources.universe), target_date=window.target_date,
+                        context_length=release.feature_contract.context_length,
                     )
-                provider = EODHDProvider(provider_config)
-                client = provider.client()
-                revision = fetch_daily_revision(
+                state.put(
+                    window.target_date, config.model.release_id, "running", attempts=attempts,
+                    quality_reference=reference,
+                )
+            # Source commit is NOT publication. Every due, unpublished attempt
+            # fetches fresh revisions, including a retry whose CURRENT already ends at D.
+            provider_config = load_eodhd_config(config.data.provider_config)
+            if not provider_config.refresh or provider_config.cache_ttl_hours != 0:
+                raise DataContractError(
+                    "daily EODHD config must use refresh=true and cache_ttl_hours=0"
+                )
+            provider = EODHDProvider(provider_config)
+            client = provider.client()
+            revision = fetch_daily_revision(
+                client,
+                provider_config,
+                revision_start=_revision_start(
+                    current_end,
+                    window.target_date,
+                    config.data.revision_sessions,
+                ),
+                target_date=window.target_date,
+            )
+            require_fresh_daily_requests(revision)
+            try:
+                current = publish_daily_source_revision(
+                    current,
+                    revision,
+                    provider_config,
+                    config.data.store_root,
+                    history_sessions=history_sessions,
+                )
+            except AdjustmentBackfillRequired as required:
+                revision = backfill_adjusted_histories(
                     client,
                     provider_config,
-                    revision_start=_revision_start(
-                        current_end,
-                        window.target_date,
-                        config.data.revision_sessions,
-                    ),
-                    target_date=window.target_date,
+                    revision,
+                    provider_symbols=required.provider_symbols,
+                    history_start=required.history_start,
                 )
                 require_fresh_daily_requests(revision)
-                try:
-                    current = publish_daily_source_revision(
-                        current,
-                        revision,
-                        provider_config,
-                        config.data.store_root,
-                        history_sessions=history_sessions,
-                        minimum_candidate_rows=(
-                            config.inference.minimum_candidate_rows
-                        ),
-                        minimum_eligible_rows=config.inference.minimum_eligible_rows,
-                    )
-                except AdjustmentBackfillRequired as required:
-                    revision = backfill_adjusted_histories(
-                        client,
-                        provider_config,
-                        revision,
-                        provider_symbols=required.provider_symbols,
-                        history_start=required.history_start,
-                    )
-                    require_fresh_daily_requests(revision)
-                    current = publish_daily_source_revision(
-                        current,
-                        revision,
-                        provider_config,
-                        config.data.store_root,
-                        history_sessions=history_sessions,
-                        minimum_candidate_rows=(
-                            config.inference.minimum_candidate_rows
-                        ),
-                        minimum_eligible_rows=config.inference.minimum_eligible_rows,
-                    )
+                current = publish_daily_source_revision(
+                    current,
+                    revision,
+                    provider_config,
+                    config.data.store_root,
+                    history_sessions=history_sessions,
+                )
+            source = _source_config(config, current)
+            universe = pl.read_parquet(source.sources.universe)
+            target_universe = universe.filter(pl.col("trade_date") == window.target_date)
+            target_bars = (
+                pl.scan_parquet(source.sources.bars)
+                .filter(pl.col("trade_date") == window.target_date)
+                .select("security_id", "trade_date").collect()
+            )
+            candidates = target_universe.select(
+                "security_id", "symbol", pl.col("trade_date").alias("asof_date"), "eligible",
+            )
+            quality = assess_daily_quality(
+                candidates, reference=reference, delivery=config.factor_batch.delivery,
+                inference=config.inference, policy=config.quality, stage="source",
+                unscorable=describe_unscorable(target_universe, target_bars, candidates),
+            )
+            state.put(
+                window.target_date, config.model.release_id, "running", attempts=attempts,
+                quality_report=quality,
+            )
+            if quality["violations"]:
+                raise TargetSessionIncomplete(
+                    "source readiness: " + ", ".join(quality["violations"])
+                )
             snapshot_dir, snapshot_manifest = build_inference_snapshot(
-                _source_config(config, current),
+                source,
                 release_dir,
                 asof_date=window.target_date,
             )
             _, snapshot_frames = load_inference_snapshot(snapshot_dir, release)
             computational_universe = snapshot_frames["delivery_universe"]
-            candidate_count = computational_universe.height
-            scorable_count = int(computational_universe["eligible"].sum())
-            if candidate_count < config.inference.minimum_candidate_rows:
+            quality = assess_daily_quality(
+                computational_universe, reference=reference, delivery=config.factor_batch.delivery,
+                inference=config.inference, policy=config.quality, stage="inference",
+                unscorable=describe_unscorable(
+                    target_universe, target_bars, computational_universe,
+                ),
+                market=assess_market_quality(
+                    snapshot_dir, snapshot_manifest, universe, reference, config.quality,
+                ),
+            )
+            quality["snapshot_id"] = snapshot_manifest["snapshot_id"]
+            state.put(
+                window.target_date, config.model.release_id, "running", attempts=attempts,
+                quality_report=quality,
+            )
+            if quality["violations"]:
                 raise TargetSessionIncomplete(
-                    "target computational candidate universe is incomplete: "
-                    f"{candidate_count} < "
-                    f"{config.inference.minimum_candidate_rows}"
-                )
-            if scorable_count < config.inference.minimum_eligible_rows:
-                raise TargetSessionIncomplete(
-                    "target computational eligible universe is incomplete: "
-                    f"{scorable_count} < "
-                    f"{config.inference.minimum_eligible_rows}"
+                    "inference readiness: " + ", ".join(quality["violations"])
                 )
             destination, factor_manifest = run_signal_inference(
                 release_dir,
@@ -411,6 +476,7 @@ def run_production_tick(
                 attempts,
                 snapshot_id=record.snapshot_id,
                 delivery_id=record.delivery_id,
+                quality=record.quality_report,
             )
         except (
             DailyDataNotReady,
@@ -429,7 +495,7 @@ def run_production_tick(
                 retry_observed,
             )
         except Exception as exc:
-            state.put(
+            record = state.put(
                 window.target_date,
                 config.model.release_id,
                 "blocked",
@@ -442,6 +508,7 @@ def run_production_tick(
                 window.phase,
                 attempts,
                 error=f"{type(exc).__name__}: {exc}",
+                quality=record.quality_report,
             )
 
 
@@ -465,6 +532,7 @@ def production_status(config: ProductionServiceConfig) -> dict[str, Any]:
                 "snapshot_id": latest.snapshot_id,
                 "delivery_id": latest.delivery_id,
                 "error": latest.error,
+                "quality": latest.quality_report,
             }
         ),
         "service": health,

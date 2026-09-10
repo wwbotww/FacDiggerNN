@@ -41,6 +41,7 @@ class EODHDDailyRevision:
     source_revision: str
     ingested_at: datetime
     backfilled_provider_symbols: tuple[str, ...] = ()
+    rejected_rows_by_symbol: tuple[tuple[str, int], ...] = ()
 
 
 def _discover(
@@ -72,16 +73,19 @@ def _mapped_rows(
     *,
     source_revision: str,
     ingested_at: datetime,
-) -> tuple[pl.DataFrame | None, int]:
+) -> tuple[pl.DataFrame | None, int, dict[str, int]]:
     valid_by_symbol: dict[str, list[dict[str, Any]]] = {}
     rejected = 0
+    rejected_by_symbol: dict[str, int] = {}
     for symbol, rows in rows_by_symbol.items():
         valid, invalid = filter_valid_eod_rows(rows)
         rejected += len(invalid)
+        if invalid:
+            rejected_by_symbol[symbol] = len(invalid)
         if valid:
             valid_by_symbol[symbol] = valid
     if not valid_by_symbol:
-        return None, rejected
+        return None, rejected, rejected_by_symbol
     return (
         map_eod_bars(
             valid_by_symbol,
@@ -91,6 +95,7 @@ def _mapped_rows(
             consolidate_aliases=False,
         ),
         rejected,
+        rejected_by_symbol,
     )
 
 
@@ -113,6 +118,7 @@ def fetch_daily_revision(
     source_revision = f"eodhd-daily:{target_date.isoformat()}"
     parts: list[pl.DataFrame] = []
     rejected = 0
+    rejected_by_symbol: dict[str, int] = {}
     expected_symbols = set(symbols)
     for session in regular_sessions(revision_start, target_date):
         payload = client.get_json(
@@ -131,13 +137,15 @@ def fetch_daily_revision(
             symbol = f"{code}.{config.exchange_code}" if code else ""
             if symbol in expected_symbols:
                 by_symbol.setdefault(symbol, []).append(row)
-        mapped, invalid = _mapped_rows(
+        mapped, invalid, rejected_symbols = _mapped_rows(
             by_symbol,
             metadata,
             source_revision=source_revision,
             ingested_at=ingested_at,
         )
         rejected += invalid
+        for symbol, count in rejected_symbols.items():
+            rejected_by_symbol[symbol] = rejected_by_symbol.get(symbol, 0) + count
         if mapped is not None:
             parts.append(mapped)
     if not parts:
@@ -162,6 +170,7 @@ def fetch_daily_revision(
         request_log=tuple(client.request_log),
         source_revision=source_revision,
         ingested_at=ingested_at,
+        rejected_rows_by_symbol=tuple(sorted(rejected_by_symbol.items())),
     )
 
 
@@ -181,6 +190,7 @@ def backfill_adjusted_histories(
     metadata = build_metadata_index(list(revision.metadata_rows), config.exchange_code)
     backfill_parts: list[pl.DataFrame] = []
     rejected = revision.rejected_rows
+    rejected_by_symbol = dict(revision.rejected_rows_by_symbol)
     for symbol in requested:
         payload = client.get_json(
             f"eod/{symbol}",
@@ -193,13 +203,15 @@ def backfill_adjusted_histories(
         )
         if not isinstance(payload, list):
             raise EODHDError("EODHD targeted history response is not an array")
-        mapped, invalid = _mapped_rows(
+        mapped, invalid, rejected_symbols = _mapped_rows(
             {symbol: [row for row in payload if isinstance(row, dict)]},
             metadata,
             source_revision=revision.source_revision,
             ingested_at=revision.ingested_at,
         )
         rejected += invalid + sum(not isinstance(row, dict) for row in payload)
+        for rejected_symbol, count in rejected_symbols.items():
+            rejected_by_symbol[rejected_symbol] = rejected_by_symbol.get(rejected_symbol, 0) + count
         if mapped is None:
             raise DailyDataNotReady(f"EODHD returned no targeted history for {symbol}")
         backfill_parts.append(mapped)
@@ -215,6 +227,7 @@ def backfill_adjusted_histories(
         rejected_rows=rejected,
         request_log=tuple(client.request_log),
         backfilled_provider_symbols=tuple(requested),
+        rejected_rows_by_symbol=tuple(sorted(rejected_by_symbol.items())),
     )
 
 
@@ -226,6 +239,7 @@ def daily_revision_audit(revision: EODHDDailyRevision) -> dict[str, Any]:
         "securities": revision.bars["security_id"].n_unique(),
         "symbols_requested": revision.symbol_count,
         "rejected_rows": revision.rejected_rows,
+        "rejected_rows_by_symbol": dict(revision.rejected_rows_by_symbol),
         "requests": list(revision.request_log),
         "backfilled_provider_symbols": list(revision.backfilled_provider_symbols),
     }

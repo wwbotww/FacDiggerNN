@@ -36,3 +36,42 @@ def test_health_requires_recent_heartbeat(tmp_path) -> None:
     with ProductionState(config.state_database) as state:
         state.heartbeat(at=now - timedelta(seconds=181), phase="sleeping")
     assert production_health(config, now=now)["healthy"] is False
+
+
+def test_failed_day_does_not_make_live_service_unhealthy(tmp_path):
+    from datetime import date
+
+    config = _config(tmp_path)
+    now = datetime(2026, 8, 18, 14, tzinfo=timezone.utc)
+    with ProductionState(config.state_database) as state:
+        state.put(date(2026, 8, 17), config.model.release_id, "expired", attempts=4,
+                  quality_report={"status": "insufficient"})
+        state.heartbeat(at=now, phase="sleeping")
+    health = production_health(config, now=now)
+    assert health["healthy"] is True
+    assert health["production"] == {
+        "target_date": "2026-08-17", "status": "expired", "quality": "insufficient",
+    }
+
+
+def test_service_continues_after_waiting_and_blocked_ticks(tmp_path, monkeypatch):
+    import threading
+
+    from facdigger.production.runner import ProductionTickResult
+    from facdigger.production.service import serve_production
+
+    config = _config(tmp_path)
+    stopped = threading.Event()
+    observed = []
+
+    def tick(config, stopped, now):
+        action = ["waiting_data", "blocked", "expired"][len(observed)]
+        observed.append(action)
+        if len(observed) == 3:
+            stopped.set()
+        return ProductionTickResult(action, now.date(), "due", 1)
+
+    monkeypatch.setattr("facdigger.production.service._run_tick_with_heartbeat", tick)
+    monkeypatch.setattr("facdigger.production.service._heartbeat_wait", lambda *args: None)
+    serve_production(config, stop_event=stopped)
+    assert observed == ["waiting_data", "blocked", "expired"]

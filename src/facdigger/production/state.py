@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 ProductionStatus = Literal["waiting_data", "running", "published", "expired", "blocked"]
 
@@ -21,6 +25,8 @@ class ProductionRecord:
     snapshot_id: str | None
     delivery_id: str | None
     error: str | None
+    quality_reference: dict[str, Any] | None = None
+    quality_report: dict[str, Any] | None = None
 
 
 class ProductionState:
@@ -40,10 +46,29 @@ class ProductionState:
                 snapshot_id TEXT,
                 delivery_id TEXT,
                 error TEXT,
+                quality_reference TEXT,
+                quality_report TEXT,
+                last_notice TEXT,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        # Extend existing local ledgers without discarding their pinned releases
+        # or published dates. Serialize migrations with the heartbeat connection.
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info(production_runs)")
+            }
+            for column in ("quality_reference", "quality_report", "last_notice"):
+                if column not in columns:
+                    self._connection.execute(
+                        f"ALTER TABLE production_runs ADD COLUMN {column} TEXT"
+                    )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS service_state (
@@ -67,7 +92,7 @@ class ProductionState:
     def get(self, target: date) -> ProductionRecord | None:
         row = self._connection.execute(
             """SELECT target_date, release_id, status, attempts, next_retry_at,
-                      snapshot_id, delivery_id, error
+                      snapshot_id, delivery_id, error, quality_reference, quality_report
                FROM production_runs WHERE target_date = ?""",
             (target.isoformat(),),
         ).fetchone()
@@ -83,6 +108,8 @@ class ProductionState:
             snapshot_id=row[5],
             delivery_id=row[6],
             error=row[7],
+            quality_reference=json.loads(row[8]) if row[8] else None,
+            quality_report=json.loads(row[9]) if row[9] else None,
         )
 
     def put(
@@ -96,6 +123,8 @@ class ProductionState:
         snapshot_id: str | None = None,
         delivery_id: str | None = None,
         error: str | None = None,
+        quality_reference: dict[str, Any] | None = None,
+        quality_report: dict[str, Any] | None = None,
     ) -> ProductionRecord:
         now = datetime.now(timezone.utc).isoformat()
         self._connection.execute("BEGIN IMMEDIATE")
@@ -105,12 +134,21 @@ class ProductionState:
                 raise ValueError(
                     "release_id cannot change after the target date has entered production"
                 )
+            if existing is not None and existing.quality_reference is not None:
+                if (
+                    quality_reference is not None
+                    and quality_reference != existing.quality_reference
+                ):
+                    raise ValueError("quality reference cannot change within a target date")
+                quality_reference = existing.quality_reference
+            if quality_report is None and existing is not None:
+                quality_report = existing.quality_report
             self._connection.execute(
                 """
                 INSERT INTO production_runs (
                     target_date, release_id, status, attempts, next_retry_at,
-                    snapshot_id, delivery_id, error, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    snapshot_id, delivery_id, error, quality_reference, quality_report, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(target_date) DO UPDATE SET
                     status=excluded.status,
                     attempts=excluded.attempts,
@@ -118,6 +156,8 @@ class ProductionState:
                     snapshot_id=excluded.snapshot_id,
                     delivery_id=excluded.delivery_id,
                     error=excluded.error,
+                    quality_reference=excluded.quality_reference,
+                    quality_report=excluded.quality_report,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -129,6 +169,8 @@ class ProductionState:
                     snapshot_id,
                     delivery_id,
                     error,
+                    json.dumps(quality_reference, sort_keys=True) if quality_reference else None,
+                    json.dumps(quality_report, sort_keys=True) if quality_report else None,
                     now,
                 ),
             )
@@ -138,7 +180,41 @@ class ProductionState:
             raise
         result = self.get(target)
         assert result is not None
+        self._report_transition(result)
         return result
+
+    def _report_transition(self, record: ProductionRecord) -> None:
+        if record.status == "running":
+            return
+        quality = record.quality_report or {}
+        # Ordinary state comparison, not another semantic hash. Attempts, clocks
+        # and changing counts do not emit the same operational alarm repeatedly.
+        notice = json.dumps({
+            "status": record.status,
+            "quality": quality.get("status"),
+            "violations": quality.get("violations", []),
+            "error_type": (record.error or "").split(":", 1)[0],
+        }, sort_keys=True)
+        changed = self._connection.execute(
+            "UPDATE production_runs SET last_notice = ? "
+            "WHERE target_date = ? AND (last_notice IS NULL OR last_notice != ?)",
+            (notice, record.target_date.isoformat(), notice),
+        ).rowcount
+        if not changed:
+            return
+        degraded = quality.get("status") == "degraded"
+        level = logging.INFO if record.status == "published" and not degraded else logging.WARNING
+        logger.log(level, json.dumps({
+            "event": "production_readiness",
+            "target_date": record.target_date.isoformat(),
+            "status": record.status,
+            "quality": quality.get("status"),
+            "violations": quality.get("violations", []),
+            "attempts": record.attempts,
+            "next_retry_at": record.next_retry_at.isoformat() if record.next_retry_at else None,
+            "computation": quality.get("computation"),
+            "delivery": quality.get("delivery"),
+        }, sort_keys=True))
 
     def latest(self) -> ProductionRecord | None:
         row = self._connection.execute(

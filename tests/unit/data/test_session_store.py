@@ -173,8 +173,6 @@ def test_store_is_bounded_and_preserves_listed_day_count(tmp_path) -> None:
         _provider_config(tmp_path),
         store,
         history_sessions=40,
-        minimum_candidate_rows=2,
-        minimum_eligible_rows=2,
     )
 
     bars = pl.read_parquet(updated.root / "bars_daily.parquet")
@@ -214,8 +212,6 @@ def test_adjustment_change_requires_full_hot_history_backfill(tmp_path) -> None:
             _provider_config(tmp_path),
             store,
             history_sessions=40,
-            minimum_candidate_rows=2,
-            minimum_eligible_rows=2,
         )
 
     assert caught.value.provider_symbols == ["AAA.US"]
@@ -245,8 +241,6 @@ def test_adjustment_change_requires_full_hot_history_backfill(tmp_path) -> None:
         _provider_config(tmp_path),
         store,
         history_sessions=40,
-        minimum_candidate_rows=2,
-        minimum_eligible_rows=2,
     )
     assert updated.manifest["daily_update"]["adjustment_changed_securities"] == [
         "eodhd:isin:US0000000001"
@@ -263,7 +257,7 @@ def test_daily_membership_rebuild_covers_gap_and_matches_full_history(tmp_path) 
     revised_bars = full_bars.filter(pl.col("trade_date").is_in(revised_days))
     updated = publish_daily_source_revision(
         current, _revision(revised_days, revised_bars), _provider_config(tmp_path), store,
-        history_sessions=40, minimum_candidate_rows=2, minimum_eligible_rows=2,
+        history_sessions=40,
     )
     observed = pl.read_parquet(updated.root / "universe_daily.parquet")
     expected = build_universe(
@@ -303,6 +297,45 @@ def test_insufficient_membership_warmup_cannot_advance_current(tmp_path) -> None
     with pytest.raises(DataContractError, match="ADV20 warm-up"):
         publish_daily_source_revision(
             current, _revision(days[-3:], _bars(days[-3:])), _provider_config(tmp_path), store,
-            history_sessions=20, minimum_candidate_rows=2, minimum_eligible_rows=2,
+            history_sessions=20,
+        )
+    assert load_current_revision(store).revision_id == current.revision_id
+
+
+def test_missing_stock_keeps_candidate_row_and_does_not_fill_price(tmp_path):
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 8, 10))["trade_date"].to_list()
+    source = _bootstrap_source(tmp_path, days[:-1])
+    store = tmp_path / "store"
+    current = bootstrap_production_store(source, store, history_sessions=40)
+    revised = _bars(days[-10:]).filter(
+        ~((pl.col("symbol") == "BBB") & (pl.col("trade_date") == days[-1]))
+    )
+    updated = publish_daily_source_revision(
+        current, _revision(days[-10:], revised), _provider_config(tmp_path), store,
+        history_sessions=40,
+    )
+    target = pl.read_parquet(updated.root / "universe_daily.parquet").filter(
+        pl.col("trade_date") == days[-1]
+    )
+    assert target.height == 2
+    missing = target.filter(pl.col("symbol") == "BBB")
+    assert missing["eligible"].to_list() == [False]
+    assert missing["close"].to_list() == [None]
+    bars = pl.read_parquet(updated.root / "bars_daily.parquet")
+    assert bars.filter((pl.col("symbol") == "BBB") & (pl.col("trade_date") == days[-1])).is_empty()
+
+
+def test_missing_whole_market_session_is_retryable_and_does_not_advance_store(tmp_path):
+    from facdigger.data.session_store import TargetSessionIncomplete
+
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 8, 10))["trade_date"].to_list()
+    source = _bootstrap_source(tmp_path, days[:-1])
+    store = tmp_path / "store"
+    current = bootstrap_production_store(source, store, history_sessions=40)
+    revised = _bars(days[-10:]).filter(pl.col("trade_date") != days[-3])
+    with pytest.raises(TargetSessionIncomplete, match="missing market sessions"):
+        publish_daily_source_revision(
+            current, _revision(days[-10:], revised), _provider_config(tmp_path), store,
+            history_sessions=40,
         )
     assert load_current_revision(store).revision_id == current.revision_id

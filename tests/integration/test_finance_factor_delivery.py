@@ -290,6 +290,102 @@ def test_finance_scoring_rejects_targets_and_wrong_membership(finance_delivery):
         )
 
 
+def test_partial_finance_signal_keeps_null_row_and_scores_remaining_cross_section(
+    finance_delivery, tmp_path,
+):
+    _, _, release_dir, release, config = finance_delivery
+    last = sessions(165)[-1]
+    # Leave the generic source flag true to prove that a missing real D bar
+    # cannot be scored merely because a provider supplied an optimistic flag.
+    bars = pl.read_parquet(config.sources.bars).filter(
+        ~((pl.col("security_id") == "sec-1") & (pl.col("trade_date") == last))
+    )
+    bars_path = tmp_path / "partial-bars.parquet"
+    bars.write_parquet(bars_path)
+    payload = config.model_dump()
+    payload["sources"]["bars"] = bars_path
+    snapshot, manifest = build_inference_snapshot(
+        InferenceSnapshotConfig.model_validate(payload), release_dir, asof_date=last,
+    )
+    _, frames = load_inference_snapshot(snapshot, release)
+    full = score_inference_rows(
+        load_factor_inference_runtime(release_dir), snapshot_dir=snapshot,
+        snapshot_manifest=manifest, rows=frames["inference_index"],
+    )
+    assert full.height == 4  # sec-0 outside model pool; sec-1 has no observed D bar.
+    delivery = DeliveryConfig.model_validate({
+        "targets": [{"instrument_id": f"S{i}.US"} for i in range(1, 6)],
+        "identities": [{
+            "instrument_id": f"S{i}.US", "security_id": f"sec-{i}",
+            "valid_from": last, "valid_to": last, "evidence": "Synthetic fixture",
+        } for i in range(1, 6)],
+    })
+    bundle, result = run_signal_inference(
+        release_dir, dataset_dir=snapshot, output_root=tmp_path / "partial-batches",
+        delivery=delivery, asof=last.isoformat(),
+    )
+    frame = pl.read_parquet(bundle / "factors.parquet")
+    assert frame.height == 5
+    assert frame.filter(~pl.col("eligible")).select("security_id", "score").rows() == [
+        ("sec-1", None),
+    ]
+    assert_frame_equal(
+        frame.filter(pl.col("eligible")).select("security_id", "asof_date", "score"),
+        full.select("security_id", "asof_date", "score"),
+    )
+    assert result["coverage"]["ratio"] == 1.0
+    assert result["coverage"]["missing_eligible_rows"] == 0
+    assert load_factor_batch(bundle).coverage.scored_eligible_rows == 4
+    audit = json.loads((snapshot / "audit.json").read_text())
+    reasons = audit["delivery_universe"]["latest_unscorable"]
+    assert next(row for row in reasons if row["security_id"] == "sec-1")["reason"] == (
+        "missing_target_bar"
+    )
+
+
+def test_cached_index_cannot_score_unobserved_target_bar(finance_delivery):
+    _, _, release_dir, release, config = finance_delivery
+    last = sessions(165)[-1]
+    snapshot, manifest = build_inference_snapshot(config, release_dir, asof_date=last)
+    features_path = snapshot / manifest["artifacts"]["features"]
+    features = pl.read_parquet(features_path).with_columns(
+        (pl.col("observed_range") & ~(
+            (pl.col("security_id") == "sec-1") & (pl.col("trade_date") == last)
+        )).alias("observed_range"),
+    )
+    features.write_parquet(features_path)
+    # Reproduce a self-consistent older artifact: hashes pass, but its optimistic
+    # index still declares an unobserved D bar scorable. Do not silently reuse it.
+    manifest["artifact_hashes"]["features"] = sha256_file(features_path)
+    (snapshot / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(DataContractError, match="unobserved as-of bar"):
+        load_inference_snapshot(snapshot, release)
+
+
+def test_exact_finance_snapshot_can_record_no_scorable_target_without_filling(
+    finance_delivery, tmp_path,
+):
+    _, _, release_dir, release, config = finance_delivery
+    last = sessions(165)[-1]
+    universe = pl.read_parquet(config.sources.universe).with_columns(
+        (pl.col("eligible") & (pl.col("trade_date") != last)).alias("eligible")
+    )
+    path = tmp_path / "unavailable-universe.parquet"
+    universe.write_parquet(path)
+    payload = config.model_dump()
+    payload["sources"]["universe"] = path
+    snapshot, _ = build_inference_snapshot(
+        InferenceSnapshotConfig.model_validate(payload), release_dir, asof_date=last,
+    )
+    _, frames = load_inference_snapshot(snapshot, release)
+    assert frames["inference_index"].is_empty()
+    assert frames["delivery_universe"].height == 6
+    assert frames["delivery_universe"]["eligible"].sum() == 0
+    audit = json.loads((snapshot / "audit.json").read_text())
+    assert audit["inference_index"]["maximum_asof_date"] is None
+    assert audit["delivery_universe"]["latest_cross_section_rows"] == 6
+
+
 def test_finance_inference_consumes_complete_production_hot_history(finance_delivery, tmp_path):
     _, _, release_dir, _, config = finance_delivery
     source = tmp_path / "production-bronze"
@@ -442,6 +538,19 @@ def test_mixed_identity_pool_delivers_one_target_after_complete_scoring(
     monkeypatch.setattr("facdigger.production.runner._source_config", lambda *_: (
         InferenceSnapshotConfig.model_validate(payload)
     ))
+    monkeypatch.setattr("facdigger.production.runner.load_eodhd_config", lambda _: (
+        SimpleNamespace(refresh=True, cache_ttl_hours=0)
+    ))
+    monkeypatch.setattr("facdigger.production.runner.EODHDProvider", lambda _: (
+        SimpleNamespace(client=lambda: None)
+    ))
+    monkeypatch.setattr("facdigger.production.runner.fetch_daily_revision", lambda *a, **kw: (
+        SimpleNamespace(request_log=({"path": "eod-bulk-last-day/US", "cache_hit": False},))
+    ))
+    monkeypatch.setattr(
+        "facdigger.production.runner.publish_daily_source_revision",
+        lambda *a, **kw: SimpleNamespace(manifest={"resolved_end": last.isoformat()}),
+    )
     production = ProductionServiceConfig.model_validate({
         "data": {"provider_config": tmp_path / "unused-provider.yaml"},
         "model": {"release_root": release_dir.parent, "release_id": release.release_id},
@@ -450,6 +559,7 @@ def test_mixed_identity_pool_delivers_one_target_after_complete_scoring(
             "minimum_candidate_rows": 6, "minimum_eligible_rows": 5,
         },
         "factor_batch": {"output_root": tmp_path / "production-factors", "delivery": delivery},
+        "quality": {"minimum_delivery_eligible_rows": 1},
         "state_database": tmp_path / "production.sqlite3",
     })
     observed = datetime.combine(last, time(20), tzinfo=ZoneInfo("America/New_York"))

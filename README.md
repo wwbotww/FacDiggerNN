@@ -45,7 +45,7 @@ provider / 标准 Parquet
   -> 标准表 + provider-neutral provenance
   -> 训练 snapshot -> E0—E3（历史）/ finance Transformer（当前）
        -> 统一评价 / 精简 walk-forward
-  -> E3 ModelRelease -> 无标签 inference snapshot
+  -> ModelRelease -> 无标签 inference snapshot
        -> 单日 signal FactorBatch / 固定模型全历史回测 FactorBatch
 ```
 
@@ -56,10 +56,10 @@ checkpoint、配置和 scaler 不跨项目传递；它们由 FacDiggerNN 内部�
 ModelRelease 还绑定 source run 原始 predictions 的文件哈希；`factor-batch
 from-predictions` 不会接受修改或重新序列化后的预测文件。全历史回测则直接对无标签
 inference snapshot 重新评分，不读取 predictions 或 target。
-日常推理快照不读取 label 或 split，也不重新拟合 scaler；`facdigger signal` 当前只接受
-E3 ModelRelease，并固定输出单个 as-of 日期的完整候选横截面。`--asof latest` 以候选
+日常推理快照不读取 label 或 split，也不重新拟合 scaler；`facdigger signal` 接受已支持模型的
+ModelRelease，并固定输出单个 as-of 日期的完整候选横截面。`--asof latest` 以候选
 universe 的最新交易日为准，不会退回最近仍有可评分股票的旧日期；全体不可评分时输出
-当日显式无信号批次。
+当日显式无信号批次（诊断能力，不代表清仓指令；每日生产质量门禁禁止发布全不可评分批次）。
 
 ## 当前 Transformer 研究任务
 
@@ -362,16 +362,27 @@ New York 交易时钟、重试状态和单实例锁，因此同一镜像可部�
 
 ```text
 19:00 America/New_York 首次尝试
+  -> 持久化采集前的计算池覆盖基准
   -> fresh EODHD 最近 10 session 修订（首次部署会补齐历史 bronze 到 D 的缺口）
   -> 调整因子变化证券的定向 hot-window 回填
   -> 原子切换 production source CURRENT
+  -> 计算池 / 实际交付池可用性检查
   -> 只为 D 建无标签 inference snapshot
+  -> 实际可评分窗口 / Finance 市场输入检查
   -> 显式固定 release_id 推理
   -> D 的 FactorBatch 原子发布
-  -> ledger 记录 published 后清理为最近 10 个 inference snapshots
+  -> ledger 记录结果；推理快照保留最近 10 个交易日、每天最近 2 次尝试
 ```
 
-失败时每 30 分钟重试，到下一 regular session 09:30 ET 截止。只有 D 完整通过才发布；
+局部缺数时，该交付股票保留 `eligible=false, score=null` 行，其余可评分股票仍在完整可用
+计算横截面上推理，最后投影交付子集，不补价格、不补分数。默认容忍计算池损失不超过 5%、
+交付池不可评分不超过 20%，且交付至少 3 只可评分；可在 `quality` 中调整。计算池仍受
+`inference.minimum_*` 绝对数量约束，Finance 还检查共享市场输入。
+
+异常缺失或暂时性供应商错误每 30 分钟重新采集，到下一 regular session 09:30 ET 截止。
+即使 source 已更新到 D，只要尚未发布，重试也会重新获取修订；不会反复推理同一份缺数源。
+只有 D 的可用性与完整性检查都通过才发布，少量不可评分行不等于交付不完整。
+超过截止跳过 D，契约/身份/模型错误阻断 D 并告警；常驻服务继续等待后续交易日。
 不会使用旧 FactorBatch，也不会改写 `data/snapshots/` 或
 `data/walk_forward_snapshots/`。FactorBatch 永久保留。生产 source
 只保存约 `context_length + 20` 个 session 的 bars、同窗口逐日 universe 和当前/上一修订，避免
@@ -381,7 +392,13 @@ New York 交易时钟、重试状态和单实例锁，因此同一镜像可部�
 若已有旧 production store 只保存单日 universe，新代码会拒绝加载。请将本地生产配置的
 `data.store_root` 指向新空目录，再从已验证历史 bronze 执行 `production bootstrap`；不要用今日
 成员补写历史，也不要修改训练 snapshot。日常修订会连同修订区间及缺口日期重建成员资格，
-保留区间外的历史状态；ADV20 预热不足时停止发布。
+保留区间外的历史状态；整体 ADV20 预热不足时停止发布，局部不足明确标记不可评分并计入门禁。
+
+`production status` 的 `latest.quality` 区分 `ready/degraded/insufficient`，记录计算/交付
+计数、缺数原因和市场检查；Docker 日志输出状态变化告警并去重。`production health` 判断
+心跳存活，同时附带最新业务状态，不能把“容器健康”当作“今日可以调仓”。
+HeyBoss 仍需按[局部缺分持仓保护交接](docs/HeyBoss局部缺分持仓保护交接.md)修改消费和执行：
+不可评分不代表卖出，未完成该保护前不要自动消费降级批次。
 
 首次配置：
 

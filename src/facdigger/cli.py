@@ -1078,10 +1078,13 @@ def production_serve_command(
 ) -> None:
     """Run the portable container-owned scheduler until SIGTERM or SIGINT."""
 
+    import logging
+
     from facdigger.production.config import load_production_config
     from facdigger.production.service import serve_production
 
     try:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
         serve_production(load_production_config(config))
     except Exception as exc:
         typer.echo(str(exc), err=True)

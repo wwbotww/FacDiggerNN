@@ -27,12 +27,22 @@ inference:
   minimum_candidate_rows: 100
   minimum_eligible_rows: 100
 
+quality:
+  # Operational readiness, independent of FactorBatch's strict 100% row/score integrity.
+  # The computational reference is fixed BEFORE fetching D and persists across retries.
+  max_computational_missing_fraction: 0.05
+  max_delivery_unscorable_fraction: 0.20
+  # Align with HeyBoss's portfolio minimum (e.g. Top 3); not the computational minimum.
+  minimum_delivery_eligible_rows: 3
+
 factor_batch:
   output_root: artifacts/factor_batches
   retention: forever
   # Required before running ticks: replace null with the complete mapping from
   # configs/inference/heyboss_delivery.example.yaml, confirmed by both projects.
   # This is an embedded mapping (targets + identities), not a filename.
+  # Local gaps keep eligible=false / score=null rows. Enable automated consumption
+  # only after HeyBoss's unscorable-position protection has been implemented and tested.
   delivery: null
 
 state_database: data/production/production.sqlite3

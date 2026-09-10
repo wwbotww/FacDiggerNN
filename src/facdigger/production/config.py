@@ -53,6 +53,14 @@ class ProductionInferenceConfig(StrictModel):
     minimum_eligible_rows: int = Field(default=100, ge=1)
 
 
+class ProductionQualityConfig(StrictModel):
+    """Operational tolerances; never weaken FactorBatch row/score integrity."""
+
+    max_computational_missing_fraction: float = Field(default=0.05, ge=0, lt=1)
+    max_delivery_unscorable_fraction: float = Field(default=0.20, ge=0, lt=1)
+    minimum_delivery_eligible_rows: int = Field(default=3, ge=1)
+
+
 class ProductionFactorBatchConfig(StrictModel):
     output_root: Path = Path("artifacts/factor_batches")
     retention: Literal["forever"] = "forever"
@@ -65,6 +73,7 @@ class ProductionServiceConfig(StrictModel):
     data: ProductionDataConfig
     model: ProductionModelConfig
     inference: ProductionInferenceConfig = Field(default_factory=ProductionInferenceConfig)
+    quality: ProductionQualityConfig = Field(default_factory=ProductionQualityConfig)
     factor_batch: ProductionFactorBatchConfig = Field(
         default_factory=ProductionFactorBatchConfig
     )

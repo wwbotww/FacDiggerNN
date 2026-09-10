@@ -113,3 +113,202 @@ def test_transient_provider_failure_waits_exactly_thirty_minutes(
     )
     assert waiting.action == "retry_wait"
     assert waiting.attempts == 1
+
+
+@pytest.fixture
+def daily_tick(tmp_path, monkeypatch):
+    """Real daily ledger/gates, isolated source IO and model execution."""
+    from types import SimpleNamespace
+
+    import polars as pl
+
+    from facdigger.data.providers.eodhd.market_calendar import regular_sessions
+    from facdigger.inference.factor_batch import build_factor_frame
+    from tests.unit.production.test_quality import _delivery
+
+    days = regular_sessions(date(2026, 6, 1), date(2026, 8, 17))
+    history = pl.DataFrame([
+        {"security_id": f"sec-{i}", "symbol": f"S{i}", "trade_date": day, "eligible": True}
+        for day in days for i in range(20)
+    ])
+    source = tmp_path / "source"
+    source.mkdir()
+    history.filter(pl.col("trade_date") < days[-1]).write_parquet(
+        source / "universe_daily.parquet"
+    )
+    current = SimpleNamespace(root=source, manifest={"resolved_end": days[-2].isoformat()})
+    controls = SimpleNamespace(
+        fetches=0, source_missing={}, window_missing={}, published=[], latest_candidates=None,
+        history=history, current=current,
+    )
+    config = _config(tmp_path).model_dump()
+    config["factor_batch"]["delivery"] = _delivery().model_dump()
+    config["inference"].update(minimum_candidate_rows=20, minimum_eligible_rows=18)
+    config = ProductionServiceConfig.model_validate(config)
+    monkeypatch.setattr("facdigger.production.runner._load_fixed_release", lambda _: (
+        tmp_path / "release", SimpleNamespace(feature_contract=SimpleNamespace(context_length=20)),
+    ))
+    monkeypatch.setattr("facdigger.production.runner.load_current_revision", lambda _: current)
+    monkeypatch.setattr("facdigger.production.runner.load_eodhd_config", lambda _: (
+        SimpleNamespace(refresh=True, cache_ttl_hours=0)
+    ))
+    monkeypatch.setattr("facdigger.production.runner.EODHDProvider", lambda _: (
+        SimpleNamespace(client=lambda: object())
+    ))
+
+    def fetch(*args, **kwargs):
+        controls.fetches += 1
+        return object()
+
+    def publish(*args, **kwargs):
+        missing = controls.source_missing.get(controls.fetches, set())
+        frame = history.with_columns(
+            ~((pl.col("trade_date") == days[-1]) & pl.col("security_id").is_in(list(missing)))
+            .alias("eligible")
+        )
+        frame.write_parquet(source / "universe_daily.parquet")
+        frame.filter(pl.col("eligible")).select("security_id", "trade_date").write_parquet(
+            source / "bars_daily.parquet"
+        )
+        current.manifest["resolved_end"] = days[-1].isoformat()
+        return current
+
+    def load_snapshot(*args, **kwargs):
+        frame = pl.read_parquet(source / "universe_daily.parquet").filter(
+            pl.col("trade_date") == days[-1]
+        ).select("security_id", "symbol", pl.col("trade_date").alias("asof_date"), "eligible")
+        window_missing = controls.window_missing.get(controls.fetches, set())
+        frame = frame.with_columns(
+            (pl.col("eligible") & ~pl.col("security_id").is_in(list(window_missing)))
+            .alias("eligible")
+        ).sort("asof_date", "security_id")
+        controls.latest_candidates = frame
+        return {}, {"delivery_universe": frame}
+
+    def infer(*args, **kwargs):
+        kwargs["before_publish"]()
+        from facdigger.inference.delivery import resolve_delivery
+
+        candidates = controls.latest_candidates
+        scores = candidates.filter(pl.col("eligible")).select(
+            "security_id", "asof_date", pl.lit(1.0).alias("score"),
+        )
+        selection = resolve_delivery(candidates, kwargs["delivery"])
+        controls.published.append(build_factor_frame(
+            selection.candidates, selection.project_scores(scores),
+        ))
+        return tmp_path / "bundle", {
+            "time": {"maximum_asof_date": days[-1].isoformat()}, "delivery_id": "delivery",
+        }
+
+    monkeypatch.setattr("facdigger.production.runner.fetch_daily_revision", fetch)
+    monkeypatch.setattr("facdigger.production.runner.require_fresh_daily_requests", lambda _: None)
+    monkeypatch.setattr("facdigger.production.runner.publish_daily_source_revision", publish)
+    monkeypatch.setattr("facdigger.production.runner.build_inference_snapshot", lambda *a, **kw: (
+        tmp_path / "snapshot", {
+            "snapshot_id": "snapshot", "feature_contract": {"feature_set": "price_volume_v1"},
+        },
+    ))
+    monkeypatch.setattr("facdigger.production.runner.load_inference_snapshot", load_snapshot)
+    monkeypatch.setattr("facdigger.production.runner.run_signal_inference", infer)
+    return config, controls
+
+
+def _tick(config, minute=0):
+    observed = datetime(2026, 8, 17, 20, minute, tzinfo=NY)
+    return run_production_tick(config, now=observed, now_provider=lambda: observed)
+
+
+def test_partial_data_publishes_explicit_null_without_old_factor(daily_tick):
+    import polars as pl
+
+    config, controls = daily_tick
+    controls.source_missing[1] = {"sec-0"}
+    result = _tick(config)
+    assert result.action == "published", result.error
+    assert result.quality["status"] == "degraded"
+    assert result.quality["unscorable"][0]["reason"] == "missing_target_bar"
+    frame = controls.published[0]
+    assert frame.height == 5 and frame["eligible"].sum() == 4
+    assert frame.filter(~pl.col("eligible"))["score"].to_list() == [None]
+    assert frame["asof_date"].unique().to_list() == [date(2026, 8, 17)]
+    assert _tick(config, 30).action == "already_published"
+    assert controls.fetches == 1
+
+
+def test_retry_refetches_after_source_commit_and_inference_shortfall(daily_tick):
+    config, controls = daily_tick
+    controls.window_missing[1] = {"sec-0", "sec-1"}
+    first = _tick(config)
+    assert first.action == "waiting_data", first.error
+    assert controls.current.manifest["resolved_end"] == "2026-08-17"
+    assert first.quality["stage"] == "inference"
+    assert _tick(config, 10).action == "retry_wait"
+    second = _tick(config, 30)
+    assert second.action == "published", second.error
+    assert second.quality["status"] == "ready"
+    assert controls.fetches == 2
+    assert second.quality["computation"]["reference_eligible_rows"] == 20
+
+
+def test_retries_keep_original_denominator_when_membership_is_reduced(daily_tick):
+    config, controls = daily_tick
+    controls.source_missing = {1: {"sec-18", "sec-19"}, 2: {"sec-18", "sec-19"}}
+    first = _tick(config)
+    second = _tick(config, 30)
+    assert first.action == second.action == "waiting_data"
+    assert second.quality["computation"]["reference_eligible_rows"] == 20
+    assert second.quality["computation"]["missing_fraction"] == 0.1
+    assert controls.fetches == 2 and not controls.published
+    observed = datetime(2026, 8, 18, 9, 30, tzinfo=NY)
+    expired = run_production_tick(config, now=observed, now_provider=lambda: observed)
+    assert expired.action == "expired"
+    assert expired.quality["status"] == "insufficient"
+    assert not controls.published
+
+
+def test_model_failure_is_not_reclassified_as_missing_input(daily_tick, monkeypatch):
+    from facdigger.data.contracts import DataContractError
+
+    config, controls = daily_tick
+    def fail(*args, **kwargs):
+        raise DataContractError("eligible score is NaN")
+
+    monkeypatch.setattr("facdigger.production.runner.run_signal_inference", fail)
+    result = _tick(config)
+    assert result.action == "blocked"
+    assert result.quality["status"] == "ready"
+    assert "NaN" in result.error
+    assert not controls.published
+
+
+@pytest.mark.parametrize("interrupted_after_commit", [False, True])
+def test_reduced_day_cannot_become_next_days_smaller_reference(
+    daily_tick, monkeypatch, interrupted_after_commit,
+):
+    from facdigger.data.providers.eodhd.daily import DailyDataNotReady
+
+    config, controls = daily_tick
+    controls.source_missing[1] = {"sec-18", "sec-19"}
+    if interrupted_after_commit:
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt("process stopped after source commit")
+
+        monkeypatch.setattr("facdigger.production.runner.assess_daily_quality", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            _tick(config)
+    else:
+        assert _tick(config).action == "waiting_data"
+
+    def unavailable(*args, **kwargs):
+        raise DailyDataNotReady("next day is not ready yet")
+
+    monkeypatch.setattr("facdigger.production.runner.fetch_daily_revision", unavailable)
+    observed = datetime(2026, 8, 18, 20, 0, tzinfo=NY)
+    result = run_production_tick(config, now=observed, now_provider=lambda: observed)
+    assert result.action == "waiting_data"
+    with ProductionState(config.state_database) as state:
+        reference = state.get(observed.date()).quality_reference
+    assert reference["target_date"] == "2026-08-18"
+    assert reference["reference_date"] == "2026-08-14"
+    assert len(reference["security_ids"]) == 20

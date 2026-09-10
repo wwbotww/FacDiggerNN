@@ -24,6 +24,7 @@ def production_health(
     observed = now or datetime.now(timezone.utc)
     with ProductionState(config.state_database) as state:
         health = state.service_health()
+        latest = state.latest()
     if health is None:
         return {"healthy": False, "reason": "service has no heartbeat"}
     heartbeat = datetime.fromisoformat(str(health["heartbeat_at"]))
@@ -34,6 +35,16 @@ def production_health(
         "healthy": timedelta(0) <= age <= maximum_age,
         "age_seconds": age.total_seconds(),
         "maximum_age_seconds": maximum_age.total_seconds(),
+        # Data readiness is not container liveness. A skipped date must not
+        # create restart loops or imply that yesterday's factor is usable.
+        "production": (
+            {
+                "target_date": latest.target_date.isoformat(),
+                "status": latest.status,
+                "quality": (latest.quality_report or {}).get("status"),
+            }
+            if latest else None
+        ),
     }
 
 
@@ -118,12 +129,15 @@ def serve_production(
             try:
                 result = _run_tick_with_heartbeat(config, stopped, now)
                 detail = result.action
-                if result.action in {"published", "already_published"}:
+                if result.action not in {"not_due", "retry_wait"}:
                     prune_inference_snapshots(
                         config.inference.output_root,
                         keep_sessions=config.inference.retention_sessions,
                     )
-                if result.action in {"published", "already_published"}:
+                if (
+                    result.action not in {"not_due", "retry_wait"}
+                    and (config.data.store_root / "CURRENT").is_file()
+                ):
                     current = load_current_revision(config.data.store_root)
                     parent = (current.manifest.get("production_revision") or {}).get(
                         "parent_revision_id"

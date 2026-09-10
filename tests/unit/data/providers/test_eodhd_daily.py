@@ -127,3 +127,27 @@ def test_daily_publication_rejects_cached_eod_requests(tmp_path) -> None:
 
     with pytest.raises(DataContractError, match="fresh"):
         require_fresh_daily_requests(changed)
+
+
+def test_one_invalid_stock_is_audited_without_fabricating_a_bar(tmp_path):
+    class PartialClient(DailyClient):
+        def get_json(self, path, params=None, *, call_cost=1):
+            rows = super().get_json(path, params, call_cost=call_cost)
+            if not rows:
+                return rows
+            if path.startswith("exchange-symbol-list/"):
+                return [*rows, {**rows[0], "Code": "BBB", "Isin": "US0000000002"}]
+            extra = {**rows[0], "code": "BBB"}
+            if extra["date"] == "2026-08-12":
+                extra["high"] = 1  # Illegal OHLC is rejected, never repaired.
+            return [*rows, extra]
+
+    revision = fetch_daily_revision(
+        PartialClient(tmp_path), _config(tmp_path), revision_start=date(2026, 8, 10),
+        target_date=date(2026, 8, 12),
+    )
+    assert revision.rejected_rows == 1
+    assert dict(revision.rejected_rows_by_symbol) == {"BBB.US": 1}
+    target = revision.bars.filter(revision.bars["trade_date"] == date(2026, 8, 12))
+    assert target["symbol"].to_list() == ["AAA"]
+    assert revision.bars.height == 5

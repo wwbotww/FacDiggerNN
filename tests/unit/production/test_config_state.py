@@ -109,3 +109,66 @@ def test_single_process_lock_is_exclusive(tmp_path) -> None:
                 pass
     with ProductionLock(state_path):
         pass
+
+
+def test_quality_reference_survives_restarts_and_cannot_shrink(tmp_path) -> None:
+    target = date(2026, 8, 17)
+    path = tmp_path / "state.sqlite3"
+    reference = {"security_ids": ["A", "B"], "target_date": target.isoformat()}
+    with ProductionState(path) as state:
+        state.put(target, "1" * 64, "running", attempts=1, quality_reference=reference)
+    with ProductionState(path) as state:
+        record = state.put(target, "1" * 64, "waiting_data", attempts=2)
+        assert record.quality_reference == reference
+        with pytest.raises(ValueError, match="reference cannot change"):
+            state.put(target, "1" * 64, "running", attempts=3,
+                      quality_reference={**reference, "security_ids": ["A"]})
+
+
+def test_existing_state_schema_is_extended_without_losing_published_dates(tmp_path) -> None:
+    import sqlite3
+
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("""CREATE TABLE production_runs (
+            target_date TEXT PRIMARY KEY, release_id TEXT NOT NULL, status TEXT NOT NULL,
+            attempts INTEGER NOT NULL, next_retry_at TEXT, snapshot_id TEXT,
+            delivery_id TEXT, error TEXT, updated_at TEXT NOT NULL)""")
+        connection.execute("INSERT INTO production_runs VALUES (?,?,?,?,?,?,?,?,?)", (
+            "2026-08-17", "1" * 64, "published", 2, None, "snapshot", "delivery", None, "old",
+        ))
+    for _ in range(2):
+        with ProductionState(path) as state:
+            row = state.get(date(2026, 8, 17))
+            assert row.status == "published" and row.delivery_id == "delivery"
+            assert row.quality_reference is None and row.quality_report is None
+
+
+def test_repeated_readiness_alarm_is_deduplicated_and_recovery_logged(tmp_path, caplog):
+    import json
+    import logging
+
+    caplog.set_level(logging.INFO, logger="facdigger.production.state")
+    day = date(2026, 8, 17)
+    quality = {"status": "insufficient", "violations": ["missing_data"]}
+    with ProductionState(tmp_path / "state.sqlite3") as state:
+        for attempt in (1, 2):
+            state.put(day, "1" * 64, "running", attempts=attempt)
+            state.put(day, "1" * 64, "waiting_data", attempts=attempt, quality_report=quality,
+                      error="TargetSessionIncomplete: changed counts")
+        state.put(day, "1" * 64, "published", attempts=3,
+                  quality_report={"status": "ready", "violations": []})
+    notices = [json.loads(record.message) for record in caplog.records]
+    assert [notice["status"] for notice in notices] == ["waiting_data", "published"]
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("max_computational_missing_fraction", 1),
+    ("max_delivery_unscorable_fraction", -0.1),
+    ("minimum_delivery_eligible_rows", 0),
+])
+def test_quality_configuration_rejects_invalid_tolerances(tmp_path, field, value):
+    payload = _config(tmp_path).model_dump()
+    payload["quality"][field] = value
+    with pytest.raises(ValueError):
+        ProductionServiceConfig.model_validate(payload)

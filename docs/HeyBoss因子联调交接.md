@@ -6,6 +6,11 @@ FactorBatch 两文件目录；全历史回放的父 plan/state/manifest 只供 F
 Git commit，并用真实 FacDigger 产出的目录做契约测试，不能
 各写一份“看起来相同”的测试 fixture 后就认为联调完成。
 
+当前下一步（2026-09-10）：FacDigger 已实现局部缺数容忍与真实重试，HeyBoss 的持仓保护、
+空组合 SKIP、预期日期/固定 release 消费仍待其会话实施。请优先执行
+[`HeyBoss局部缺分持仓保护交接.md`](HeyBoss局部缺分持仓保护交接.md)，未验收前不要自动消费
+降级批次。本文保留接口总览；第 2 节旧消费者差异是历史背景，不是当前待重做清单。
+
 ## 六项 FacDigger 收尾审计
 
 | 原审计项 | 状态 | 当前实现与证据 |
@@ -26,7 +31,8 @@ Git commit，并用真实 FacDigger 产出的目录做契约测试，不能
 FacDiggerNN 已提供两种来源、同一种文件契约：
 
 - `signal_inference`：单日完整交付候选横截面；使用交付 profile 时指双方事先声明的目标集合，
-  不等于模型完整计算池，后者仍全部参与评分；允许进入人工触发的 paper 验证；
+  不等于模型完整计算池，后者的可评分成员仍全部参与评分；完成消费者保护后才进入
+  人工触发的 paper 验证；
 - `evaluation_predictions`：eligible 且已有分数的历史回测行；既可以来自 release 绑定的原始
   评价 predictions，也可以来自固定 release 对 target-free 历史 snapshot 的重新推理。该枚举
   表达 backtest-only 消费边界，不表示 FactorBatch 含有或读取了标签；只能用于隔离回测。
@@ -56,7 +62,7 @@ Finance 模型的历史子集导出会先在快照完整日横截面上计算，
 
 | 列 | Arrow/Parquet 类型 | 规则 |
 |---|---|---|
-| `security_id` | string | 稳定主身份，EODHD production release 使用 `eodhd:isin:*` |
+| `security_id` | string | 实际交付集合的稳定身份；ISIN 或经双方确认、具有明确有效期的可靠映射 |
 | `symbol` | string | 只用于显示和审计，不能作为自动映射键 |
 | `asof_date` | date32/date | 信息截止交易日 |
 | `score` | float64 nullable | eligible 时有限且非空；否则必须为空 |
@@ -103,11 +109,12 @@ universe_sha256 = digest.hexdigest()
 
 HeyBoss 应从收到的 Parquet 独立重算，不能只检查字段格式。
 
-## 2. HeyBoss 当前实现的 P0 差异
+## 2. 消费者契约与早期差异（旧差异已完成同步）
 
 2026-08-12 对 HeyBoss 工作树做只读核查后，已有 importer、`FactorScoreData`、NT Catalog、
-`PatchTSTFactorActor`、backtest/paper 分区和相关测试，主链路不需要重写。但当前
-`trading_assistant/data/factor.py` 仍实现旧契约，会拒绝所有现行 FacDigger 批次：
+`PatchTSTFactorActor`、backtest/paper 分区和相关测试。当时的
+`trading_assistant/data/factor.py` 仍实现旧契约，存在以下差异；现行导入器已经同步，
+并通过上文的小型跨仓导入验证。此清单仅解释为何旧实施材料不能继续使用：
 
 1. 仍要求 `delivery_id == artifact.sha256`，应改为上面的完整语义哈希；
 2. `model` 缺少必需的 `score_semantics`；
@@ -132,7 +139,7 @@ HeyBoss 应从收到的 Parquet 独立重算，不能只检查字段格式。
 
 HeyBoss 应继续失败关闭并只接受：
 
-- `model_type=financial_pretrained_patchtst`；
+- `model_type` 为合法来源元数据，不按 E3 名称建立模型白名单；
 - `score_semantics=raw_cross_sectional_rank_score`（中性化上线前）；
 - `higher_score_is_better=true`；
 - `calendar=US_EQUITIES_REGULAR` 且显式记录非空 `calendar_version`；
@@ -147,7 +154,9 @@ HeyBoss 应继续失败关闭并只接受：
 
 ## 3. HeyBoss 项目侧实施任务
 
-建议按以下四个小提交实施，任一步失败都不要继续到 paper：
+以下 H1—H4 是通路检查顺序：H1 契约同步及 H2 日期身份解析代码已具备，不需要重复实现；
+真实身份配置、价格覆盖、当前[缺分保护交接](HeyBoss局部缺分持仓保护交接.md)和 H3/H4 的
+真实数据/执行验收仍需完成。任一步失败都不要继续到 paper：
 
 建议 HeyBoss 侧直接把本文件作为任务输入，并以 FacDigger
 `codex/factor-batch-v1-release` 分支最终提交的 commit 为生产者基线；不要继续以原
@@ -190,9 +199,10 @@ HeyBoss instrument、明确的有效期与证据。模板见
 过期会使批次失败，不能静默漏交。ISIN 缺失可以经可靠映射补足；训练中不交付股票的 fallback
 不阻止 release，也不会提前从模型计算池删除。
 
-当前消费者的静态 `factor_security_id` 适合不变的身份。若回测跨越历史 ISIN 变更，应在
-HeyBoss 增加按日期解析的身份区间；在该扩展部署前，不得把历史 ISIN 改写成当前 ISIN 来通过
-静态匹配。FacDigger 不替 HeyBoss 猜测上市主体或交易路由，也不修改其真实标的配置。
+当前消费者的静态 `factor_security_id` 适合不变的身份；跨历史 ISIN 变更应配置已实现的
+`factor_identity_periods`，按日期解析并验证唯一映射。代码支持不等于真实标的配置已补齐：
+不得把历史 ISIN 改写成当前 ISIN 来通过静态匹配。FacDigger 不替 HeyBoss 猜测上市主体或
+交易路由，也不修改其真实标的配置。
 
 每个当日 active 的交付目标必须在候选表中存在；不要求 HeyBoss 映射完整 top-1000 计算池。
 合法 ineligible 行仍交付为 null；eligible 行缺 signal/execution bar 必须停止导入。
@@ -249,8 +259,9 @@ uv run --frozen --env-file .env python scripts/run_backtest.py
 FacDigger 的 `signal --asof latest` 以 `delivery_universe` 的最新候选交易日为准，不以“最近
 仍有 eligible 模型窗口的日期”为准。若当日完整候选横截面存在但全部不可评分，会发布该日
 `eligible=false, score=null` 的无信号批次；不会静默回退到上一交易日。若指定日期根本不在
-候选 universe 中则失败关闭。HeyBoss 应把无信号批次当作显式 flat/no-new-target 语义，并仍
-执行过期与完整性检查。
+候选 universe 中则失败关闭。这是 `signal` 的诊断能力；每日生产服务的数量/比例门禁不会
+发布全不可评分批次。HeyBoss 必须将其解释为 **SKIP／保持持仓**，不是 flat／清仓，也不能
+发送空目标权重事件。仍需执行新鲜度与完整性检查，详见缺分保护交接。
 
 ## 4. FacDigger 侧交付命令
 

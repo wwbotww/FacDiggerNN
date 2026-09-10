@@ -392,10 +392,8 @@ def publish_daily_source_revision(
     store_root: str | Path,
     *,
     history_sessions: int,
-    minimum_candidate_rows: int,
-    minimum_eligible_rows: int,
 ) -> ProductionSourceRevision:
-    """Replace the revision window and atomically advance CURRENT after all gates pass."""
+    """Commit valid source data; production owns scoring and delivery readiness."""
 
     old_bars = validate_bars(pl.read_parquet(current.root / PRODUCTION_SOURCE_FILES["bars"]))
     old_universe = validate_universe(
@@ -472,6 +470,14 @@ def publish_daily_source_revision(
     if start is None or bars["trade_date"].max() != revision.target_date:
         raise DataContractError("merged production bars do not end on the target date")
     calendar = regular_session_frame(start, revision.target_date)
+    missing_sessions = calendar.join(
+        bars.select("trade_date").unique(), on="trade_date", how="anti",
+    )
+    if missing_sessions.height:
+        raise TargetSessionIncomplete(
+            "daily source has missing market sessions: "
+            + ", ".join(day.isoformat() for day in missing_sessions["trade_date"])
+        )
     clean_bars, identity_audit = quarantine_suspicious_identities(
         bars,
         calendar,
@@ -537,21 +543,6 @@ def publish_daily_source_revision(
     target_universe = universe.filter(pl.col("trade_date") == revision.target_date)
     candidate_rows = target_universe.height
     eligible_rows = target_universe.filter(pl.col("eligible")).height
-    if observed_target_rows < minimum_candidate_rows:
-        raise TargetSessionIncomplete(
-            "target session has too few observed EOD bars: "
-            f"{observed_target_rows} < {minimum_candidate_rows}"
-        )
-    if candidate_rows < minimum_candidate_rows:
-        raise TargetSessionIncomplete(
-            "target candidate universe is incomplete: "
-            f"{candidate_rows} < {minimum_candidate_rows}"
-        )
-    if eligible_rows < minimum_eligible_rows:
-        raise TargetSessionIncomplete(
-            "target eligible universe is incomplete: "
-            f"{eligible_rows} < {minimum_eligible_rows}"
-        )
     revision_metadata = {
         "contract": PRODUCTION_SOURCE_CONTRACT,
         "parent_revision_id": current.revision_id,

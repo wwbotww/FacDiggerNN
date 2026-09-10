@@ -244,6 +244,18 @@ def load_inference_snapshot(
         pl.read_parquet(paths["inference_index"]),
         pl.read_parquet(paths["delivery_universe"]),
     )
+    if not inference_index.is_empty():
+        # Both supported feature contracts observe range only from a real OHLC
+        # bar on that date. Check cached snapshots too, not only new builds.
+        observed_bars = (
+            pl.scan_parquet(paths["features"]).filter(pl.col("observed_range"))
+            .select("security_id", pl.col("trade_date").alias("asof_date"))
+        )
+        absent = inference_index.select("security_id", "asof_date").lazy().join(
+            observed_bars, on=["security_id", "asof_date"], how="anti",
+        ).limit(1).collect()
+        if absent.height:
+            raise DataContractError("inference index contains an unobserved as-of bar")
     return manifest, {
         "inference_index": inference_index,
         "delivery_universe": delivery_universe,
@@ -310,6 +322,46 @@ def _delivery_universe(
     )
 
 
+def describe_unscorable(
+    universe: pl.DataFrame, bars: pl.DataFrame, candidates: pl.DataFrame,
+) -> list[dict[str, Any]]:
+    """Explain input eligibility; never turn a failed model score into missing data."""
+    missing = candidates.filter(~pl.col("eligible"))
+    if missing.is_empty():
+        return []
+    dates = missing["asof_date"].unique()
+    metadata = universe.filter(pl.col("trade_date").is_in(dates.implode())).select(
+        "security_id", pl.col("trade_date").alias("asof_date"),
+        pl.col("eligible").alias("_source_eligible"),
+        (
+            pl.col("is_delisted") if "is_delisted" in universe.columns else pl.lit(False)
+        ).alias("_delisted"),
+        (
+            pl.col("adv20_usd").is_null() if "adv20_usd" in universe.columns else pl.lit(False)
+        ).alias("_missing_liquidity_history"),
+    )
+    observed = bars.filter(pl.col("trade_date").is_in(dates.implode())).select(
+        "security_id", pl.col("trade_date").alias("asof_date"),
+        pl.lit(True).alias("_observed_bar"),
+    )
+    reasons = (
+        missing.join(metadata, on=["security_id", "asof_date"], validate="1:1")
+        .join(observed, on=["security_id", "asof_date"], how="left", validate="1:1")
+        .with_columns(
+            pl.when(pl.col("_delisted")).then(pl.lit("not_active"))
+            .when(pl.col("_observed_bar").is_null()).then(pl.lit("missing_target_bar"))
+            .when(pl.col("_source_eligible")).then(pl.lit("insufficient_model_history"))
+            .when(pl.col("_missing_liquidity_history"))
+            .then(pl.lit("insufficient_liquidity_history"))
+            .otherwise(pl.lit("outside_model_universe")).alias("reason"),
+            pl.col("asof_date").dt.strftime("%Y-%m-%d"),
+        )
+        .select("security_id", "symbol", "asof_date", "reason")
+        .sort("asof_date", "security_id")
+    )
+    return reasons.to_dicts()
+
+
 def build_inference_snapshot(
     config: InferenceSnapshotConfig,
     release_dir: str | Path,
@@ -356,6 +408,10 @@ def build_inference_snapshot(
         source_audit = adapter.audit(bundle)
         universe = bundle.universe
         feature_bars = bundle.bars
+        latest_source_date = asof_date or universe["trade_date"].max()
+        audit_bars = bundle.bars.filter(pl.col("trade_date") == latest_source_date).select(
+            "security_id", "trade_date",
+        )
         feature_universe = universe
         if asof_date is not None and release.feature_contract.feature_set == "price_volume_v1":
             context_length = int(feature_contract["context_length"])
@@ -380,8 +436,6 @@ def build_inference_snapshot(
             scorable_ids = (
                 target_universe.filter(pl.col("eligible"))["security_id"].unique().to_list()
             )
-            if not scorable_ids:
-                raise DataContractError("inference target has no eligible securities")
             feature_bars = feature_bars.filter(
                 pl.col("trade_date").is_between(feature_start, asof_date)
                 & pl.col("security_id").is_in(scorable_ids)
@@ -439,6 +493,12 @@ def build_inference_snapshot(
             feature_universe,
             int(feature_contract["context_length"]),
         )
+        # A source eligibility flag cannot manufacture a target-day observation.
+        # Keep masked historical holes, but never score a stock with no actual D bar.
+        inference_index = inference_index.join(
+            feature_bars.select("security_id", pl.col("trade_date").alias("asof_date")),
+            on=["security_id", "asof_date"], how="semi",
+        ).sort("asof_date", "security_id")
         if market_features is not None:
             context_length = int(feature_contract["context_length"])
             if market_features.height < context_length:
@@ -448,8 +508,12 @@ def build_inference_snapshot(
         if asof_date is not None:
             inference_index = inference_index.filter(pl.col("asof_date") == asof_date)
         maximum_date = inference_index["asof_date"].max()
-        if maximum_date is None:
+        if maximum_date is None and asof_date is None:
             raise DataContractError("inference snapshot contains no eligible feature windows")
+        # An exact-day snapshot may truthfully contain zero scorable windows.
+        # Operational gates decide whether to wait; never fabricate a model score.
+        audit_date = asof_date or universe["trade_date"].max()
+        assert audit_date is not None
         delivery_source = target_universe if asof_date is not None else universe
         delivery_universe = _delivery_universe(delivery_source, inference_index)
         artifacts = {
@@ -473,18 +537,25 @@ def build_inference_snapshot(
             "features": _feature_audit(features),
             "inference_index": {
                 "rows": inference_index.height,
-                "minimum_asof_date": inference_index["asof_date"].min().isoformat(),
-                "maximum_asof_date": maximum_date.isoformat(),
+                "minimum_asof_date": (
+                    inference_index["asof_date"].min().isoformat()
+                    if inference_index.height else None
+                ),
+                "maximum_asof_date": maximum_date.isoformat() if maximum_date else None,
                 "latest_cross_section_rows": inference_index.filter(
-                    pl.col("asof_date") == maximum_date
+                    pl.col("asof_date") == audit_date
                 ).height,
                 "contains_target": False,
             },
             "delivery_universe": {
                 "rows": delivery_universe.height,
                 "latest_cross_section_rows": delivery_universe.filter(
-                    pl.col("asof_date") == maximum_date
+                    pl.col("asof_date") == audit_date
                 ).height,
+                "latest_unscorable": describe_unscorable(
+                    delivery_source, audit_bars,
+                    delivery_universe.filter(pl.col("asof_date") == audit_date),
+                ),
             },
             "scaler": {"origin": "model_release", "sha256": scaler_hash},
         }
