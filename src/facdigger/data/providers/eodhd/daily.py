@@ -9,6 +9,10 @@ from typing import Any
 import polars as pl
 
 from facdigger.data.contracts import DataContractError, validate_bars
+from facdigger.data.market_calendar import (
+    regular_session_frame,
+    regular_sessions,
+)
 from facdigger.data.providers.eodhd.client import EODHDClient, EODHDError
 from facdigger.data.providers.eodhd.config import EODHDConfig
 from facdigger.data.providers.eodhd.mapper import (
@@ -16,10 +20,6 @@ from facdigger.data.providers.eodhd.mapper import (
     consolidate_bars,
     filter_valid_eod_rows,
     map_eod_bars,
-)
-from facdigger.data.providers.eodhd.market_calendar import (
-    regular_session_frame,
-    regular_sessions,
 )
 from facdigger.data.providers.eodhd.quality import filter_to_regular_sessions
 from facdigger.data.providers.eodhd.universe import discover_historical_symbols

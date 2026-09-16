@@ -497,7 +497,7 @@ def publish_evaluation_factor_batch(
 ) -> tuple[Path, FactorBatchManifest]:
     """Convert verified research predictions into the sole external factor contract."""
 
-    from facdigger.data.providers.eodhd.market_calendar import CALENDAR_VERSION
+    from facdigger.data.market_calendar import CALENDAR_VERSION
     from facdigger.evaluation.contracts import validate_predictions
     from facdigger.inference.releases import load_model_release
 

@@ -10,11 +10,11 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from facdigger.data.contracts import DataContractError, table_audit, validate_bars
+from facdigger.data.market_calendar import regular_session_frame
 from facdigger.data.provenance import build_standardization_contract
 from facdigger.data.providers.eodhd.config import EODHDConfig
 from facdigger.data.providers.eodhd.daily import EODHDDailyRevision
 from facdigger.data.providers.eodhd.mapper import build_universe
-from facdigger.data.providers.eodhd.market_calendar import regular_session_frame
 from facdigger.data.session_store import (
     AdjustmentBackfillRequired,
     bootstrap_production_store,

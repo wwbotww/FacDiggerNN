@@ -17,7 +17,7 @@ from pydantic import Field, field_validator, model_validator
 from facdigger.data.config import StrictModel
 from facdigger.data.contracts import DataContractError
 from facdigger.data.inference_snapshots import load_inference_snapshot
-from facdigger.data.providers.eodhd.market_calendar import CALENDAR_VERSION
+from facdigger.data.market_calendar import CALENDAR_VERSION
 from facdigger.data.snapshots import sha256_file
 from facdigger.inference.delivery import (
     DeliveryConfig,

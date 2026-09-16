@@ -17,6 +17,10 @@ from facdigger.data.inference_snapshots import (
     describe_unscorable,
     load_inference_snapshot,
 )
+from facdigger.data.market_calendar import (
+    next_regular_session,
+    shift_regular_session,
+)
 from facdigger.data.providers.eodhd.client import EODHDError
 from facdigger.data.providers.eodhd.config import load_eodhd_config
 from facdigger.data.providers.eodhd.daily import (
@@ -24,10 +28,6 @@ from facdigger.data.providers.eodhd.daily import (
     backfill_adjusted_histories,
     fetch_daily_revision,
     require_fresh_daily_requests,
-)
-from facdigger.data.providers.eodhd.market_calendar import (
-    next_regular_session,
-    shift_regular_session,
 )
 from facdigger.data.providers.eodhd.provider import EODHDProvider
 from facdigger.data.session_store import (

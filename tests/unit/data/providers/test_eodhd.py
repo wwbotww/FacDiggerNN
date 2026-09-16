@@ -14,6 +14,7 @@ from facdigger.data.contracts import (
     validate_corporate_actions,
     validate_universe,
 )
+from facdigger.data.market_calendar import regular_session_frame, regular_sessions
 from facdigger.data.providers.eodhd.client import (
     DailyCallBudget,
     EODHDBudgetError,
@@ -30,7 +31,6 @@ from facdigger.data.providers.eodhd.mapper import (
     map_eod_bars,
     parse_split_ratio,
 )
-from facdigger.data.providers.eodhd.market_calendar import regular_session_frame, regular_sessions
 from facdigger.data.providers.eodhd.provider import EODHDProvider
 from facdigger.data.providers.eodhd.quality import (
     assert_historical_ingestion_quality,

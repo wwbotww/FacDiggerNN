@@ -250,7 +250,7 @@ def run_signal_inference(
     """Score one target-free inference snapshot and publish a FactorBatch."""
 
     from facdigger.data.inference_snapshots import load_inference_snapshot
-    from facdigger.data.providers.eodhd.market_calendar import CALENDAR_VERSION
+    from facdigger.data.market_calendar import CALENDAR_VERSION
     from facdigger.inference.factor_batch import (
         FactorBatchInput,
         FactorBatchTime,

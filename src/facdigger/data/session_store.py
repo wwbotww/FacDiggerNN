@@ -18,6 +18,10 @@ from facdigger.data.contracts import (
     validate_bars,
     validate_universe,
 )
+from facdigger.data.market_calendar import (
+    regular_session_frame,
+    regular_sessions,
+)
 from facdigger.data.provenance import (
     build_standardization_contract,
     read_source_provenance_manifest,
@@ -31,10 +35,6 @@ from facdigger.data.providers.eodhd.mapper import (
     consolidate_bars,
     display_symbol,
     security_identity,
-)
-from facdigger.data.providers.eodhd.market_calendar import (
-    regular_session_frame,
-    regular_sessions,
 )
 from facdigger.data.providers.eodhd.quality import (
     assert_historical_ingestion_quality,

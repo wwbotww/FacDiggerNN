@@ -18,8 +18,8 @@ from facdigger.data.config import (
 )
 from facdigger.data.contracts import DataContractError, table_audit
 from facdigger.data.inference_snapshots import build_inference_snapshot, load_inference_snapshot
+from facdigger.data.market_calendar import regular_session_frame
 from facdigger.data.provenance import build_standardization_contract
-from facdigger.data.providers.eodhd.market_calendar import regular_session_frame
 from facdigger.data.session_store import bootstrap_production_store
 from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
 from facdigger.inference.delivery import DeliveryConfig

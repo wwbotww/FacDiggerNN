@@ -122,7 +122,7 @@ def daily_tick(tmp_path, monkeypatch):
 
     import polars as pl
 
-    from facdigger.data.providers.eodhd.market_calendar import regular_sessions
+    from facdigger.data.market_calendar import regular_sessions
     from facdigger.inference.factor_batch import build_factor_frame
     from tests.unit.production.test_quality import _delivery
 

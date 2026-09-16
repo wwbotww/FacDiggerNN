@@ -13,8 +13,8 @@ from typing import Any
 import polars as pl
 
 from facdigger.data.contracts import DataContractError
+from facdigger.data.market_calendar import regular_sessions
 from facdigger.data.paths import artifact_path
-from facdigger.data.providers.eodhd.market_calendar import regular_sessions
 from facdigger.inference.delivery import DeliveryConfig, resolve_delivery
 from facdigger.production.config import ProductionInferenceConfig, ProductionQualityConfig
 

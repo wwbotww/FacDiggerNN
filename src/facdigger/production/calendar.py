@@ -7,7 +7,7 @@ from datetime import date, datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from facdigger.data.providers.eodhd.market_calendar import (
+from facdigger.data.market_calendar import (
     next_regular_session,
     previous_regular_session,
     regular_session_open,
