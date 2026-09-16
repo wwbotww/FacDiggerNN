@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -69,7 +70,7 @@ def _metadata() -> tuple[FactorBatchSource, FactorBatchModel, FactorBatchInput, 
             identity_policy="eodhd_isin_only",
         ),
         FactorBatchTime(
-            calendar_version="2026.1",
+            calendar_version="exchange_calendars:4.13.2:XNYS",
             minimum_asof_date=date(2026, 8, 11),
             maximum_asof_date=date(2026, 8, 11),
         ),
@@ -305,3 +306,28 @@ def test_factor_batch_publish_failure_leaves_no_visible_or_temporary_bundle(
         )
 
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("day", "calendar_version", "message"),
+    [
+        (date(2026, 8, 15), "exchange_calendars:4.13.2:XNYS", "session"),
+        (date(2026, 8, 11), "temporary-calendar", "provenance"),
+    ],
+)
+def test_publish_checks_calendar_facts_before_creating_delivery(
+    tmp_path: Path, day: date, calendar_version: str, message: str,
+) -> None:
+    """周末或错误来源不能通过仅填写标签发布成正式交付。"""
+    source, model, input_metadata, time_metadata = _metadata()
+    frame = _frame().with_columns(pl.lit(day).alias("asof_date"))
+    time_metadata = time_metadata.model_copy(update={
+        "calendar_version": calendar_version,
+        "minimum_asof_date": day,
+        "maximum_asof_date": day,
+    })
+    output = tmp_path / "deliveries"
+    with pytest.raises(DataContractError, match=message):
+        publish_factor_batch(frame, output, source=source, model=model,
+            input_metadata=_input_for_frame(input_metadata, frame), time_metadata=time_metadata)
+    assert not output.exists()

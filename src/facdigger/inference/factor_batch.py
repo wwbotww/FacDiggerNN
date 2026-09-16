@@ -390,6 +390,14 @@ def publish_factor_batch(
     ):
         raise DataContractError("factor date range disagrees with time metadata")
 
+    from facdigger.data.market_calendar import CALENDAR_VERSION, regular_sessions
+
+    if time_value.calendar_version != CALENDAR_VERSION:
+        raise DataContractError("factor calendar provenance does not match installed calendar")
+    valid_dates = set(regular_sessions(observed_minimum, observed_maximum))
+    if not set(factors["asof_date"].to_list()) <= valid_dates:
+        raise DataContractError("factor asof_date must be a regular trading session")
+
     root = Path(output_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     temporary = root / f".tmp-factor-batch-{uuid.uuid4().hex}"

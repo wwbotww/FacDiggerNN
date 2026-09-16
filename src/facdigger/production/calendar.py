@@ -10,8 +10,7 @@ from zoneinfo import ZoneInfo
 from facdigger.data.market_calendar import (
     next_regular_session,
     previous_regular_session,
-    regular_session_open,
-    regular_sessions,
+    regular_session,
 )
 from facdigger.production.config import ProductionScheduleConfig
 
@@ -36,25 +35,15 @@ def production_window(
         raise ValueError("production clock must be timezone-aware")
     local = now.astimezone(NEW_YORK)
     today = local.date()
-    today_is_session = bool(regular_sessions(today, today))
-    if today_is_session:
-        today_first = datetime.combine(today, schedule.first_attempt, tzinfo=NEW_YORK)
-        today_open = regular_session_open(today)
-        if local >= today_first:
-            target = today
-        elif local < today_open:
-            target = previous_regular_session(today)
-        else:
-            return ProductionWindow(
-                today,
-                today_first,
-                regular_session_open(next_regular_session(today)),
-                "not_due",
-            )
+    today_session = regular_session(today)
+    if today_session is not None and now >= today_session.open_utc:
+        target = today
     else:
         target = previous_regular_session(today)
     first = datetime.combine(target, schedule.first_attempt, tzinfo=NEW_YORK)
-    cutoff = regular_session_open(next_regular_session(target))
+    execution_session = regular_session(next_regular_session(target))
+    assert execution_session is not None
+    cutoff = execution_session.open_utc.astimezone(NEW_YORK)
     phase: Literal["not_due", "open", "expired"]
     if local < first:
         phase = "not_due"

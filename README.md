@@ -397,8 +397,9 @@ New York 交易时钟、重试状态和单实例锁，因此同一镜像可部�
 `production status` 的 `latest.quality` 区分 `ready/degraded/insufficient`，记录计算/交付
 计数、缺数原因和市场检查；Docker 日志输出状态变化告警并去重。`production health` 判断
 心跳存活，同时附带最新业务状态，不能把“容器健康”当作“今日可以调仓”。
-HeyBoss 仍需按[局部缺分持仓保护交接](docs/HeyBoss局部缺分持仓保护交接.md)修改消费和执行：
-不可评分不代表卖出，未完成该保护前不要自动消费降级批次。
+HeyBoss 的缺分持仓保护及两侧 XNYS 日历统一代码已完成，826 原 validation 预测交付通过了
+离线历史验收；真实每日采集、无标签推理、开盘前接纳和持续 paper 仍待验证，真实运行库未迁移。
+见[局部缺分持仓保护交接](docs/HeyBoss局部缺分持仓保护交接.md)，不要把历史验收当成生产已就绪。
 
 首次配置：
 

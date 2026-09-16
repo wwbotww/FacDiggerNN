@@ -13,8 +13,8 @@
 4. [`Transformer因子质量优化设计.md`](Transformer因子质量优化设计.md)：当前金融原生
    Transformer 精简实验的结构、训练、资源预算和验收方案；
 5. [`RTX2070_Windows训练指南.md`](RTX2070_Windows训练指南.md)：目标 GPU 机器的安装、迁移和资源门禁。
-6. [`HeyBoss因子联调交接.md`](HeyBoss因子联调交接.md)：交易项目应实现的 importer 契约和流程验收。
-   当前消费者待实施任务见[局部缺分持仓保护交接](HeyBoss局部缺分持仓保护交接.md)。
+6. [`HeyBoss因子联调交接.md`](HeyBoss因子联调交接.md)：现行 importer 契约、离线验收及生产边界。
+   缺分保护设计、回归要求及剩余生产验收见[局部缺分持仓保护交接](HeyBoss局部缺分持仓保护交接.md)。
 
 ## 现行文档职责
 
@@ -26,7 +26,7 @@
 | [`Transformer因子质量优化设计.md`](Transformer因子质量优化设计.md) | 当前怎样提高 Transformer 单模型因子质量 | 已实现协议与待运行实验 |
 | [`RTX2070_Windows训练指南.md`](RTX2070_Windows训练指南.md) | 怎样在 WSL2/RTX 2070 Super 上运行 | 平台操作 |
 | [`HeyBoss因子联调交接.md`](HeyBoss因子联调交接.md) | HeyBoss 怎样校验、导入和跑通因子链路 | 跨项目交接 |
-| [`HeyBoss局部缺分持仓保护交接.md`](HeyBoss局部缺分持仓保护交接.md) | 局部缺分怎样不误清仓，消费者具体改什么 | 当前 HeyBoss 待实施任务与验收 |
+| [`HeyBoss局部缺分持仓保护交接.md`](HeyBoss局部缺分持仓保护交接.md) | 局部缺分怎样不误清仓，哪些验收尚未完成 | 已实施设计、回归与生产验收边界 |
 | [`项目关键问题与修复复盘.md`](项目关键问题与修复复盘.md) | 真实问题如何定位、权衡、修复和验证 | 持续维护的复盘档案 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 如何改代码、测试和评审 | 贡献流程 |
 | [`SECURITY.md`](../SECURITY.md) | 如何处理 token、外部数据和研究完整性 | 安全规则 |
@@ -51,8 +51,9 @@
   放宽产物绑定；生产配置的计算池最低数量位于 `inference`，必须提供 `factor_batch.delivery`；
 - 每日生产允许小范围不可评分行，固定采集前的覆盖基准，分别检查计算池、交付池及 Finance
   市场输入；异常缺失重新 fresh 采集，到截止跳过 D 而不停服务。质量报告与心跳分离，未放宽
-  五列/身份/有限分数门禁。HeyBoss 的 SKIP/保持数量/预算保护待其会话实施，尚不能宣称
-  无人值守交易链路已完成；
+  五列/身份/有限分数门禁。HeyBoss 的 SKIP/保持数量/预算保护及两侧 XNYS 日历统一代码已完成，
+  826 release 与原 validation 预测交付已通过离线历史验收；真实每日采集 → 无标签推理 →
+  HeyBoss 接纳与持续 paper 仍待验证，真实运行库未迁移，不能宣称无人值守交易链路已完成；
 - 监督阶段以完整日横截面排序相关性为目标；E1—E3 通过 CPU 整日组装、GPU
   physical microbatch 和两遍回放计算精确整日梯度，LightGBM 使用按完整日分组的
   LambdaRank；

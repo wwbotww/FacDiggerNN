@@ -6,10 +6,13 @@ FactorBatch 两文件目录；全历史回放的父 plan/state/manifest 只供 F
 Git commit，并用真实 FacDigger 产出的目录做契约测试，不能
 各写一份“看起来相同”的测试 fixture 后就认为联调完成。
 
-当前下一步（2026-09-10）：FacDigger 已实现局部缺数容忍与真实重试，HeyBoss 的持仓保护、
-空组合 SKIP、预期日期/固定 release 消费仍待其会话实施。请优先执行
-[`HeyBoss局部缺分持仓保护交接.md`](HeyBoss局部缺分持仓保护交接.md)，未验收前不要自动消费
-降级批次。本文保留接口总览；第 2 节旧消费者差异是历史背景，不是当前待重做清单。
+当前状态（2026-09-16）：两侧日历统一、HeyBoss 持仓保护、空组合 SKIP、预期日期/固定
+release 消费及审批恢复代码已完成，826 release 与原 validation 预测的历史交付已完成离线
+联合验收，具体产物与证据见本文末尾。无需重新实施这些功能或重复创建同一 release。
+仍待验证的是 fresh EODHD → 无标签每日推理 → HeyBoss 接纳与持续 paper 运行；历史回测
+不代表这条生产链路已验收，也不代表因子收益有效。真实运行库尚未迁移。
+[`局部缺分持仓保护交接`](HeyBoss局部缺分持仓保护交接.md)保留原设计和回归要求；本文
+第 2 节旧消费者差异同样是历史背景，不是当前待重做清单。
 
 ## 六项 FacDigger 收尾审计
 
@@ -31,8 +34,8 @@ Git commit，并用真实 FacDigger 产出的目录做契约测试，不能
 FacDiggerNN 已提供两种来源、同一种文件契约：
 
 - `signal_inference`：单日完整交付候选横截面；使用交付 profile 时指双方事先声明的目标集合，
-  不等于模型完整计算池，后者的可评分成员仍全部参与评分；完成消费者保护后才进入
-  人工触发的 paper 验证；
+  不等于模型完整计算池，后者的可评分成员仍全部参与评分；真实每日接纳、行情准备与
+  运行库迁移验证通过后，才进入人工触发的 paper 验证；
 - `evaluation_predictions`：eligible 且已有分数的历史回测行；既可以来自 release 绑定的原始
   评价 predictions，也可以来自固定 release 对 target-free 历史 snapshot 的重新推理。该枚举
   表达 backtest-only 消费边界，不表示 FactorBatch 含有或读取了标签；只能用于隔离回测。
@@ -142,7 +145,7 @@ HeyBoss 应继续失败关闭并只接受：
 - `model_type` 为合法来源元数据，不按 E3 名称建立模型白名单；
 - `score_semantics=raw_cross_sectional_rank_score`（中性化上线前）；
 - `higher_score_is_better=true`；
-- `calendar=US_EQUITIES_REGULAR` 且显式记录非空 `calendar_version`；
+- `calendar=US_EQUITIES_REGULAR` 且发布来源为 `calendar_version=exchange_calendars:4.13.2:XNYS`；
 - `timezone=America/New_York`；
 - `signal_available=after_regular_session_close`；
 - `earliest_execution=next_regular_session_open`；
@@ -152,11 +155,12 @@ HeyBoss 应继续失败关闭并只接受：
 
 不要在 HeyBoss 增加 predictions reader、旧格式 fallback 或 ModelRelease loader。
 
-## 3. HeyBoss 项目侧实施任务
+## 3. HeyBoss 通路检查顺序与验收边界
 
-以下 H1—H4 是通路检查顺序：H1 契约同步及 H2 日期身份解析代码已具备，不需要重复实现；
-真实身份配置、价格覆盖、当前[缺分保护交接](HeyBoss局部缺分持仓保护交接.md)和 H3/H4 的
-真实数据/执行验收仍需完成。任一步失败都不要继续到 paper：
+以下 H1—H4 保留为部署/回归检查顺序，不是待编码清单。H1 契约、H2 日期身份解析及缺分
+保护代码已完成；826 的隔离身份/价格配置与 H3 原 validation 预测回测已验收。更换交付范围
+或运行环境须重新核对前置条件，固定模型全历史重新推理与 H4 真实每日/paper 仍需单独验证。
+任一步失败都不要继续到 paper：
 
 建议 HeyBoss 侧直接把本文件作为任务输入，并以 FacDigger
 `codex/factor-batch-v1-release` 分支最终提交的 commit 为生产者基线；不要继续以原
@@ -413,3 +417,55 @@ CPU 集成测试生成的 FactorBatch 验证 importer/NT 通路，不能把合�
 
 这一定义只证明工程链路和语义一致，不证明因子有效，也不替代新一轮 walk-forward 统计门禁、
 组合风险评审和 paper 观察期。
+
+
+## 2026-09-16：两侧统一交易日历
+
+本次联合实施已按用户确认统一为 `exchange_calendars==4.13.2` / XNYS。
+唯一入口为 `src/facdigger/data/market_calendar.py`；原供应商目录的手写日历已删除。
+模块懒加载数据依赖，返回标准库 date 与有时区 UTC datetime；MarketSession 包含实际开收盘，
+支持提前收盘。regular_sessions 为闭区间，previous/next 严格跨日，shift(offset=0) 要求交易日。
+既有 regular_session_frame 仅做 Polars 转换。没有 Provider 抽象、插件注册或共享运行时包。
+
+来源标识复用外部交付既有 calendar_version，固定为 `exchange_calendars:4.13.2:XNYS`。
+发布前验证安装版本与所有 asof_date；不能仅换标签而不校验日期。production_window 继续负责
+纽约 19:00 首次尝试、30 分钟重试与下一交易日实际开盘截止；提前收盘不改变 19:00 策略。
+HeyBoss 独立计算最近已收盘 D，并以 N 开盘前本地成功验收、N 常规时段执行为消费门禁。
+
+两仓 `tests/fixtures/us_equities_sessions.json` 内容一致；覆盖 2001/2012 特殊休市、2021-12-31、
+2025-01-09、2026 夏冬令时、Good Friday 和 11-27/12-24 半日市。HeyBoss 的
+`scripts/check_calendar_consistency.py` 使用双方各自解释器比较 2000—2027 完整日期集合、UTC
+开收盘与前后交易日。升级来源必须重跑此联合检查；普通单仓测试不依赖另一个仓库。
+
+
+## 2026-09-16：826 联合验收结果
+
+已按已完成的 finance_patch_transformer_pretrained-20260902T045825Z-72c1db3f 运行发布：
+model_release_id=fbd630164624c71fe67c5b7c6637f5be08ef3179bdf93f9c3aa48d208c44d7ef；
+delivery_id=02172c408d11f2032da4f08567b3d54659bd5ee2199fad9c0dad62b26ef5a87a。
+来源为 evaluation_predictions，2023-02-01—2024-12-02，462 个日期、10 个目标、4,620 行。
+原交付全部有效；局部缺分和全 false 使用独立测试样例验证，未篡改真实实验产物。
+源运行有 dirty Git 状态，发布按工程联调显式 allow-dirty，未改成 clean、未重新训练或解锁 test。
+
+训练快照 b7ca76a74dbe396c8e157eb7ecc826460931ed66e917d939ab56746cb70d2696 的 features、
+market_features、inference_index 日期集合与新 XNYS 日历一致；sample_index 中仅有原协议
+purge/embargo 缺口，没有非交易日。XOM 的隔离历史映射绑定 US30231G1022，依据原预测及
+SEC 历史披露，未替换为当前 ISIN。其余目标与消费者显式身份匹配。
+
+HeyBoss 以 historical 模式完整导入，重复导入 0 新增行。行情从现有 EODHD 缓存经原有 HeyBoss
+解析/公司行动/质量管道进入隔离 Catalog（9,300 根双价格日线，0 质量错误）。最终 NT 回放
+run_id=20260916T065922Z-d1035895，462 个工作流、970 笔成交；逐笔执行窗口和下一交易日
+开盘价加既定滑点核对均无偏差。开盘使用日线 open 推导的 QuoteTick 与固定流动性假设，不代表
+真实盘口或精确开盘成交。初始边界 2023-01-31 缺 D 留下一条 SKIP，不回退旧批次。
+
+验收产物位于 /Users/young/Documents/HeyBoss/reports/facdigger-826-validation/，包含
+acceptance.json、delivery.yaml、import-audit.db、backtest-accepted.db、catalog 和最终回测目录；
+模型、数据库、Catalog、缓存和报告均不提交 Git。HeyBoss 交易入口仍只消费两个 FactorBatch
+文件，不读取冻结模型或训练文件。具体命令与限制见 HeyBoss 的
+/Users/young/Documents/HeyBoss/docs/facdigger-heyboss-joint-implementation-plan.md 第八节。
+
+质量结果：FacDigger Ruff 与 lock 检查通过，Python 3.10/3.11/3.12 完整测试各 277 项通过；
+两仓 2000—2027 的 10,227 个自然日/7,041 个交易日、开收盘和前后日一致。HeyBoss Ruff、
+mypy strict、996 项测试通过（总覆盖率 91.05%）；前端 127 项测试和构建通过。
+本次完成离线历史链路验收，未启动 IBKR 下单或 Telegram 对外通知，也未迁移真实运行库。
+真实 paper 仍需要 signal_inference、固定生产 release 与开盘前本地成功接纳。

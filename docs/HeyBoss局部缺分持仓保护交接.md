@@ -1,9 +1,11 @@
 # HeyBoss 局部缺分持仓保护交接
 
-日期：2026-09-10。本文交给 **HeyBoss 项目的 agent 会话实施**。
-本轮仅修改 FacDigger，未修改 HeyBoss、真实标的配置、Catalog、交易数据库或部署环境。
-以下 HeyBoss 行为是待实施要求，不是已验收能力。不要因为 FacDigger 可以发布局部缺数批次，
-就直接启用无人值守调仓。
+当前状态：2026-09-16。两侧日历统一、HeyBoss 的 SKIP、持仓数量/预算保护、时间与 release
+门禁、审批恢复代码已完成；826 release 和原 validation 预测的离线历史交付已验收。
+§3–4 保留 2026-09-10 的根因分析与实施设计作为历史参考，§5 用于后续回归，均不表示需要
+重新开发。实际实施与产物记录见本文末尾及[因子联调交接](HeyBoss因子联调交接.md)。
+真实每日采集/无标签推理/接纳及持续 paper 运行仍待验证，真实运行库未迁移；不要仅凭离线
+历史验收启用无人值守调仓。
 
 ## 1. 目标和两项目边界
 
@@ -91,9 +93,9 @@ docker compose logs -f facdigger-production
 - 消费者不读取 FacDigger SQLite、snapshot 或 checkpoint。日常交易判断仍基于验证后的
   FactorBatch、明确预期 D、固定 release 和自身组合条件。
 
-## 3. HeyBoss 当前根因（只读代码审计）
+## 3. 2026-09-10 根因审计（历史，相关代码已修复）
 
-以 HeyBoss 当前 `src/trading_assistant/` 下实现为基线，开始修改前应重新检查最新 diff：
+以下描述当时 HeyBoss `src/trading_assistant/` 的实现，不是当前仍存在的问题清单：
 
 1. `signals/factor.py::calculate_factor_weights` 在可用股票不足 Top N 时返回 `{}`。
 2. `strategies/patchtst_factor.py::_publish_signal` 仍把这个空权重发送为 `TradeSignalEvent`；
@@ -108,7 +110,7 @@ docker compose logs -f facdigger-production
 日期身份映射已存在（`factor_identity_periods` / `factor_security_id_on`）；不要再建一套
 ticker alias，也不要把本任务误当成重写 importer 或增加模型专属接口。
 
-## 4. 建议分三个小提交实施
+## 4. 原实施方案（历史设计参考，不是待办清单）
 
 ### H1：明确 REBALANCE / SKIP 与持仓保护意图
 
@@ -171,7 +173,7 @@ backtest 和 paper 必须复用同一个决策/Gateway 路径，不能只给线�
 - artifact/semantic hash、完整五列、完整候选数量、有效期身份唯一性和 eligible 价格前置条件
   仍严格校验。FactorBatch 的质量降级不允许绕过 importer 的任何完整性检查。
 
-## 5. 必须通过的验收矩阵
+## 5. 持续维护的回归验收矩阵
 
 全部用临时数据库/Catalog、fake broker/时钟；以下不授权真实交易。
 
@@ -196,23 +198,77 @@ backtest 和 paper 必须复用同一个决策/Gateway 路径，不能只给线�
 最后使用 **FacDigger 实际生成的原始 FactorBatch** 做临时 Catalog → Actor → Gateway
 dry-run，并逐值核对 score/eligible/身份；双方各自生成自洽 fixture 不能替代这一步。
 
-## 6. 826 实验 release 的后续联调
+## 6. 已发布的 826 与剩余生产验收
 
-本阶段没有新建真实 release；先完成两侧保护，再返回 FacDigger 会话执行 release 与交付。
-已检查的候选是 `artifacts826new` 中 complete 的 `wf3/finance_pretrained` 监督 run
-`finance_patch_transformer_pretrained-20260902T045825Z-72c1db3f`，不是仍标记 running 的新目录。
-发布前重新核验本机 run、checkpoint、scaler、数据集及状态，不按目录日期自动选模型。
+`artifacts826new` 中 complete 的 `wf3/finance_pretrained` 监督 run
+`finance_patch_transformer_pretrained-20260902T045825Z-72c1db3f` 已生成 release，并交付
+462 天、4,620 行 `evaluation_predictions`。具体 ID 与目录见末尾验收记录；不要重复发布，
+也不要改写原 manifest、checkpoint、训练 snapshot 或 dirty 来源状态。
 
-1. 从实际文件核验并记录双方 Git commit，固定一版 release。使用本机 `--dataset` 重定位
-   Windows 数据集路径；若来源仍为 dirty，显式 `--allow-dirty` 并如实记录，不改原 manifest。
-2. 双方确认实际交付 targets、日期有效期、身份依据和 Catalog 中的 signal/execution bars。
-   例如 2024 历史 XOM 不能被自动改成当前 ISIN，也不能绕过 HeyBoss 已有日期身份解析。
-3. 先取已具备价格和模型上下文的少量历史日期，生成 backtest-only 批次做隔离回测；完整
-   横截面计算后才投影小交付集合。不把 2024/2025 数据标成 2026 最新生产。
-4. 用测试输入的副本再覆盖局部缺数/严重缺数场景，不修改原训练 snapshot 或实验结果。
-5. 再单独验证 fresh EODHD、Docker 生产时钟、文件传递/导入调度及 paper dry-run。
-   当前并未完成跨容器自动导入、paper 订单或真实数据长期运行验收。
+该验收使用原 validation 预测，不是最新日期 `signal_inference`，也不是固定 release 的
+target-free 全历史重新推理。下一步只推进尚未验证的生产环节：
+
+1. 显式配置选定的生产 release ID，核对双方部署代码及依赖；已有隔离 release 可以验证加载，
+   不能把“已存在”当成已部署到生产配置。
+2. 确认生产日期的 targets、有效期身份和 signal/execution bars；历史 XOM 隔离映射不可直接
+   套用当前日期。按 HeyBoss 迁移流程审阅、备份并显式迁移真实运行库，不直接复用隔离测试库。
+3. 以实际 D 数据构建无标签 snapshot、运行完整可评分横截面，再投影交付，验证新
+   `signal_inference` 批次；不把历史数据标成最新日期，不把旧预测文件当作每日模型输出。
+4. 验证 fresh EODHD、Docker 时钟、文件传递与导入调度、开盘前本地成功接纳和 paper dry-run；
+   用独立测试输入覆盖缺数、迟到、重启，不修改真实训练或交付产物。
+5. 单独记录持续运行、告警恢复及人工批准的 paper 验收证据；这些尚未由离线回测证明。
 
 工程跑通不代表该模型已通过样本外收益门禁；这里不重新训练、不解锁 holdout，也不依据这次
-回测选模型。HeyBoss agent 完成后应交回修改清单、实际测试、迁移注意点和未完成项，再进行
-826 release 的真实跨仓通路测试。
+回测选模型。上述剩余步骤需在后续任务中执行，本次文档收尾不启动真实生产或交易。
+
+
+## 2026-09-16：两侧统一交易日历
+
+本次联合实施已按用户确认统一为 `exchange_calendars==4.13.2` / XNYS。
+唯一入口为 `src/facdigger/data/market_calendar.py`；原供应商目录的手写日历已删除。
+模块懒加载数据依赖，返回标准库 date 与有时区 UTC datetime；MarketSession 包含实际开收盘，
+支持提前收盘。regular_sessions 为闭区间，previous/next 严格跨日，shift(offset=0) 要求交易日。
+既有 regular_session_frame 仅做 Polars 转换。没有 Provider 抽象、插件注册或共享运行时包。
+
+来源标识复用外部交付既有 calendar_version，固定为 `exchange_calendars:4.13.2:XNYS`。
+发布前验证安装版本与所有 asof_date；不能仅换标签而不校验日期。production_window 继续负责
+纽约 19:00 首次尝试、30 分钟重试与下一交易日实际开盘截止；提前收盘不改变 19:00 策略。
+HeyBoss 独立计算最近已收盘 D，并以 N 开盘前本地成功验收、N 常规时段执行为消费门禁。
+
+两仓 `tests/fixtures/us_equities_sessions.json` 内容一致；覆盖 2001/2012 特殊休市、2021-12-31、
+2025-01-09、2026 夏冬令时、Good Friday 和 11-27/12-24 半日市。HeyBoss 的
+`scripts/check_calendar_consistency.py` 使用双方各自解释器比较 2000—2027 完整日期集合、UTC
+开收盘与前后交易日。升级来源必须重跑此联合检查；普通单仓测试不依赖另一个仓库。
+
+
+## 2026-09-16：826 联合验收结果
+
+已按已完成的 finance_patch_transformer_pretrained-20260902T045825Z-72c1db3f 运行发布：
+model_release_id=fbd630164624c71fe67c5b7c6637f5be08ef3179bdf93f9c3aa48d208c44d7ef；
+delivery_id=02172c408d11f2032da4f08567b3d54659bd5ee2199fad9c0dad62b26ef5a87a。
+来源为 evaluation_predictions，2023-02-01—2024-12-02，462 个日期、10 个目标、4,620 行。
+原交付全部有效；局部缺分和全 false 使用独立测试样例验证，未篡改真实实验产物。
+源运行有 dirty Git 状态，发布按工程联调显式 allow-dirty，未改成 clean、未重新训练或解锁 test。
+
+训练快照 b7ca76a74dbe396c8e157eb7ecc826460931ed66e917d939ab56746cb70d2696 的 features、
+market_features、inference_index 日期集合与新 XNYS 日历一致；sample_index 中仅有原协议
+purge/embargo 缺口，没有非交易日。XOM 的隔离历史映射绑定 US30231G1022，依据原预测及
+SEC 历史披露，未替换为当前 ISIN。其余目标与消费者显式身份匹配。
+
+HeyBoss 以 historical 模式完整导入，重复导入 0 新增行。行情从现有 EODHD 缓存经原有 HeyBoss
+解析/公司行动/质量管道进入隔离 Catalog（9,300 根双价格日线，0 质量错误）。最终 NT 回放
+run_id=20260916T065922Z-d1035895，462 个工作流、970 笔成交；逐笔执行窗口和下一交易日
+开盘价加既定滑点核对均无偏差。开盘使用日线 open 推导的 QuoteTick 与固定流动性假设，不代表
+真实盘口或精确开盘成交。初始边界 2023-01-31 缺 D 留下一条 SKIP，不回退旧批次。
+
+验收产物位于 /Users/young/Documents/HeyBoss/reports/facdigger-826-validation/，包含
+acceptance.json、delivery.yaml、import-audit.db、backtest-accepted.db、catalog 和最终回测目录；
+模型、数据库、Catalog、缓存和报告均不提交 Git。HeyBoss 交易入口仍只消费两个 FactorBatch
+文件，不读取冻结模型或训练文件。具体命令与限制见 HeyBoss 的
+/Users/young/Documents/HeyBoss/docs/facdigger-heyboss-joint-implementation-plan.md 第八节。
+
+质量结果：FacDigger Ruff 与 lock 检查通过，Python 3.10/3.11/3.12 完整测试各 277 项通过；
+两仓 2000—2027 的 10,227 个自然日/7,041 个交易日、开收盘和前后日一致。HeyBoss Ruff、
+mypy strict、996 项测试通过（总覆盖率 91.05%）；前端 127 项测试和构建通过。
+本次完成离线历史链路验收，未启动 IBKR 下单或 Telegram 对外通知，也未迁移真实运行库。
+真实 paper 仍需要 signal_inference、固定生产 release 与开盘前本地成功接纳。

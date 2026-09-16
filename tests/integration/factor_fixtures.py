@@ -5,17 +5,14 @@ from datetime import date, timedelta
 import polars as pl
 
 from facdigger.data.config import DatasetBuildConfig
+from facdigger.data.market_calendar import regular_sessions
 from facdigger.data.snapshots import build_dataset_snapshot
 
 
 def sessions(count: int) -> list[date]:
-    sessions = []
-    current = date(2022, 1, 3)
-    while len(sessions) < count:
-        if current.weekday() < 5:
-            sessions.append(current)
-        current += timedelta(days=1)
-    return sessions
+    start = date(2022, 1, 3)
+    return regular_sessions(start, start + timedelta(days=count * 2 + 31))[:count]
+
 
 
 def build_price_volume_snapshot(tmp_path, *, count: int = 85):

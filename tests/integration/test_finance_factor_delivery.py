@@ -4,10 +4,11 @@ import json
 import shutil
 from pathlib import Path
 
+import factor_fixtures
 import numpy as np
 import polars as pl
 import pytest
-from factor_fixtures import build_price_volume_snapshot, sessions
+from factor_fixtures import build_price_volume_snapshot
 from polars.testing import assert_frame_equal
 
 from facdigger.data.config import (
@@ -41,9 +42,9 @@ def finance_delivery(tmp_path, monkeypatch, request):
     import torch
 
     torch.set_num_threads(1)
+    calendar = factor_fixtures.sessions(165)
     original = build_price_volume_snapshot(tmp_path, count=165)
     source = json.loads((original / "manifest.json").read_text())["source_paths"]
-    calendar = sessions(165)
     universe_path = Path(source["universe"])
     universe = pl.read_parquet(universe_path).with_columns(
         (
@@ -179,10 +180,10 @@ def test_finance_release_replay_daily_and_subset_history_share_forward(finance_d
     assert load_factor_batch(evaluation_dir).model.model_type == "finance_patch_transformer"
 
     history_snapshot, history_manifest = build_inference_snapshot(config, release_dir)
-    last = sessions(165)[-1]
+    last = factor_fixtures.sessions(165)[-1]
     daily_snapshot, _ = build_inference_snapshot(config, release_dir, asof_date=last)
     # Dynamic historical membership must not be replaced by today's membership.
-    window_start = sessions(165)[-20]
+    window_start = factor_fixtures.sessions(165)[-20]
     market = pl.read_parquet(daily_snapshot / "market_features.parquet").filter(
         pl.col("trade_date") >= window_start
     )
@@ -272,7 +273,9 @@ def test_finance_scoring_rejects_targets_and_wrong_membership(finance_delivery):
     _, _, release_dir, release, config = finance_delivery
     snapshot, manifest = build_inference_snapshot(config, release_dir)
     _, frames = load_inference_snapshot(snapshot, release)
-    rows = frames["inference_index"].filter(pl.col("asof_date") == sessions(165)[-1])
+    rows = frames["inference_index"].filter(
+        pl.col("asof_date") == factor_fixtures.sessions(165)[-1]
+    )
     runtime = load_factor_inference_runtime(release_dir)
     with pytest.raises(DataContractError, match="targets"):
         score_inference_rows(
@@ -294,7 +297,7 @@ def test_partial_finance_signal_keeps_null_row_and_scores_remaining_cross_sectio
     finance_delivery, tmp_path,
 ):
     _, _, release_dir, release, config = finance_delivery
-    last = sessions(165)[-1]
+    last = factor_fixtures.sessions(165)[-1]
     # Leave the generic source flag true to prove that a missing real D bar
     # cannot be scored merely because a provider supplied an optimistic flag.
     bars = pl.read_parquet(config.sources.bars).filter(
@@ -345,7 +348,7 @@ def test_partial_finance_signal_keeps_null_row_and_scores_remaining_cross_sectio
 
 def test_cached_index_cannot_score_unobserved_target_bar(finance_delivery):
     _, _, release_dir, release, config = finance_delivery
-    last = sessions(165)[-1]
+    last = factor_fixtures.sessions(165)[-1]
     snapshot, manifest = build_inference_snapshot(config, release_dir, asof_date=last)
     features_path = snapshot / manifest["artifacts"]["features"]
     features = pl.read_parquet(features_path).with_columns(
@@ -366,7 +369,7 @@ def test_exact_finance_snapshot_can_record_no_scorable_target_without_filling(
     finance_delivery, tmp_path,
 ):
     _, _, release_dir, release, config = finance_delivery
-    last = sessions(165)[-1]
+    last = factor_fixtures.sessions(165)[-1]
     universe = pl.read_parquet(config.sources.universe).with_columns(
         (pl.col("eligible") & (pl.col("trade_date") != last)).alias("eligible")
     )
@@ -390,7 +393,7 @@ def test_finance_inference_consumes_complete_production_hot_history(finance_deli
     _, _, release_dir, _, config = finance_delivery
     source = tmp_path / "production-bronze"
     source.mkdir()
-    dates = sessions(165)
+    dates = factor_fixtures.sessions(165)
     calendar = regular_session_frame(dates[0], dates[-1])
     evidence = {}
     for name, original_path in [
@@ -478,7 +481,7 @@ def test_mixed_identity_pool_delivers_one_target_after_complete_scoring(
         source.write_parquet(target)
         payload["sources"][name] = target
     payload["output_root"] = tmp_path / "mixed-inference"
-    last = sessions(165)[-1]
+    last = factor_fixtures.sessions(165)[-1]
     snapshot, manifest = build_inference_snapshot(
         InferenceSnapshotConfig.model_validate(payload), release_dir, asof_date=last,
     )
@@ -574,7 +577,7 @@ def test_mixed_identity_pool_delivers_one_target_after_complete_scoring(
 def test_historical_export_verification_and_resume_survive_relocation(finance_delivery, tmp_path):
     _, _, release_dir, _, config = finance_delivery
     snapshot, _ = build_inference_snapshot(config, release_dir)
-    last = sessions(165)[-1]
+    last = factor_fixtures.sessions(165)[-1]
     request = HistoricalReplayConfig(
         history_id="relocated-history", release_dir=release_dir, inference_snapshot_dir=snapshot,
         output_root=tmp_path / "original", start_date=last, end_date=last,
