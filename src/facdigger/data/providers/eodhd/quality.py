@@ -23,6 +23,7 @@ def filter_to_regular_sessions(
         .agg(pl.len().alias("bars"))
         .sort("trade_date")
         .head(20)
+        .with_columns(pl.col("trade_date").cast(pl.String))
         .to_dicts()
     )
     return filtered, {
@@ -105,7 +106,8 @@ def quarantine_suspicious_identities(
         "quarantined_security_ids": quarantined,
         "alias_overlap_conflict_groups": alias_conflicts.height,
         "extreme_consecutive_return_rows": sequential.height,
-        "alias_overlap_examples": alias_conflicts.head(20).to_dicts(),
+        "alias_overlap_examples": alias_conflicts.head(20)
+        .with_columns(pl.col("trade_date").cast(pl.String)).to_dicts(),
         "extreme_return_examples": sequential.select(
             "security_id",
             "provider_symbol",
@@ -115,6 +117,7 @@ def quarantine_suspicious_identities(
             "_price_ratio",
         )
         .head(20)
+        .with_columns(pl.col("trade_date").cast(pl.String))
         .to_dicts(),
     }
 

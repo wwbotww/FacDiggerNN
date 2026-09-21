@@ -29,6 +29,78 @@ def _config(tmp_path) -> ProductionServiceConfig:
     )
 
 
+def test_live_bootstrap_fetches_full_warmup_before_current_session(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from facdigger.data.market_calendar import regular_sessions
+    from facdigger.data.providers.eodhd.config import EODHDConfig
+    from facdigger.production import runner
+
+    config = _config(tmp_path)
+    provider = EODHDConfig(
+        allow_demo_token=False,
+        universe={"mode": "historical_liquid", "max_symbols": 1000},
+        delisting_imputation={"enabled": True},
+        min_listed_sessions=252, refresh=True, cache_ttl_hours=0,
+    )
+    release = SimpleNamespace(feature_contract=SimpleNamespace(context_length=512))
+    monkeypatch.setattr(runner, "_load_fixed_release", lambda _: (tmp_path, release))
+    monkeypatch.setattr(runner, "load_eodhd_config", lambda _: provider)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 20, 16, tzinfo=NY).astimezone(tz)
+
+    monkeypatch.setattr(runner, "datetime", Clock)
+    client, revision, stored = object(), object(), object()
+    calls = {}
+
+    def make_provider(initial):
+        calls["initial"] = initial
+        return SimpleNamespace(client=lambda: client)
+
+    def fetch(actual_client, initial, **dates):
+        assert actual_client is client and initial is calls["initial"]
+        calls.update(dates)
+        return revision
+
+    def initialize(actual_revision, actual_config, root, *, history_sessions):
+        assert actual_revision is revision and actual_config is provider
+        assert root == config.data.store_root and history_sessions == 532
+        return stored
+
+    monkeypatch.setattr(runner, "EODHDProvider", make_provider)
+    monkeypatch.setattr(runner, "fetch_daily_revision", fetch)
+    monkeypatch.setattr(runner, "initialize_production_store", initialize)
+    assert runner.bootstrap_store(config, live=True) is stored
+    assert calls["target_date"] == date(2026, 9, 18)
+    assert len(regular_sessions(calls["revision_start"], calls["target_date"])) == 784
+    assert calls["initial"].universe.max_symbols == 1000
+    assert not calls["initial"].refresh and calls["initial"].cache_ttl_hours == 24
+    # Only the initial history may use recent raw cache. Daily settings stay fresh.
+    assert provider.refresh and provider.cache_ttl_hours == 0
+
+
+def test_live_bootstrap_rejects_existing_store_before_any_provider_access(tmp_path, monkeypatch):
+    from facdigger.data.contracts import DataContractError
+    from facdigger.production import runner
+
+    config = _config(tmp_path)
+    config.data.store_root.mkdir()
+    marker = config.data.store_root / "CURRENT"
+    marker.write_text("original-revision\n")
+    monkeypatch.setattr(runner, "_load_fixed_release", lambda _: (tmp_path, object()))
+
+    def no_provider_access(_):
+        pytest.fail("existing production source must be rejected before provider access")
+
+    monkeypatch.setattr(runner, "load_eodhd_config", no_provider_access)
+    with pytest.raises(DataContractError, match="empty production store_root"):
+        runner.bootstrap_store(config, live=True)
+    assert marker.read_text() == "original-revision\n"
+
+
 def test_tick_does_not_touch_release_or_data_before_first_attempt(tmp_path) -> None:
     config = _config(tmp_path)
     result = run_production_tick(

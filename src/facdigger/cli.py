@@ -986,8 +986,11 @@ def production_plan_command(
 @production_app.command("bootstrap")
 def production_bootstrap_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    live: Annotated[
+        bool, typer.Option(help="Fetch current-identity history into an empty production store."),
+    ] = False,
 ) -> None:
-    """Create the bounded production store from accepted historical bronze."""
+    """Initialize from accepted bronze, or explicitly fetch live history with --live."""
 
     from facdigger.production.config import load_production_config
     from facdigger.production.lock import ProductionLock
@@ -996,7 +999,7 @@ def production_bootstrap_command(
     production = load_production_config(config)
     try:
         with ProductionLock(production.state_database):
-            current = bootstrap_store(production)
+            current = bootstrap_store(production, live=live)
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc

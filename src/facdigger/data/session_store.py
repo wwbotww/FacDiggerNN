@@ -257,6 +257,86 @@ def bootstrap_production_store(
     return load_current_revision(root)
 
 
+def initialize_production_store(
+    revision: EODHDDailyRevision,
+    config: EODHDConfig,
+    store_root: str | Path,
+    *,
+    history_sessions: int,
+) -> ProductionSourceRevision:
+    """Create a new current-identity store; never relabel an old immutable source.
+
+    The fetched prefix establishes listing age and ADV20 before the retained
+    model context. Every past universe is rebuilt from that day's actual prices,
+    not from the target day's top stocks. This publishes no factor or labels.
+    """
+    root = Path(store_root).resolve()
+    if root.exists() and any(root.iterdir()):
+        raise DataContractError("live initialization requires an empty production store_root")
+    if config.universe.mode != "historical_liquid" or not config.quality_gate.enabled:
+        raise DataContractError("live initialization requires historical_liquid quality gates")
+    days = regular_sessions(revision.revision_start, revision.target_date)
+    prefix = max(config.min_listed_sessions, 20)
+    if len(days) < history_sessions + prefix:
+        raise DataContractError("live initialization lacks listing/liquidity warm-up history")
+    retained_start = _history_start(days, history_sessions)
+    calendar = regular_session_frame(days[0], days[-1])
+    bars = validate_bars(revision.bars)
+    if bars.filter(~pl.col("trade_date").is_in(days)).height:
+        raise DataContractError("live initialization contains dates outside its requested sessions")
+    if bars["trade_date"].unique().sort().to_list() != days:
+        raise TargetSessionIncomplete("live initialization has missing market sessions")
+    bars, identity_audit = quarantine_suspicious_identities(
+        bars, calendar,
+        max_adjusted_price_ratio=config.quality_gate.max_adjusted_price_ratio,
+        max_alias_overlap_relative_diff=config.quality_gate.max_alias_overlap_relative_diff,
+        max_quarantined_security_fraction=config.quality_gate.max_quarantined_security_fraction,
+    )
+    bars = validate_bars(bars)
+    quality_gate = assert_historical_ingestion_quality(
+        bars, calendar, max_adjusted_price_ratio=config.quality_gate.max_adjusted_price_ratio,
+    )
+    universe = build_universe(
+        bars, min_listed_sessions=config.min_listed_sessions,
+        min_price=config.min_price, min_adv20_usd=config.min_adv20_usd,
+        max_daily_symbols=config.universe.max_symbols, calendar=calendar,
+    )
+    frames = {
+        "bars": bars.filter(pl.col("trade_date") >= retained_start),
+        "universe": universe.filter(pl.col("trade_date") >= retained_start),
+    }
+    revision_id = uuid.uuid4().hex
+    _write_revision(root, revision_id, frames, {
+        "provider": "eodhd",
+        "resolved_start": retained_start.isoformat(),
+        "resolved_end": revision.target_date.isoformat(),
+        "source_revision": revision.source_revision,
+        "ingested_at": revision.ingested_at.isoformat(),
+        "production_revision": {
+            "contract": PRODUCTION_SOURCE_CONTRACT,
+            "kind": "live_initialization",
+            "history_sessions": history_sessions,
+        },
+        "bootstrap": {
+            "kind": "current_provider_identity",
+            "fetched_start": days[0].isoformat(),
+            "fetched_end": days[-1].isoformat(),
+            "fetched_sessions": len(days),
+            "history_sessions": history_sessions,
+            **daily_revision_audit(revision),
+        },
+        "quality": {"gate": quality_gate, "identity": identity_audit},
+        "selection": {"research_ready": False},
+        "warnings": [
+            "current provider identities apply only to this new production source; "
+            "this is not a point-in-time historical security master",
+            "historical industry and float market cap are unavailable",
+        ],
+    })
+    _advance_current(root, revision_id)
+    return load_current_revision(root)
+
+
 def _adjustment_changes(
     old_bars: pl.DataFrame,
     revised_bars: pl.DataFrame,

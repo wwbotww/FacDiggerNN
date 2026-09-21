@@ -17,7 +17,9 @@ from facdigger.data.providers.eodhd.daily import EODHDDailyRevision
 from facdigger.data.providers.eodhd.mapper import build_universe
 from facdigger.data.session_store import (
     AdjustmentBackfillRequired,
+    TargetSessionIncomplete,
     bootstrap_production_store,
+    initialize_production_store,
     load_current_revision,
     prune_source_revisions,
     publish_daily_source_revision,
@@ -195,6 +197,72 @@ def test_store_is_bounded_and_preserves_listed_day_count(tmp_path) -> None:
     assert [path.name for path in (store / "revisions").iterdir() if path.is_dir()] == [
         updated.revision_id
     ]
+
+
+def test_live_initialization_preserves_full_dated_universe_and_warmup(tmp_path) -> None:
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 7, 31))[
+        "trade_date"
+    ].to_list()[-60:]
+    bars = _bars(days).with_columns(
+        pl.when((pl.col("symbol") == "AAA") & (pl.col("trade_date") >= days[-5]))
+        .then(100_000_000.0).otherwise(pl.col("volume")).alias("volume"),
+    ).with_columns((pl.col("close") * pl.col("volume")).alias("dollar_volume"))
+    config = _provider_config(tmp_path)
+    config.universe.max_symbols = 1
+    store = tmp_path / "live"
+    current = initialize_production_store(
+        _revision(days, bars), config, store, history_sessions=40,
+    )
+    universe = pl.read_parquet(current.root / "universe_daily.parquet")
+    assert universe["trade_date"].unique().sort().to_list() == days[-40:]
+    assert universe["security_id"].n_unique() == 2
+    assert universe.filter(pl.col("trade_date") == days[-40])["listed_days"].min() == 21
+    assert universe.filter(
+        (pl.col("trade_date") == days[-40]) & pl.col("eligible")
+    )["symbol"].to_list() == ["BBB"]
+    assert universe.filter(
+        (pl.col("trade_date") == days[-1]) & pl.col("eligible")
+    )["symbol"].to_list() == ["AAA"]
+    assert current.manifest["bootstrap"]["fetched_sessions"] == 60
+    assert current.manifest["quality"]["gate"]["status"] == "passed"
+    original_hash = sha256_file(current.root / "eodhd_ingestion_manifest.json")
+    with pytest.raises(DataContractError, match="empty production"):
+        initialize_production_store(_revision(days, bars), config, store, history_sessions=40)
+    assert sha256_file(current.root / "eodhd_ingestion_manifest.json") == original_hash
+
+
+@pytest.mark.parametrize("invalid", ["missing_session", "short_warmup"])
+def test_live_initialization_never_commits_incomplete_source(tmp_path, invalid) -> None:
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 7, 31))[
+        "trade_date"
+    ].to_list()[-60:]
+    if invalid == "short_warmup":
+        days = days[-40:]
+    bars = _bars(days)
+    if invalid == "missing_session":
+        bars = bars.filter(pl.col("trade_date") != days[-8])
+    store = tmp_path / "live"
+    with pytest.raises((DataContractError, TargetSessionIncomplete)):
+        initialize_production_store(
+            _revision(days, bars), _provider_config(tmp_path), store, history_sessions=40,
+        )
+    assert not (store / "CURRENT").exists()
+
+
+def test_live_initialization_persists_real_quarantine_audit_dates(tmp_path) -> None:
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 7, 31))[
+        "trade_date"
+    ].to_list()[-60:]
+    bars = _bars(days, changed_last_factor=20.0)
+    config = _provider_config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    current = initialize_production_store(
+        _revision(days, bars), config, tmp_path / "live", history_sessions=40,
+    )
+    audit = current.manifest["quality"]["identity"]
+    assert audit["quarantined_securities"] == 1
+    assert audit["extreme_return_examples"][0]["trade_date"] == days[-1].isoformat()
+    assert current.manifest["quality"]["gate"]["status"] == "passed"
 
 
 def test_adjustment_change_requires_full_hot_history_backfill(tmp_path) -> None:

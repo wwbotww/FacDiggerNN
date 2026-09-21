@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -12,6 +13,8 @@ from facdigger.data.providers.eodhd.client import DailyCallBudget
 from facdigger.data.providers.eodhd.config import EODHDConfig
 from facdigger.data.providers.eodhd.daily import (
     DailyDataNotReady,
+    backfill_adjusted_histories,
+    daily_revision_audit,
     fetch_daily_revision,
     require_fresh_daily_requests,
 )
@@ -151,3 +154,69 @@ def test_one_invalid_stock_is_audited_without_fabricating_a_bar(tmp_path):
     target = revision.bars.filter(revision.bars["trade_date"] == date(2026, 8, 12))
     assert target["symbol"].to_list() == ["AAA"]
     assert revision.bars.height == 5
+
+
+class AliasClient(DailyClient):
+    def __init__(self, tmp_path, *, alias_price):
+        super().__init__(tmp_path)
+        self.alias_price = alias_price
+
+    def get_json(self, path, params=None, *, call_cost=1):
+        if path.startswith("eod/"):
+            return [{
+                "date": str((params or {})["to"]), "open": 10.0, "high": 11.0, "low": 9.0,
+                "close": 10.5, "adjusted_close": (
+                    self.alias_price if path == "eod/AAOLD.US" else 10.5
+                ), "volume": 1000.0,
+            }]
+        rows = super().get_json(path, params, call_cost=call_cost)
+        if not rows:
+            return rows
+        if path.startswith("exchange-symbol-list/"):
+            return [*rows, {**rows[0], "Code": "AAOLD"},
+                    {**rows[0], "Code": "BBB", "Isin": "US0000000002"}]
+        return [*rows, {**rows[0], "code": "AAOLD", "adjusted_close": self.alias_price},
+                {**rows[0], "code": "BBB"}]
+
+
+@pytest.mark.parametrize("alias_price,quarantined", [(10.6, 0), (21.0, 1)])
+def test_raw_aliases_are_checked_before_daily_consolidation(tmp_path, alias_price, quarantined):
+    config = _config(tmp_path)
+    # The fixture has only two identities; production retains its unchanged 10% cap.
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    revision = fetch_daily_revision(
+        AliasClient(tmp_path, alias_price=alias_price), config,
+        revision_start=date(2026, 8, 10), target_date=date(2026, 8, 12),
+    )
+    audit = revision.raw_quality_audits[0]["identity"]
+    # Production stores use strict JSON; audit dates must already be ISO strings.
+    json.dumps(daily_revision_audit(revision))
+    assert audit["quarantined_securities"] == quarantined
+    assert audit["alias_overlap_conflict_groups"] == 3 * quarantined
+    assert revision.bars.height == 3 * (2 - quarantined)
+    if quarantined:
+        assert revision.bars["symbol"].unique().to_list() == ["BBB"]
+        assert audit["quarantined_security_ids"] == ["eodhd:isin:US0000000001"]
+
+
+def test_systemic_raw_alias_conflicts_still_fail_the_quality_gate(tmp_path):
+    with pytest.raises(DataContractError, match="would quarantine"):
+        fetch_daily_revision(
+            AliasClient(tmp_path, alias_price=21.0), _config(tmp_path),
+            revision_start=date(2026, 8, 10), target_date=date(2026, 8, 12),
+        )
+
+
+def test_adjustment_backfill_cannot_hide_conflicting_aliases(tmp_path):
+    config = _config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    client = AliasClient(tmp_path, alias_price=10.6)
+    revision = fetch_daily_revision(
+        client, config, revision_start=date(2026, 8, 10), target_date=date(2026, 8, 12),
+    )
+    client.alias_price = 21.0
+    with pytest.raises(DailyDataNotReady, match="conflicting security identities"):
+        backfill_adjusted_histories(
+            client, config, revision, provider_symbols=["AAA.US", "AAOLD.US", "BBB.US"],
+            history_start=date(2026, 8, 10),
+        )

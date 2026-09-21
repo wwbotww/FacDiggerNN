@@ -6,11 +6,14 @@ FactorBatch 两文件目录；全历史回放的父 plan/state/manifest 只供 F
 Git commit，并用真实 FacDigger 产出的目录做契约测试，不能
 各写一份“看起来相同”的测试 fixture 后就认为联调完成。
 
-当前状态（2026-09-16）：两侧日历统一、HeyBoss 持仓保护、空组合 SKIP、预期日期/固定
+当前状态（2026-09-20）：两侧日历统一、HeyBoss 持仓保护、空组合 SKIP、预期日期/固定
 release 消费及审批恢复代码已完成，826 release 与原 validation 预测的历史交付已完成离线
 联合验收，具体产物与证据见本文末尾。无需重新实施这些功能或重复创建同一 release。
-仍待验证的是 fresh EODHD → 无标签每日推理 → HeyBoss 接纳与持续 paper 运行；历史回测
-不代表这条生产链路已验收，也不代表因子收益有效。真实运行库尚未迁移。
+FacDigger 已完成 fresh EODHD → Docker 无标签推理 → 2026-09-18 真实十只批次，固定 826
+release、XOM 新 ISIN 及 HeyBoss parser 逐值只读校验通过。稳定目录、发布时间、耗时和
+部署证据见[826 生产运行交接](826每日生产运行交接.md)。仍待验证的是 HeyBoss 真实配置
+下的接纳、联合提前量和连续五日；本轮没有迁移或写入其运行库，没有启动交易，也不代表
+因子收益有效。
 [`局部缺分持仓保护交接`](HeyBoss局部缺分持仓保护交接.md)保留原设计和回归要求；本文
 第 2 节旧消费者差异同样是历史背景，不是当前待重做清单。
 
@@ -379,6 +382,12 @@ docker compose up -d --build
 FactorBatch 永久保留；`data/snapshots/` 和 `data/walk_forward_snapshots/` 永不由服务
 修改。HeyBoss 只监视已完成的
 `artifacts/factor_batches/<delivery_id>/`，不读取 FacDigger SQLite、source store 或隐藏临时目录。
+
+发布恢复窗口已补齐：如果目录完成后、ledger 记账前退出，FacDigger 在采集前核验唯一原交付，
+恢复同一 delivery ID；源修订不能生成第二份同日交付。原快照、质量记录、release 血缘、目标
+及有效期映射须全部匹配，歧义/损坏则阻断。截止后只补记截止前已存在的合法原交付，不补发、
+不修改创建时间。HeyBoss 的独立截止、唯一接纳与冲突拒绝不变。隔离故障复验及部署边界见
+[826 每日生产运行交接](826每日生产运行交接.md#fd-04-发布恢复窗口复验2026-09-21)。
 
 每次交接记录 FacDigger commit、release ID、history ID/年份（若为历史回放）、delivery ID、
 source kind、日期范围、Parquet hash、row/date/eligible counts、`strict_out_of_sample=false`、被批准

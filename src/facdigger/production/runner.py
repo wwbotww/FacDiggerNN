@@ -35,6 +35,7 @@ from facdigger.data.session_store import (
     ProductionSourceRevision,
     TargetSessionIncomplete,
     bootstrap_production_store,
+    initialize_production_store,
     load_current_revision,
     publish_daily_source_revision,
 )
@@ -42,6 +43,7 @@ from facdigger.inference.releases import ModelReleaseManifest, load_model_releas
 from facdigger.inference.runner import run_signal_inference
 from facdigger.production.calendar import NEW_YORK, ProductionWindow, production_window
 from facdigger.production.config import ProductionServiceConfig
+from facdigger.production.publication import recover_publication
 from facdigger.production.quality import (
     assess_daily_quality,
     assess_market_quality,
@@ -109,8 +111,32 @@ def _history_sessions(
 
 def bootstrap_store(
     config: ProductionServiceConfig,
+    *,
+    live: bool = False,
 ) -> ProductionSourceRevision:
+    """Initialize explicitly from accepted bronze or a new live provider history."""
     _, release = _load_fixed_release(config)
+    if live:
+        root = config.data.store_root
+        if root.exists() and any(root.iterdir()):
+            raise DataContractError("live initialization requires an empty production store_root")
+        provider_config = load_eodhd_config(config.data.provider_config)
+        target = production_window(datetime.now(timezone.utc), config.schedule).target_date
+        history = _history_sessions(config, release)
+        sessions = history + max(provider_config.min_listed_sessions, 20)
+        start = shift_regular_session(target, -(sessions - 1))
+        # Initialization may resume recently fetched raw history. The first
+        # production tick still requires fresh target/revision EOD responses.
+        initial_config = provider_config.model_copy(update={
+            "refresh": False, "cache_ttl_hours": 24,
+        })
+        client = EODHDProvider(initial_config).client()
+        revision = fetch_daily_revision(
+            client, initial_config, revision_start=start, target_date=target,
+        )
+        return initialize_production_store(
+            revision, provider_config, root, history_sessions=history,
+        )
     try:
         current = load_current_revision(config.data.store_root)
     except FileNotFoundError:
@@ -193,7 +219,7 @@ def _expired_record(
     error = "publication cutoff reached without a complete target FactorBatch"
     state.put(
         window.target_date,
-        config.model.release_id,
+        existing.release_id if existing else config.model.release_id,
         "expired",
         attempts=attempts,
         error=error,
@@ -223,6 +249,36 @@ def _clock_value(clock: Any) -> datetime:
     return observed
 
 
+def _recover_record(
+    state: ProductionState,
+    config: ProductionServiceConfig,
+    window: ProductionWindow,
+    existing: ProductionRecord | None,
+    observed: datetime,
+) -> ProductionTickResult | None:
+    try:
+        record = recover_publication(config, state, window, existing, observed=observed)
+    except Exception as exc:
+        record = state.put(
+            window.target_date, existing.release_id if existing else config.model.release_id,
+            "blocked", attempts=existing.attempts if existing else 0,
+            snapshot_id=existing.snapshot_id if existing else None,
+            delivery_id=existing.delivery_id if existing else None,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return ProductionTickResult(
+            "blocked", window.target_date, window.phase, record.attempts,
+            error=record.error, quality=record.quality_report,
+        )
+    if record is None:
+        return None
+    return ProductionTickResult(
+        "already_published", window.target_date, window.phase, record.attempts,
+        snapshot_id=record.snapshot_id, delivery_id=record.delivery_id,
+        quality=record.quality_report,
+    )
+
+
 def run_production_tick(
     config: ProductionServiceConfig,
     *,
@@ -240,26 +296,26 @@ def run_production_tick(
         existing = state.get(window.target_date)
         latest = state.latest()
         if (
-            window.phase == "not_due"
-            and latest is not None
+            latest is not None
             and latest.target_date < window.target_date
             and latest.status not in {"published", "expired", "blocked"}
         ):
-            state.put(
-                latest.target_date,
-                latest.release_id,
-                "expired",
-                attempts=latest.attempts,
-                error="publication cutoff reached without a complete target FactorBatch",
+            previous_window = production_window(
+                datetime.combine(
+                    latest.target_date, config.schedule.first_attempt, tzinfo=NEW_YORK,
+                ),
+                config.schedule,
             )
-            return ProductionTickResult(
-                "expired",
-                latest.target_date,
-                "expired",
-                latest.attempts,
-                error="publication cutoff reached without a complete target FactorBatch",
-                quality=latest.quality_report,
+            previous_window = ProductionWindow(
+                previous_window.target_date, previous_window.first_attempt_at,
+                previous_window.cutoff_at, "expired",
             )
+            recovered = _recover_record(state, config, previous_window, latest, observed)
+            if recovered is not None:
+                return recovered
+            expired = _expired_record(state, config, previous_window, latest)
+            if window.phase == "not_due":
+                return expired
         if existing is not None and existing.release_id != config.model.release_id:
             raise DataContractError(
                 "fixed production release_id differs from the target's persisted release"
@@ -276,6 +332,12 @@ def run_production_tick(
             )
         if window.phase == "not_due":
             return ProductionTickResult("not_due", window.target_date, window.phase, 0)
+        # A committed directory can outlive its ledger transaction. Reconcile
+        # before retries, expiry, or any fresh source revision/model execution.
+        if existing is None or existing.status not in {"expired", "blocked"}:
+            recovered = _recover_record(state, config, window, existing, observed)
+            if recovered is not None:
+                return recovered
         if window.phase == "expired":
             return _expired_record(state, config, window, existing)
         if (

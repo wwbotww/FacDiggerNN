@@ -362,6 +362,7 @@ New York 交易时钟、重试状态和单实例锁，因此同一镜像可部�
 
 ```text
 19:00 America/New_York 首次尝试
+  -> 先核对已完成交付；退出窗口内的唯一合法原交付只补记 ledger
   -> 持久化采集前的计算池覆盖基准
   -> fresh EODHD 最近 10 session 修订（首次部署会补齐历史 bronze 到 D 的缺口）
   -> 调整因子变化证券的定向 hot-window 回填
@@ -380,7 +381,10 @@ New York 交易时钟、重试状态和单实例锁，因此同一镜像可部�
 `inference.minimum_*` 绝对数量约束，Finance 还检查共享市场输入。
 
 异常缺失或暂时性供应商错误每 30 分钟重新采集，到下一 regular session 09:30 ET 截止。
-即使 source 已更新到 D，只要尚未发布，重试也会重新获取修订；不会反复推理同一份缺数源。
+确认不存在已发布原交付后，即使 source 已更新到 D，重试也会重新获取修订；不会反复推理
+同一份缺数源。目录已发布而 ledger 未记账时，先用原快照、release、交付目标及质量记录
+核验并恢复同一 delivery ID，不因源修订发布第二份同日因子。歧义或损坏明确阻断；只有
+截止前已发布的合法交付可以在截止后补记，不能补发或修改原文件与时间。
 只有 D 的可用性与完整性检查都通过才发布，少量不可评分行不等于交付不完整。
 超过截止跳过 D，契约/身份/模型错误阻断 D 并告警；常驻服务继续等待后续交易日。
 不会使用旧 FactorBatch，也不会改写 `data/snapshots/` 或
@@ -394,12 +398,23 @@ New York 交易时钟、重试状态和单实例锁，因此同一镜像可部�
 成员补写历史，也不要修改训练 snapshot。日常修订会连同修订区间及缺口日期重建成员资格，
 保留区间外的历史状态；整体 ADV20 预热不足时停止发布，局部不足明确标记不可评分并计入门禁。
 
+如果没有可用 bronze，或公司重组使旧 source 身份不能与当前供应商身份安全衔接，可显式运行
+`production bootstrap --live`，在**空的 store_root** 中建立独立生产基底。它复用 EODHD daily
+adapter，取得完整计算池的 `context_length + feature_buffer_sessions + max(min_listed_sessions, 20)`
+个交易日，逐日计算真实价格/流动性成员资格，通过来源质量门禁后只保留模型热窗口。
+826 配置为 784 日初始化、532 日保留；约 78,400 个 bulk API 计费额度，另有元数据请求。
+这是当前身份下的推理上下文，不是 point-in-time 历史证券主表，不能代替研究数据。
+初始化可复用 24 小时内的原始请求缓存以便中断后重试；正式 `tick/serve` 仍会 fresh 获取最近
+10 日。非空 store 拒绝覆盖，训练 source/snapshot、旧 release 和已完成交付不被改写。
+
 `production status` 的 `latest.quality` 区分 `ready/degraded/insufficient`，记录计算/交付
 计数、缺数原因和市场检查；Docker 日志输出状态变化告警并去重。`production health` 判断
 心跳存活，同时附带最新业务状态，不能把“容器健康”当作“今日可以调仓”。
 HeyBoss 的缺分持仓保护及两侧 XNYS 日历统一代码已完成，826 原 validation 预测交付通过了
-离线历史验收；真实每日采集、无标签推理、开盘前接纳和持续 paper 仍待验证，真实运行库未迁移。
-见[局部缺分持仓保护交接](docs/HeyBoss局部缺分持仓保护交接.md)，不要把历史验收当成生产已就绪。
+离线历史验收。2026-09-20 已用真实 EODHD 数据在 Docker 中产出 D=2026-09-18 的
+`signal_inference`，十只交付及 HeyBoss 只读 parser 校验通过，日常 tick 实测约 122 秒。
+稳定目录、当前身份和运行证据见[826 生产运行交接](docs/826每日生产运行交接.md)；
+HeyBoss 实际接纳、联合提前量和连续五日仍待验收，本轮没有修改其运行库或启动交易。
 
 首次配置：
 
@@ -417,6 +432,9 @@ uv run facdigger production plan \
 
 uv run facdigger production bootstrap \
   --config configs/production/eodhd_daily.local.yaml
+# 没有可安全衔接的 bronze 时，改用以下命令（与上面二选一，要求新空 store_root）：
+# uv run facdigger production bootstrap --live \
+#   --config configs/production/eodhd_daily.local.yaml
 
 docker compose build
 docker compose up -d

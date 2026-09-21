@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     environment:
       EODHD_API_TOKEN: ${EODHD_API_TOKEN:?set EODHD_API_TOKEN before starting production}
+      # Bound CPU parallelism on the shared macOS Docker VM; do not change model inputs.
+      POLARS_MAX_THREADS: "4"
+      OMP_NUM_THREADS: "4"
     volumes:
       - ./configs:/app/configs:ro
       - ./data:/app/data

@@ -21,7 +21,10 @@ from facdigger.data.providers.eodhd.mapper import (
     filter_valid_eod_rows,
     map_eod_bars,
 )
-from facdigger.data.providers.eodhd.quality import filter_to_regular_sessions
+from facdigger.data.providers.eodhd.quality import (
+    filter_to_regular_sessions,
+    quarantine_suspicious_identities,
+)
 from facdigger.data.providers.eodhd.universe import discover_historical_symbols
 
 
@@ -42,6 +45,7 @@ class EODHDDailyRevision:
     ingested_at: datetime
     backfilled_provider_symbols: tuple[str, ...] = ()
     rejected_rows_by_symbol: tuple[tuple[str, int], ...] = ()
+    raw_quality_audits: tuple[dict[str, Any], ...] = ()
 
 
 def _discover(
@@ -99,6 +103,23 @@ def _mapped_rows(
     )
 
 
+def _quality_checked_bars(
+    bars: pl.DataFrame, config: EODHDConfig, calendar: pl.DataFrame,
+) -> tuple[pl.DataFrame, dict[str, Any]]:
+    """Inspect raw aliases before consolidation can hide conflicting observations."""
+    bars, calendar_audit = filter_to_regular_sessions(bars, calendar)
+    gate = config.quality_gate
+    bars, identity_audit = quarantine_suspicious_identities(
+        bars, calendar,
+        max_adjusted_price_ratio=gate.max_adjusted_price_ratio,
+        max_alias_overlap_relative_diff=gate.max_alias_overlap_relative_diff,
+        max_quarantined_security_fraction=gate.max_quarantined_security_fraction,
+    )
+    return validate_bars(consolidate_bars(bars)), {
+        "calendar": calendar_audit, "identity": identity_audit,
+    }
+
+
 def fetch_daily_revision(
     client: EODHDClient,
     config: EODHDConfig,
@@ -152,8 +173,7 @@ def fetch_daily_revision(
         raise DailyDataNotReady("EODHD returned no usable daily revision bars")
     bars = pl.concat(parts, how="vertical_relaxed")
     calendar = regular_session_frame(revision_start, target_date)
-    bars, _ = filter_to_regular_sessions(bars, calendar)
-    bars = validate_bars(consolidate_bars(bars))
+    bars, raw_quality = _quality_checked_bars(bars, config, calendar)
     maximum = bars["trade_date"].max()
     if maximum != target_date:
         raise DailyDataNotReady(
@@ -171,6 +191,7 @@ def fetch_daily_revision(
         source_revision=source_revision,
         ingested_at=ingested_at,
         rejected_rows_by_symbol=tuple(sorted(rejected_by_symbol.items())),
+        raw_quality_audits=({"stage": "bulk_revision", **raw_quality},),
     )
 
 
@@ -215,7 +236,14 @@ def backfill_adjusted_histories(
         if mapped is None:
             raise DailyDataNotReady(f"EODHD returned no targeted history for {symbol}")
         backfill_parts.append(mapped)
-    backfill = validate_bars(consolidate_bars(pl.concat(backfill_parts)))
+    backfill, raw_quality = _quality_checked_bars(
+        pl.concat(backfill_parts), config,
+        regular_session_frame(history_start, revision.target_date),
+    )
+    if raw_quality["identity"]["quarantined_securities"]:
+        # An unsafe replacement cannot repair an adjustment boundary. Never keep
+        # the old history and pretend that the requested full backfill succeeded.
+        raise DailyDataNotReady("targeted adjustment history has conflicting security identities")
     merged = validate_bars(
         consolidate_bars(
             pl.concat([revision.bars, backfill], how="vertical_relaxed")
@@ -228,6 +256,9 @@ def backfill_adjusted_histories(
         request_log=tuple(client.request_log),
         backfilled_provider_symbols=tuple(requested),
         rejected_rows_by_symbol=tuple(sorted(rejected_by_symbol.items())),
+        raw_quality_audits=(
+            *revision.raw_quality_audits, {"stage": "adjustment_backfill", **raw_quality},
+        ),
     )
 
 
@@ -242,6 +273,7 @@ def daily_revision_audit(revision: EODHDDailyRevision) -> dict[str, Any]:
         "rejected_rows_by_symbol": dict(revision.rejected_rows_by_symbol),
         "requests": list(revision.request_log),
         "backfilled_provider_symbols": list(revision.backfilled_provider_symbols),
+        "raw_quality": list(revision.raw_quality_audits),
     }
 
 
