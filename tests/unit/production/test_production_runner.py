@@ -310,6 +310,41 @@ def test_partial_data_publishes_explicit_null_without_old_factor(daily_tick):
     assert controls.fetches == 1
 
 
+def test_backfill_releases_failed_merge_frame_before_loading_again(daily_tick, monkeypatch):
+    import gc
+    import weakref
+
+    from facdigger.data.session_store import AdjustmentBackfillRequired
+    from facdigger.production import runner
+
+    config, controls = daily_tick
+    publish = runner.publish_daily_source_revision
+    retained = []
+
+    class LargeFrame:
+        """Stand in for the failed merge's locally owned price tables."""
+
+    def require_backfill(*args, **kwargs):
+        if not retained:
+            large_frame = LargeFrame()
+            retained.append(weakref.ref(large_frame))
+            raise AdjustmentBackfillRequired(["sec-0"], ["S0.US"], date(2026, 6, 1))
+        return publish(*args, **kwargs)
+
+    def backfill(client, provider_config, revision, *, provider_symbols, history_start):
+        gc.collect()
+        assert retained[0]() is None, "failed source merge still retains its large local frames"
+        assert provider_symbols == ["S0.US"]
+        assert history_start == date(2026, 6, 1)
+        return revision
+
+    monkeypatch.setattr(runner, "publish_daily_source_revision", require_backfill)
+    monkeypatch.setattr(runner, "backfill_adjusted_histories", backfill)
+    result = _tick(config)
+    assert result.action == "published", result.error
+    assert len(controls.published) == 1
+
+
 def test_retry_refetches_after_source_commit_and_inference_shortfall(daily_tick):
     config, controls = daily_tick
     controls.window_missing[1] = {"sec-0", "sec-1"}

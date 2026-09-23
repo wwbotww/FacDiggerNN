@@ -330,7 +330,7 @@ def initialize_production_store(
         raise DataContractError("live initialization contains dates outside its requested sessions")
     if bars["trade_date"].unique().sort().to_list() != days:
         raise TargetSessionIncomplete("live initialization has missing market sessions")
-    known_bars = bars
+    known_bars = bars.select("security_id", "trade_date", "symbol", "provider_symbol")
     bars, identity_audit = quarantine_suspicious_identities(
         bars, calendar,
         max_adjusted_price_ratio=config.quality_gate.max_adjusted_price_ratio,
@@ -532,7 +532,13 @@ def publish_daily_source_revision(
     old_universe = validate_universe(
         pl.read_parquet(current.root / PRODUCTION_SOURCE_FILES["universe"])
     )
-    known_bars = pl.concat([old_bars, revision.bars], how="vertical_relaxed")
+    # Membership evidence needs identifiers/dates only, not another retained copy
+    # of every price/provenance column through the full-history merge.
+    known_columns = ["security_id", "trade_date", "symbol", "provider_symbol"]
+    known_bars = pl.concat(
+        [old_bars.select(known_columns), revision.bars.select(known_columns)],
+        how="vertical_relaxed",
+    )
     quarantines = _source_quarantines(current)
     fresh_quarantines = revision_quarantines(revision.raw_quality_audits)
     metadata = build_metadata_index(list(revision.metadata_rows), config.exchange_code)

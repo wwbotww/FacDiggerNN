@@ -468,6 +468,7 @@ def run_production_tick(
             )
             require_fresh_daily_requests(revision)
             mark_stage("source_commit")
+            backfill_request = None
             try:
                 current = publish_daily_source_revision(
                     current,
@@ -477,13 +478,18 @@ def run_production_tick(
                     history_sessions=history_sessions,
                 )
             except AdjustmentBackfillRequired as required:
+                backfill_request = (required.provider_symbols, required.history_start)
+            # Leave the exception scope before loading another full history. Its
+            # traceback otherwise retains all large tables from the failed merge.
+            if backfill_request is not None:
+                provider_symbols, history_start = backfill_request
                 mark_stage("adjustment_backfill")
                 revision = backfill_adjusted_histories(
                     client,
                     provider_config,
                     revision,
-                    provider_symbols=required.provider_symbols,
-                    history_start=required.history_start,
+                    provider_symbols=provider_symbols,
+                    history_start=history_start,
                 )
                 require_fresh_daily_requests(revision)
                 mark_stage("source_commit")
