@@ -655,6 +655,9 @@ def publish_daily_source_revision(
             config.exchange_code,
         )
     )
+    # The merged table now owns the next stage. Do not retain old/full replacement
+    # tables while quality checks and universe construction allocate their output.
+    del old_bars, unchanged_old, revised_bars
     start = bars["trade_date"].min()
     if start is None:
         raise DataContractError("merged production bars are empty")
@@ -684,6 +687,7 @@ def publish_daily_source_revision(
         ),
     )
     clean_bars = validate_bars(clean_bars)
+    del bars
     quarantines = merge_quarantines(quarantines, audit_quarantines(identity_audit))
     total_ids = set(known_bars["security_id"]) | set(quarantines)
     if len(quarantines) / len(total_ids) > config.quality_gate.max_quarantined_security_fraction:
@@ -713,9 +717,6 @@ def publish_daily_source_revision(
         {"trade_date": universe_calendar_days},
         schema={"trade_date": pl.Date},
     )
-    hot_bars = validate_bars(
-        clean_bars.filter(pl.col("trade_date").is_in(retained_sessions))
-    )
     universe = build_universe(
         clean_bars,
         min_listed_sessions=config.min_listed_sessions,
@@ -731,6 +732,10 @@ def publish_daily_source_revision(
             universe_calendar_days[0],
         ),
     )
+    hot_bars = validate_bars(
+        clean_bars.filter(pl.col("trade_date").is_in(retained_sessions))
+    )
+    del clean_bars
     universe = validate_universe(
         pl.concat(
             [
@@ -740,10 +745,12 @@ def publish_daily_source_revision(
             how="vertical_relaxed",
         ).filter(pl.col("trade_date").is_in(retained_sessions))
     )
-    universe = validate_universe(retain_quarantined_candidates(
+    universe = retain_quarantined_candidates(
         universe, old_universe, known_bars, quarantines, days=sessions[-history_sessions:],
         metadata_rows=revision.metadata_rows, exchange_code=config.exchange_code,
-    ))
+    )
+    del old_universe, known_bars
+    universe = validate_universe(universe)
     observed_target_rows = hot_bars.filter(
         pl.col("trade_date") == revision.target_date
     ).height

@@ -55,7 +55,6 @@ def quarantine_suspicious_identities(
         adjusted.group_by(["security_id", "trade_date"])
         .agg(
             pl.col("provider_symbol").n_unique().alias("_aliases"),
-            pl.col("provider_symbol").unique().sort().alias("provider_symbols"),
             pl.col("_adjusted_price").min().alias("_minimum"),
             pl.col("_adjusted_price").max().alias("_maximum"),
         )
@@ -67,6 +66,15 @@ def quarantine_suspicious_identities(
             )
         )
     )
+    # Materialize alias lists only for failing groups, not millions of ordinary
+    # security/date keys. The scalar conflict gate above still checks every row.
+    alias_keys = ["security_id", "trade_date"]
+    alias_symbols = (
+        adjusted.join(alias_conflicts.select(alias_keys), on=alias_keys, how="semi")
+        .group_by(alias_keys)
+        .agg(pl.col("provider_symbol").unique().sort().alias("provider_symbols"))
+    )
+    alias_conflicts = alias_conflicts.join(alias_symbols, on=alias_keys, validate="1:1")
 
     indexed = calendar.with_row_index("_session_index")
     sequential = (

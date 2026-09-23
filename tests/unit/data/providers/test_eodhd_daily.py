@@ -199,6 +199,37 @@ def test_raw_aliases_are_checked_before_daily_consolidation(tmp_path, alias_pric
         assert audit["quarantined_security_ids"] == ["eodhd:isin:US0000000001"]
 
 
+@pytest.mark.parametrize("alias_price,conflict_rows", [(10.6, 0), (21.0, 6)])
+def test_alias_evidence_lists_only_materialize_conflicts(tmp_path, monkeypatch,
+                                                       alias_price, conflict_rows):
+    import polars as pl
+    from polars.dataframe.group_by import GroupBy
+
+    # Millions of clean security/date groups must not each allocate a list of
+    # aliases just to discard it. Scalar gate checks still see every raw row.
+    aggregate = GroupBy.agg
+    list_rows = []
+
+    def observe(self, *expressions, **named_expressions):
+        if any(isinstance(expr, pl.Expr) and expr.meta.output_name() == "provider_symbols"
+               for expr in expressions):
+            list_rows.append(self.df.height)
+        return aggregate(self, *expressions, **named_expressions)
+
+    monkeypatch.setattr(GroupBy, "agg", observe)
+    config = _config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    revision = fetch_daily_revision(
+        AliasClient(tmp_path, alias_price=alias_price), config,
+        revision_start=date(2026, 8, 10), target_date=date(2026, 8, 12),
+    )
+    assert sum(list_rows) == conflict_rows
+    audit = revision.raw_quality_audits[0]["identity"]
+    assert audit["alias_overlap_conflict_groups"] == (3 if conflict_rows else 0)
+    for example in audit["alias_overlap_examples"]:
+        assert example["provider_symbols"] == ["AAA.US", "AAOLD.US"]
+
+
 def test_systemic_raw_alias_conflicts_still_fail_the_quality_gate(tmp_path):
     with pytest.raises(DataContractError, match="would quarantine"):
         fetch_daily_revision(
