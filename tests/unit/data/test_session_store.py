@@ -265,6 +265,33 @@ def test_live_initialization_persists_real_quarantine_audit_dates(tmp_path) -> N
     assert current.manifest["quality"]["gate"]["status"] == "passed"
 
 
+def test_quarantined_history_cannot_reenter_from_a_clean_short_window(tmp_path):
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 7, 31))[
+        "trade_date"
+    ].to_list()[-60:]
+    config = _provider_config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    store = tmp_path / "live"
+    current = initialize_production_store(
+        _revision(days, _bars(days, changed_last_factor=20)), config, store,
+        history_sessions=40,
+    )
+    for _ in range(2):
+        current = publish_daily_source_revision(
+            current, _revision(days[-10:], _bars(days[-10:])), config, store,
+            history_sessions=40,
+        )
+        bars = pl.read_parquet(current.root / "bars_daily.parquet")
+        assert bars.filter(pl.col("symbol") == "AAA").is_empty()
+        candidates = pl.read_parquet(current.root / "universe_daily.parquet").filter(
+            pl.col("trade_date") == days[-1]
+        )
+        assert set(candidates["symbol"]) == {"AAA", "BBB"}
+        row = candidates.filter(pl.col("symbol") == "AAA").row(0, named=True)
+        assert row["eligible"] is False and row["close"] is None
+        assert row["trade_status_quality"] == "source_quality_quarantined"
+
+
 def test_adjustment_change_requires_full_hot_history_backfill(tmp_path) -> None:
     days = regular_session_frame(date(2026, 5, 1), date(2026, 7, 29))["trade_date"].to_list()
     source = _bootstrap_source(tmp_path, days)
@@ -407,3 +434,173 @@ def test_missing_whole_market_session_is_retryable_and_does_not_advance_store(tm
             history_sessions=40,
         )
     assert load_current_revision(store).revision_id == current.revision_id
+
+
+@pytest.mark.parametrize("missing_middle", [False, True])
+def test_full_backfill_replaces_old_history_even_without_overlap_factor_change(
+    tmp_path, missing_middle,
+):
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 8, 10))["trade_date"].to_list()
+    source = _bootstrap_source(tmp_path, days)
+    store = tmp_path / "store"
+    current = bootstrap_production_store(source, store, history_sessions=40)
+    original_hash = sha256_file(current.root / "bars_daily.parquet")
+    old = pl.read_parquet(current.root / "bars_daily.parquet")
+    changed_day = days[-25]
+    complete = old.with_columns(
+        pl.when((pl.col("symbol") == "AAA") & (pl.col("trade_date") == changed_day))
+        .then(0.5).otherwise(pl.col("adj_factor")).alias("adj_factor"),
+    ).filter((pl.col("symbol") == "AAA") | (pl.col("trade_date") >= days[-10]))
+    if missing_middle:
+        complete = complete.filter(
+            ~((pl.col("symbol") == "AAA") & (pl.col("trade_date") == days[-20]))
+        )
+    revision = replace(_revision(days[-10:], complete), backfilled_provider_symbols=("AAA.US",))
+    config = _provider_config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    updated = publish_daily_source_revision(current, revision, config, store, history_sessions=40)
+    assert sha256_file(current.root / "bars_daily.parquet") == original_hash
+    observed = pl.read_parquet(updated.root / "bars_daily.parquet")
+    target = pl.read_parquet(updated.root / "universe_daily.parquet").filter(
+        pl.col("trade_date") == days[-1]
+    )
+    assert target.height == 2  # Exclusion never shrinks membership.
+    if missing_middle:
+        assert observed.filter(pl.col("symbol") == "AAA").is_empty()
+        assert updated.manifest["quarantines"][0]["reasons"] == ["incomplete_adjustment_history"]
+        assert updated.manifest["daily_update"]["backfilled_provider_symbols"] == []
+        assert target.filter(pl.col("symbol") == "AAA")["close"].item() is None
+    else:
+        assert observed.filter(
+            (pl.col("symbol") == "AAA") & (pl.col("trade_date") == changed_day)
+        )["adj_factor"].item() == 0.5
+        assert not updated.manifest["quarantines"]
+        assert updated.manifest["daily_update"]["backfilled_provider_symbols"] == ["AAA.US"]
+
+
+def test_full_clean_context_can_clear_persisted_quarantine(tmp_path):
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 8, 10))["trade_date"].to_list()
+    config = _provider_config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    store = tmp_path / "store"
+    current = initialize_production_store(
+        _revision(days, _bars(days, changed_last_factor=20)), config, store, history_sessions=40,
+    )
+    full = _bars(days).filter((pl.col("symbol") == "AAA") | (pl.col("trade_date") >= days[-10]))
+    revision = replace(_revision(days[-10:], full), backfilled_provider_symbols=("AAA.US",))
+    updated = publish_daily_source_revision(current, revision, config, store, history_sessions=40)
+    assert updated.manifest["quarantines"] == []
+    assert pl.read_parquet(updated.root / "bars_daily.parquet")["security_id"].n_unique() == 2
+    target = pl.read_parquet(updated.root / "universe_daily.parquet").filter(
+        pl.col("trade_date") == days[-1]
+    )
+    assert target["eligible"].to_list() == [True, True]
+
+
+def test_metadata_cannot_silently_relabel_quarantined_isin(tmp_path):
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 8, 10))["trade_date"].to_list()
+    config = _provider_config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    store = tmp_path / "store"
+    current = initialize_production_store(
+        _revision(days, _bars(days, changed_last_factor=20)), config, store, history_sessions=40,
+    )
+    revision = _revision(days[-10:], _bars(days[-10:]))
+    revision = replace(revision, metadata_rows=(
+        {**revision.metadata_rows[0], "Isin": "US0000000099"}, revision.metadata_rows[1],
+    ))
+    with pytest.raises(DataContractError, match="remapped existing production identity"):
+        publish_daily_source_revision(current, revision, config, store, history_sessions=40)
+    assert load_current_revision(store).revision_id == current.revision_id
+
+
+def test_legacy_quarantine_recovery_requires_valid_parent_evidence(tmp_path):
+    from facdigger.data.session_store import _source_quarantines
+
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 8, 10))["trade_date"].to_list()
+    config = _provider_config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    store = tmp_path / "store"
+    parent = initialize_production_store(
+        _revision(days, _bars(days, changed_last_factor=20)), config, store, history_sessions=40,
+    )
+    updated = publish_daily_source_revision(
+        parent, _revision(days[-10:], _bars(days[-10:])), config, store, history_sessions=40,
+    )
+    # Reproduce the old format, which retained evidence only in the parent audit.
+    for revision in (parent, updated):
+        path = revision.root / "eodhd_ingestion_manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest.pop("quarantines")
+        path.write_text(json.dumps(manifest))
+    current = load_current_revision(store)
+    recovered = _source_quarantines(current)
+    assert recovered["eodhd:isin:US0000000001"]["reasons"] == ["extreme_adjusted_return"]
+    parent_bars = parent.root / "bars_daily.parquet"
+    parent_bars.write_bytes(b"corrupt fixture")
+    with pytest.raises(DataContractError, match="artifact integrity failure"):
+        _source_quarantines(current)
+    parent_bars.unlink()
+    with pytest.raises(DataContractError, match="artifact integrity failure"):
+        _source_quarantines(current)
+    (parent.root / "eodhd_ingestion_manifest.json").unlink()
+    with pytest.raises(DataContractError, match="incomplete revision"):
+        _source_quarantines(current)
+
+
+def test_source_commit_interruption_does_not_change_previous_current(tmp_path, monkeypatch):
+    from facdigger.data import session_store
+
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 8, 10))["trade_date"].to_list()
+    source = _bootstrap_source(tmp_path, days)
+    store = tmp_path / "store"
+    current = bootstrap_production_store(source, store, history_sessions=40)
+    revision = _revision(days[-10:], _bars(days[-10:]))
+    original = session_store._advance_current
+
+    def interrupted(*args):
+        raise SystemExit("stopped before CURRENT commit")
+
+    monkeypatch.setattr(session_store, "_advance_current", interrupted)
+    with pytest.raises(SystemExit):
+        publish_daily_source_revision(
+            current, revision, _provider_config(tmp_path), store, history_sessions=40,
+        )
+    assert load_current_revision(store).revision_id == current.revision_id
+    monkeypatch.setattr(session_store, "_advance_current", original)
+    updated = publish_daily_source_revision(
+        load_current_revision(store), revision, _provider_config(tmp_path), store,
+        history_sessions=40,
+    )
+    assert load_current_revision(store).revision_id == updated.revision_id
+
+
+def test_missing_legacy_quality_audit_is_not_treated_as_empty_quarantine(tmp_path):
+    from facdigger.data.session_store import _source_quarantines
+
+    days = regular_session_frame(date(2026, 4, 1), date(2026, 8, 10))["trade_date"].to_list()
+    config = _provider_config(tmp_path)
+    current = initialize_production_store(
+        _revision(days, _bars(days)), config, tmp_path / "store", history_sessions=40,
+    )
+    manifest = {key: value for key, value in current.manifest.items()
+                if key not in {"quarantines", "quality"}}
+    with pytest.raises(DataContractError, match="missing original production quarantine evidence"):
+        _source_quarantines(replace(current, manifest=manifest))
+
+
+def test_real_mgn_raw_revision_requires_backfill_even_when_adjusted_close_is_unchanged():
+    from facdigger.data.session_store import _adjustment_changes
+
+    sample = json.loads((Path(__file__).parents[2] / "fixtures/eodhd_adjustment_quality.json")
+                        .read_text())
+    example = sample["revision_example"]
+    day = date.fromisoformat(example["date"])
+    identity = f"eodhd:isin:{sample['isin']}"
+    old = pl.DataFrame({"security_id": [identity], "trade_date": [day],
+                        "adj_factor": [example["old_adjusted_close"] / example["old_close"]]})
+    revised = old.with_columns(pl.lit(
+        example["revised_adjusted_close"] / example["revised_close"]
+    ).alias("adj_factor"))
+    assert example["old_adjusted_close"] == example["revised_adjusted_close"]
+    assert _adjustment_changes(old, revised, day) == [identity]

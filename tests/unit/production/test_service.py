@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from facdigger.production.config import ProductionServiceConfig
 from facdigger.production.service import production_health
 from facdigger.production.state import ProductionState
@@ -75,3 +77,34 @@ def test_service_continues_after_waiting_and_blocked_ticks(tmp_path, monkeypatch
     monkeypatch.setattr("facdigger.production.service._heartbeat_wait", lambda *args: None)
     serve_production(config, stop_event=stopped)
     assert observed == ["waiting_data", "blocked", "expired"]
+
+
+@pytest.mark.parametrize("start,jump", [
+    (datetime(2026, 9, 23, 22, 30, tzinfo=timezone.utc), 3600),  # First 19:00 NY attempt.
+    (datetime(2026, 9, 24, 0, 0, tzinfo=timezone.utc), 1800),  # Retry window.
+    (datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc), 3600),  # Past market open.
+])
+def test_wait_rechecks_absolute_time_after_suspend(tmp_path, monkeypatch, start, jump):
+    from facdigger.production import service
+
+    observed = [start]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed[0].astimezone(tz)
+
+    class Stop:
+        calls = 0
+
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            self.calls += 1
+            observed[0] += timedelta(seconds=seconds + (jump if self.calls == 1 else 0))
+
+    stop = Stop()
+    monkeypatch.setattr(service, "datetime", Clock)
+    service._heartbeat_wait(_config(tmp_path), stop, 1800, "not_due")
+    assert stop.calls == 1

@@ -215,8 +215,133 @@ def test_adjustment_backfill_cannot_hide_conflicting_aliases(tmp_path):
         client, config, revision_start=date(2026, 8, 10), target_date=date(2026, 8, 12),
     )
     client.alias_price = 21.0
-    with pytest.raises(DailyDataNotReady, match="conflicting security identities"):
-        backfill_adjusted_histories(
-            client, config, revision, provider_symbols=["AAA.US", "AAOLD.US", "BBB.US"],
-            history_start=date(2026, 8, 10),
-        )
+    result = backfill_adjusted_histories(
+        client, config, revision, provider_symbols=["AAA.US", "BBB.US"],
+        history_start=date(2026, 8, 10),
+    )
+    assert result.bars["symbol"].unique().to_list() == ["BBB"]
+    assert result.backfilled_provider_symbols == ("BBB.US",)
+    assert result.raw_quality_audits[-1]["identity"]["quarantined_security_ids"] == [
+        "eodhd:isin:US0000000001",
+    ]
+
+
+def test_consistent_same_isin_aliases_remain_one_identity_after_backfill(tmp_path):
+    client = AliasClient(tmp_path, alias_price=10.5)
+    config = _config(tmp_path)
+    revision = fetch_daily_revision(
+        client, config, revision_start=date(2026, 8, 12), target_date=date(2026, 8, 12),
+    )
+    result = backfill_adjusted_histories(
+        client, config, revision, provider_symbols=["AAA.US", "BBB.US"],
+        history_start=date(2026, 8, 12),
+    )
+    assert result.backfilled_provider_symbols == ("AAA.US", "AAOLD.US", "BBB.US")
+    assert result.bars.height == result.bars["security_id"].n_unique() == 2
+    assert not result.raw_quality_audits[-1]["identity"]["quarantines"]
+
+
+def test_bulk_targeted_disagreement_is_not_resolved_by_deduplication(tmp_path):
+    import polars as pl
+
+    config = _config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    client = AliasClient(tmp_path, alias_price=10.5)
+    revision = fetch_daily_revision(
+        client, config, revision_start=date(2026, 8, 12), target_date=date(2026, 8, 12),
+    )
+    revision = replace(revision, bars=revision.bars.with_columns(
+        pl.when(pl.col("symbol") == "AAA").then(2000.0)
+        .otherwise(pl.col("volume")).alias("volume"),
+    ))
+    result = backfill_adjusted_histories(
+        client, config, revision, provider_symbols=["AAA.US", "BBB.US"],
+        history_start=date(2026, 8, 12),
+    )
+    assert result.bars["symbol"].to_list() == ["BBB"]
+    assert result.backfilled_provider_symbols == ("BBB.US",)
+    assert result.raw_quality_audits[-1]["unavailable_histories"][0]["reasons"] == [
+        "endpoint_history_conflict",
+    ]
+
+
+@pytest.mark.parametrize("empty_required", [False, True])
+def test_empty_retired_alias_is_distinguished_from_missing_expected_history(
+    tmp_path, empty_required,
+):
+    class EmptyAliasClient(AliasClient):
+        def get_json(self, path, params=None, *, call_cost=1):
+            if path == ("eod/AAA.US" if empty_required else "eod/AAOLD.US"):
+                return []
+            return super().get_json(path, params, call_cost=call_cost)
+
+    config = _config(tmp_path)
+    config.quality_gate.max_quarantined_security_fraction = 0.5
+    client = EmptyAliasClient(tmp_path, alias_price=10.5)
+    revision = fetch_daily_revision(
+        client, config, revision_start=date(2026, 8, 12), target_date=date(2026, 8, 12),
+    )
+    revision = replace(revision, metadata_rows=tuple(
+        {**row, "_is_delisted": True} if row["Code"] == "AAOLD" else row
+        for row in revision.metadata_rows
+    ))
+    result = backfill_adjusted_histories(
+        client, config, revision, provider_symbols=["AAA.US", "BBB.US"],
+        history_start=date(2026, 8, 12),
+    )
+    audit = result.raw_quality_audits[-1]
+    if empty_required:
+        assert result.backfilled_provider_symbols == ("BBB.US",)
+        assert audit["unavailable_histories"][0]["reasons"] == ["incomplete_adjustment_history"]
+    else:
+        assert result.backfilled_provider_symbols == ("AAA.US", "AAOLD.US", "BBB.US")
+        assert audit["unavailable_histories"] == []
+        assert audit["empty_related_aliases"] == ["AAOLD.US"]
+
+
+def test_real_mgn_extreme_return_is_isolated_not_misreported_as_alias_conflict(tmp_path):
+    from datetime import datetime, timezone
+
+    import polars as pl
+
+    from facdigger.data.providers.eodhd.daily import EODHDDailyRevision, _mapped_rows
+    from facdigger.data.providers.eodhd.mapper import build_metadata_index
+
+    sample = json.loads((Path(__file__).parents[3] / "fixtures/eodhd_adjustment_quality.json")
+                        .read_text())
+    metadata_rows = [{"Code": "MGN", "Isin": sample["isin"], "Exchange": "NASDAQ"}]
+    metadata_rows += [{"Code": f"OK{i}", "Isin": f"US{i:010d}", "Exchange": "NASDAQ"}
+                      for i in range(10)]
+    metadata = build_metadata_index(metadata_rows, "US")
+    now = datetime(2026, 9, 23, tzinfo=timezone.utc)
+    payloads = {"MGN.US": sample["rows"]}
+    for i in range(10):
+        payloads[f"OK{i}.US"] = [
+            {**row, "open": 10, "high": 11, "low": 9, "close": 10, "adjusted_close": 10}
+            for row in sample["rows"]
+        ]
+    raw, _, _ = _mapped_rows(payloads, metadata, source_revision="test", ingested_at=now)
+    revision = EODHDDailyRevision(
+        date(2026, 3, 26), date(2026, 3, 26),
+            raw.filter(pl.col("trade_date") == "2026-03-26").with_columns(
+                pl.col("trade_date").str.to_date()
+            ), tuple(metadata_rows),
+        11, 0, (), "test", now,
+    )
+
+    class Client:
+        request_log = []
+
+        def get_json(self, path, params):
+            return payloads[path.removeprefix("eod/")]
+
+    result = backfill_adjusted_histories(
+        Client(), _config(tmp_path), revision, provider_symbols=list(payloads),
+        history_start=date(2026, 3, 25),
+    )
+    audit = result.raw_quality_audits[-1]["identity"]
+    assert audit["alias_overlap_conflict_groups"] == 0
+    assert audit["extreme_consecutive_return_rows"] == 1
+    assert audit["quarantines"][0]["reasons"] == ["extreme_adjusted_return"]
+    assert result.bars["security_id"].n_unique() == 10
+    assert "MGN.US" not in result.backfilled_provider_symbols

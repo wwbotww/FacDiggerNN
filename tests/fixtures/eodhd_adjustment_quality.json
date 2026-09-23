@@ -1,0 +1,17 @@
+{
+  "source": "EODHD cached eod/MGN.US, fetched 2026-09-23T12:45:39.766796+00:00; minimum regression excerpt, not a production input",
+  "symbol": "MGN.US",
+  "isin": "KYG5980E1052",
+  "rows": [
+    {"date": "2026-03-25", "open": 4.82, "high": 5.18, "low": 4.22, "close": 4.24, "adjusted_close": 127.2, "volume": 973596},
+    {"date": "2026-03-26", "open": 0.4232, "high": 0.4681, "low": 0.255, "close": 0.2801, "adjusted_close": 8.403, "volume": 1307987}
+  ],
+  "revision_example": {
+    "date": "2026-09-14",
+    "old_close": 0.1772,
+    "old_adjusted_close": 5.316,
+    "revised_close": 5.316,
+    "revised_adjusted_close": 5.316,
+    "note": "Observed provider revision, not an instruction to reconstruct prices or change identities."
+  }
+}

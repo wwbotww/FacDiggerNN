@@ -143,6 +143,8 @@ class ProductionState:
                 quality_reference = existing.quality_reference
             if quality_report is None and existing is not None:
                 quality_report = existing.quality_report
+            if status == "running" and error is None and existing is not None:
+                error = existing.error  # A retry/crash must not erase the last failure.
             self._connection.execute(
                 """
                 INSERT INTO production_runs (
@@ -214,6 +216,7 @@ class ProductionState:
             "next_retry_at": record.next_retry_at.isoformat() if record.next_retry_at else None,
             "computation": quality.get("computation"),
             "delivery": quality.get("delivery"),
+            "error": record.error,
         }, sort_keys=True))
 
     def latest(self) -> ProductionRecord | None:

@@ -208,7 +208,9 @@ def daily_tick(tmp_path, monkeypatch):
     history.filter(pl.col("trade_date") < days[-1]).write_parquet(
         source / "universe_daily.parquet"
     )
-    current = SimpleNamespace(root=source, manifest={"resolved_end": days[-2].isoformat()})
+    current = SimpleNamespace(
+        root=source, revision_id="fixture", manifest={"resolved_end": days[-2].isoformat()},
+    )
     controls = SimpleNamespace(
         fetches=0, source_missing={}, window_missing={}, published=[], latest_candidates=None,
         history=history, current=current,
@@ -230,7 +232,7 @@ def daily_tick(tmp_path, monkeypatch):
 
     def fetch(*args, **kwargs):
         controls.fetches += 1
-        return object()
+        return SimpleNamespace(backfilled_provider_symbols=())
 
     def publish(*args, **kwargs):
         missing = controls.source_missing.get(controls.fetches, set())
@@ -384,3 +386,38 @@ def test_reduced_day_cannot_become_next_days_smaller_reference(
     assert reference["target_date"] == "2026-08-18"
     assert reference["reference_date"] == "2026-08-14"
     assert len(reference["security_ids"]) == 20
+
+
+def test_expiry_retains_actual_failure_and_is_idempotent(tmp_path, monkeypatch, caplog):
+    import json
+    import logging
+    from datetime import timedelta
+
+    from facdigger.data.providers.eodhd.daily import DailyDataNotReady
+
+    config = _config(tmp_path)
+    observed = datetime(2026, 9, 22, 20, tzinfo=NY)
+    caplog.set_level(logging.INFO, logger="facdigger.production.runner")
+
+    def fail(_):
+        raise DailyDataNotReady("MGN source quality unavailable")
+
+    monkeypatch.setattr("facdigger.production.runner._load_fixed_release", fail)
+    for minutes in [0, 30]:
+        clock = observed + timedelta(minutes=minutes)
+        result = run_production_tick(config, now=clock, now_provider=lambda clock=clock: clock)
+        assert result.action == "waiting_data"
+    events = [json.loads(record.message) for record in caplog.records]
+    finished = [event for event in events if event["event"] == "production_attempt_finished"]
+    assert [event["attempt"] for event in finished] == [1, 2]
+    assert all("MGN" in event["error"] for event in finished)
+    assert all(event["last_stage"] == "load_source" for event in finished)
+    clock = datetime(2026, 9, 23, 9, 30, tzinfo=NY)
+    expired = run_production_tick(config, now=clock, now_provider=lambda: clock)
+    assert expired.action == "expired" and "MGN" in expired.error and "cutoff_at=" in expired.error
+    with ProductionState(config.state_database) as state:
+        before = state.get(observed.date())
+    repeated = run_production_tick(config, now=clock, now_provider=lambda: clock)
+    assert repeated.action == "not_due" and repeated.target_date == clock.date()
+    with ProductionState(config.state_database) as state:
+        assert state.get(observed.date()) == before

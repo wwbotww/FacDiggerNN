@@ -72,12 +72,13 @@ def _heartbeat_wait(
     delay_seconds: float,
     detail: str,
 ) -> None:
-    remaining = max(delay_seconds, 0.0)
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=max(delay_seconds, 0.0))
     interval = float(config.poll_seconds)
-    while remaining > 0 and not stopped.is_set():
-        waited = min(interval, remaining)
-        stopped.wait(waited)
-        remaining -= waited
+    while not stopped.is_set():
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            return
+        stopped.wait(min(interval, remaining))
         if not stopped.is_set():
             with ProductionState(config.state_database) as state:
                 state.heartbeat(phase="sleeping", detail=detail)

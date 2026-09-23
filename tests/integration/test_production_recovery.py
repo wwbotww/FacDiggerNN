@@ -68,7 +68,7 @@ def production_case(request, tmp_path, monkeypatch):
             return case.now.astimezone(tz)
 
     monkeypatch.setattr(factor_batch, "datetime", Clock)
-    current = SimpleNamespace(manifest={"resolved_end": target.isoformat()})
+    current = SimpleNamespace(revision_id="fixture", manifest={"resolved_end": target.isoformat()})
     monkeypatch.setattr(runner, "load_current_revision", lambda _: current)
     monkeypatch.setattr(runner, "_source_config", lambda *_: source)
     monkeypatch.setattr(runner, "load_eodhd_config", lambda _: (
@@ -78,7 +78,10 @@ def production_case(request, tmp_path, monkeypatch):
 
     def fetch(*args, **kwargs):
         case.fetches += 1
-        return SimpleNamespace(request_log=({"path": "eod-bulk-last-day/US", "cache_hit": False},))
+        return SimpleNamespace(
+            request_log=({"path": "eod-bulk-last-day/US", "cache_hit": False},),
+            backfilled_provider_symbols=(),
+        )
 
     monkeypatch.setattr(runner, "fetch_daily_revision", fetch)
     monkeypatch.setattr(runner, "publish_daily_source_revision", lambda *a, **kw: current)

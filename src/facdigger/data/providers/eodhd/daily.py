@@ -20,11 +20,13 @@ from facdigger.data.providers.eodhd.mapper import (
     consolidate_bars,
     filter_valid_eod_rows,
     map_eod_bars,
+    security_identity,
 )
 from facdigger.data.providers.eodhd.quality import (
     filter_to_regular_sessions,
     quarantine_suspicious_identities,
 )
+from facdigger.data.providers.eodhd.quarantine import audit_quarantines, merge_quarantines
 from facdigger.data.providers.eodhd.universe import discover_historical_symbols
 
 
@@ -209,7 +211,21 @@ def backfill_adjusted_histories(
     if not requested:
         return revision
     metadata = build_metadata_index(list(revision.metadata_rows), config.exchange_code)
+    required_symbols = set(requested) | set(revision.bars["provider_symbol"])
+    missing_metadata = sorted(set(requested) - set(metadata))
+    if missing_metadata:
+        raise DataContractError(
+            f"targeted history has no current identity metadata: {missing_metadata}"
+        )
+    requested_ids = {security_identity(symbol, metadata[symbol])[0] for symbol in requested}
+    # Review related listings together before consolidation can hide an alias conflict.
+    requested = sorted(
+        symbol for symbol, row in metadata.items()
+        if security_identity(symbol, row)[0] in requested_ids
+    )
     backfill_parts: list[pl.DataFrame] = []
+    unavailable: dict[str, dict[str, Any]] = {}
+    empty_related_aliases: list[str] = []
     rejected = revision.rejected_rows
     rejected_by_symbol = dict(revision.rejected_rows_by_symbol)
     for symbol in requested:
@@ -234,30 +250,76 @@ def backfill_adjusted_histories(
         for rejected_symbol, count in rejected_symbols.items():
             rejected_by_symbol[rejected_symbol] = rejected_by_symbol.get(rejected_symbol, 0) + count
         if mapped is None:
-            raise DailyDataNotReady(f"EODHD returned no targeted history for {symbol}")
+            if not payload and symbol not in required_symbols and metadata[symbol]["is_delisted"]:
+                # A verified empty, retired alias does not contradict the active
+                # listing. Empty/malformed expected histories still fail below.
+                empty_related_aliases.append(symbol)
+                continue
+            security_id, _ = security_identity(symbol, metadata[symbol])
+            unavailable[security_id] = {
+                "security_id": security_id, "provider_symbols": [symbol],
+                "reasons": ["incomplete_adjustment_history"],
+                "first_trade_date": history_start.isoformat(),
+                "last_trade_date": revision.target_date.isoformat(), "examples": [],
+            }
+            continue
         backfill_parts.append(mapped)
+    if not backfill_parts:
+        raise DailyDataNotReady("all targeted adjustment histories are unavailable")
     backfill, raw_quality = _quality_checked_bars(
         pl.concat(backfill_parts), config,
         regular_session_frame(history_start, revision.target_date),
     )
-    if raw_quality["identity"]["quarantined_securities"]:
-        # An unsafe replacement cannot repair an adjustment boundary. Never keep
-        # the old history and pretend that the requested full backfill succeeded.
-        raise DailyDataNotReady("targeted adjustment history has conflicting security identities")
-    merged = validate_bars(
-        consolidate_bars(
-            pl.concat([revision.bars, backfill], how="vertical_relaxed")
+    # Compare the same physical listing before replacement, not after ordinary
+    # alias deduplication. A disagreement is untrusted input, never implicit precedence.
+    fields = ["open", "high", "low", "close", "volume", "adj_factor"]
+    keys = ["security_id", "provider_symbol", "trade_date"]
+    comparison = backfill.select(*keys, *fields).join(
+        revision.bars.select(*keys, *fields), on=keys, suffix="_bulk",
+    ).filter(pl.any_horizontal([
+        (pl.col(field) - pl.col(f"{field}_bulk")).abs()
+        > (1e-10 + 1e-8 * pl.col(f"{field}_bulk").abs()) for field in fields
+    ]))
+    for security_id in sorted(comparison["security_id"].unique()):
+        rows = comparison.filter(pl.col("security_id") == security_id).sort("trade_date")
+        unavailable[security_id] = {
+            "security_id": security_id,
+            "provider_symbols": sorted(rows["provider_symbol"].unique()),
+            "reasons": ["endpoint_history_conflict"],
+            "first_trade_date": str(rows["trade_date"].min()),
+            "last_trade_date": str(rows["trade_date"].max()),
+            "examples": rows.head(3).with_columns(pl.col("trade_date").cast(pl.String)).to_dicts(),
+        }
+    quarantines = merge_quarantines(audit_quarantines(raw_quality["identity"]), unavailable)
+    if len(quarantines) / len(requested_ids) > (
+        config.quality_gate.max_quarantined_security_fraction
+    ):
+        raise DailyDataNotReady(
+            f"targeted history quality excludes {len(quarantines)}/{len(requested_ids)} "
+            f"identities above the configured limit: {sorted(quarantines)}"
         )
+    backfill = backfill.filter(~pl.col("security_id").is_in(quarantines.keys()))
+    successful_ids = set(backfill["security_id"])
+    successful = [symbol for symbol in requested
+                  if security_identity(symbol, metadata[symbol])[0] in successful_ids]
+    merged = validate_bars(
+        pl.concat([
+            revision.bars.filter(~pl.col("security_id").is_in(requested_ids)), backfill,
+        ], how="vertical_relaxed")
     )
     return replace(
         revision,
         bars=merged,
         rejected_rows=rejected,
         request_log=tuple(client.request_log),
-        backfilled_provider_symbols=tuple(requested),
+        backfilled_provider_symbols=tuple(successful),
         rejected_rows_by_symbol=tuple(sorted(rejected_by_symbol.items())),
         raw_quality_audits=(
-            *revision.raw_quality_audits, {"stage": "adjustment_backfill", **raw_quality},
+            *revision.raw_quality_audits, {
+                "stage": "adjustment_backfill", **raw_quality,
+                "unavailable_histories": list(unavailable.values()),
+                "empty_related_aliases": empty_related_aliases,
+            },
         ),
     )
 

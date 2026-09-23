@@ -40,6 +40,13 @@ from facdigger.data.providers.eodhd.quality import (
     assert_historical_ingestion_quality,
     quarantine_suspicious_identities,
 )
+from facdigger.data.providers.eodhd.quarantine import (
+    audit_quarantines,
+    manifest_quarantines,
+    merge_quarantines,
+    retain_quarantined_candidates,
+    revision_quarantines,
+)
 from facdigger.data.snapshots import sha256_file
 
 PRODUCTION_SOURCE_FILES = {
@@ -94,6 +101,12 @@ def load_current_revision(store_root: str | Path) -> ProductionSourceRevision:
         raise FileNotFoundError("production data store is not bootstrapped")
     revision_id = pointer.read_text(encoding="utf-8").strip()
     revision_root = root / "revisions" / revision_id
+    return _load_revision(revision_root, revision_id)
+
+
+def _load_revision(revision_root: Path, revision_id: str) -> ProductionSourceRevision:
+    if len(revision_id) != 32 or any(char not in "0123456789abcdef" for char in revision_id):
+        raise DataContractError("invalid production source revision ID")
     manifest_path = revision_root / "eodhd_ingestion_manifest.json"
     if not manifest_path.is_file():
         raise DataContractError("production CURRENT points to an incomplete revision")
@@ -116,6 +129,36 @@ def load_current_revision(store_root: str | Path) -> ProductionSourceRevision:
     )
     _require_universe_history(universe_dates, manifest)
     return ProductionSourceRevision(revision_id, revision_root, manifest)
+
+
+def _source_quarantines(current: ProductionSourceRevision) -> dict[str, dict[str, Any]]:
+    """Migrate retained old audit evidence once; future revisions carry it themselves."""
+    records = manifest_quarantines(current.manifest)
+    if "quarantines" in current.manifest:
+        return records
+    revision = current
+    seen = {current.revision_id}
+    while parent := (revision.manifest.get("production_revision") or {}).get("parent_revision_id"):
+        if parent in seen:
+            raise DataContractError("cycle in production quality evidence")
+        seen.add(parent)
+        revision = _load_revision(current.root.parent / parent, parent)
+        records = merge_quarantines(manifest_quarantines(revision.manifest), records)
+        if "quarantines" in revision.manifest:
+            return records
+    kind = (revision.manifest.get("production_revision") or {}).get("kind")
+    quality = revision.manifest.get("quality") or {}
+    audits = [quality, quality.get("identity", {})]
+    for key in ("bootstrap", "daily_update"):
+        audits.extend(
+            item.get("identity", {})
+            for item in (revision.manifest.get(key) or {}).get("raw_quality", [])
+        )
+    has_evidence = any("quarantined_security_ids" in audit or "quarantines" in audit
+                       for audit in audits)
+    if kind not in {"bootstrap", "live_initialization"} or not has_evidence:
+        raise DataContractError("missing original production quarantine evidence; review source")
+    return records
 
 
 def _history_start(days: list[date], history_sessions: int) -> date:
@@ -247,6 +290,7 @@ def bootstrap_production_store(
             "production_revision": revision_metadata,
             "warnings": list(payload.get("warnings") or []),
             "selection": {"research_ready": False},
+            "quarantines": list(manifest_quarantines(payload).values()),
             "bootstrap": {
                 "source_manifest_sha256": sha256_file(manifest_path),
                 "history_sessions": history_sessions,
@@ -286,6 +330,7 @@ def initialize_production_store(
         raise DataContractError("live initialization contains dates outside its requested sessions")
     if bars["trade_date"].unique().sort().to_list() != days:
         raise TargetSessionIncomplete("live initialization has missing market sessions")
+    known_bars = bars
     bars, identity_audit = quarantine_suspicious_identities(
         bars, calendar,
         max_adjusted_price_ratio=config.quality_gate.max_adjusted_price_ratio,
@@ -300,6 +345,13 @@ def initialize_production_store(
         bars, min_listed_sessions=config.min_listed_sessions,
         min_price=config.min_price, min_adv20_usd=config.min_adv20_usd,
         max_daily_symbols=config.universe.max_symbols, calendar=calendar,
+    )
+    quarantines = merge_quarantines(
+        revision_quarantines(revision.raw_quality_audits), audit_quarantines(identity_audit),
+    )
+    universe = retain_quarantined_candidates(
+        universe, universe.head(0), known_bars, quarantines, days=days,
+        metadata_rows=revision.metadata_rows, exchange_code=config.exchange_code,
     )
     frames = {
         "bars": bars.filter(pl.col("trade_date") >= retained_start),
@@ -326,6 +378,7 @@ def initialize_production_store(
             **daily_revision_audit(revision),
         },
         "quality": {"gate": quality_gate, "identity": identity_audit},
+        "quarantines": list(quarantines.values()),
         "selection": {"research_ready": False},
         "warnings": [
             "current provider identities apply only to this new production source; "
@@ -479,11 +532,57 @@ def publish_daily_source_revision(
     old_universe = validate_universe(
         pl.read_parquet(current.root / PRODUCTION_SOURCE_FILES["universe"])
     )
+    known_bars = pl.concat([old_bars, revision.bars], how="vertical_relaxed")
+    quarantines = _source_quarantines(current)
+    fresh_quarantines = revision_quarantines(revision.raw_quality_audits)
+    metadata = build_metadata_index(list(revision.metadata_rows), config.exchange_code)
+    aliases: dict[str, set[str]] = {}
+    for symbol, row in metadata.items():
+        security_id, _ = security_identity(symbol, row)
+        aliases.setdefault(security_id, set()).add(symbol)
+    for row in old_universe.select("security_id", "provider_symbol").unique().to_dicts():
+        symbol = row["provider_symbol"]
+        if (
+            symbol in metadata
+            and security_identity(symbol, metadata[symbol])[0] != row["security_id"]
+        ):
+            raise DataContractError(
+                f"daily metadata remapped existing production identity: {symbol}; "
+                "review and re-bootstrap before publishing"
+            )
+    # A new, checked full context may clear an exclusion; a clean short window cannot.
+    required_days = regular_sessions(
+        date.fromisoformat(current.manifest["resolved_start"]), revision.target_date,
+    )[-history_sessions:]
+    for security_id in list(quarantines):
+        history = revision.bars.filter(pl.col("security_id") == security_id)
+        required_aliases = aliases.get(security_id, set()) | set(
+            quarantines[security_id].get("provider_symbols", [])
+        )
+        aliases_reviewed = (
+            bool(required_aliases)
+            and required_aliases.issubset(set(revision.backfilled_provider_symbols))
+        )
+        alias_sensitive = (
+            len(required_aliases) > 1
+            or "alias_overlap_conflict" in quarantines[security_id]["reasons"]
+        )
+        full_review = aliases_reviewed or (
+            not alias_sensitive and revision.revision_start <= required_days[0]
+        )
+        if (
+            security_id not in fresh_quarantines and history.height and full_review
+            and set(required_days).issubset(set(history["trade_date"]))
+        ):
+            # The final merged-source gate below revalidates the full history.
+            del quarantines[security_id]
+    quarantines = merge_quarantines(quarantines, fresh_quarantines)
+    previous_ids = set(old_bars["security_id"])
     old_bars = validate_bars(
         _refresh_current_metadata(old_bars, revision, config.exchange_code)
     )
     remapped_ids = sorted(
-        set(old_universe["security_id"].unique().to_list())
+        previous_ids
         - set(old_bars["security_id"].unique().to_list())
     )
     if remapped_ids:
@@ -491,28 +590,22 @@ def publish_daily_source_revision(
             "daily metadata remapped existing production identities; review and "
             f"re-bootstrap before publishing ({len(remapped_ids)} identities)"
         )
+    old_bars = old_bars.filter(~pl.col("security_id").is_in(quarantines.keys()))
+    revised_bars = revision.bars.filter(~pl.col("security_id").is_in(quarantines.keys()))
     changed_adjustments = _adjustment_changes(
         old_bars,
-        revision.bars,
+        revised_bars,
         revision.revision_start,
     )
+    backfilled_ids = {
+        security_identity(symbol, metadata.get(symbol))[0]
+        for symbol in revision.backfilled_provider_symbols
+    }
     if changed_adjustments:
         insufficient = [
             security_id
             for security_id in changed_adjustments
-            if (
-                revision.bars.filter(pl.col("security_id") == security_id)[
-                    "trade_date"
-                ].min()
-                > old_bars.filter(pl.col("security_id") == security_id)[
-                    "trade_date"
-                ].min()
-                or not set(
-                    revision.bars.filter(pl.col("security_id") == security_id)[
-                        "provider_symbol"
-                    ].unique()
-                ).intersection(set(revision.backfilled_provider_symbols))
-            )
+            if security_id not in backfilled_ids
         ]
         if insufficient:
             symbols = sorted(
@@ -528,13 +621,30 @@ def publish_daily_source_revision(
             assert history_start is not None
             raise AdjustmentBackfillRequired(insufficient, symbols, history_start)
 
+    # A response starting early is not proof that its middle is complete.
+    for security_id in sorted(backfilled_ids):
+        previous = old_bars.filter(
+            (pl.col("security_id") == security_id) & (pl.col("trade_date") >= required_days[0])
+        )
+        replacement = revised_bars.filter(pl.col("security_id") == security_id)
+        missing = sorted(set(previous["trade_date"]) - set(replacement["trade_date"]))
+        if missing:
+            quarantines[security_id] = {
+                "security_id": security_id, "reasons": ["incomplete_adjustment_history"],
+                "provider_symbols": sorted(previous["provider_symbol"].unique()),
+                "first_trade_date": str(missing[0]), "last_trade_date": str(missing[-1]),
+                "examples": [{"missing_dates": [str(day) for day in missing[:3]]}],
+            }
+
     unchanged_old = old_bars.filter(
-        (~pl.col("security_id").is_in(changed_adjustments))
+        (~pl.col("security_id").is_in(backfilled_ids))
         & (pl.col("trade_date") < revision.revision_start)
     )
     bars = validate_bars(
         _refresh_current_metadata(
-            pl.concat([unchanged_old, revision.bars], how="vertical_relaxed"),
+            pl.concat([unchanged_old, revised_bars], how="vertical_relaxed").filter(
+                ~pl.col("security_id").is_in(quarantines.keys())
+            ),
             revision,
             config.exchange_code,
         )
@@ -568,6 +678,13 @@ def publish_daily_source_revision(
         ),
     )
     clean_bars = validate_bars(clean_bars)
+    quarantines = merge_quarantines(quarantines, audit_quarantines(identity_audit))
+    total_ids = set(known_bars["security_id"]) | set(quarantines)
+    if len(quarantines) / len(total_ids) > config.quality_gate.max_quarantined_security_fraction:
+        raise DataContractError(
+            "production quality quarantine exceeds configured limit: "
+            f"{len(quarantines)}/{len(total_ids)}"
+        )
     quality_gate = assert_historical_ingestion_quality(
         clean_bars,
         calendar,
@@ -617,6 +734,10 @@ def publish_daily_source_revision(
             how="vertical_relaxed",
         ).filter(pl.col("trade_date").is_in(retained_sessions))
     )
+    universe = validate_universe(retain_quarantined_candidates(
+        universe, old_universe, known_bars, quarantines, days=sessions[-history_sessions:],
+        metadata_rows=revision.metadata_rows, exchange_code=config.exchange_code,
+    ))
     observed_target_rows = hot_bars.filter(
         pl.col("trade_date") == revision.target_date
     ).height
@@ -650,12 +771,17 @@ def publish_daily_source_revision(
             "selection": {"research_ready": False},
             "daily_update": {
                 **daily_revision_audit(revision),
+                "backfilled_provider_symbols": [
+                    symbol for symbol in revision.backfilled_provider_symbols
+                    if security_identity(symbol, metadata.get(symbol))[0] not in quarantines
+                ],
                 "adjustment_changed_securities": changed_adjustments,
                 "target_observed_rows": observed_target_rows,
                 "target_candidate_rows": candidate_rows,
                 "target_eligible_rows": eligible_rows,
             },
             "quality": {"gate": quality_gate, "identity": identity_audit},
+            "quarantines": list(quarantines.values()),
         },
     )
     _advance_current(root, revision_id)

@@ -144,6 +144,18 @@ def test_existing_state_schema_is_extended_without_losing_published_dates(tmp_pa
             assert row.quality_reference is None and row.quality_report is None
 
 
+def test_running_retry_preserves_last_failure_until_success(tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    target = date(2026, 9, 22)
+    with ProductionState(path) as state:
+        state.put(target, "1" * 64, "waiting_data", attempts=1, error="EODHDError: sample")
+        state.put(target, "1" * 64, "running", attempts=2)
+    with ProductionState(path) as state:
+        assert state.get(target).error == "EODHDError: sample"
+        state.put(target, "1" * 64, "published", attempts=2, delivery_id="verified")
+        assert state.get(target).error is None
+
+
 def test_repeated_readiness_alarm_is_deduplicated_and_recovery_logged(tmp_path, caplog):
     import json
     import logging

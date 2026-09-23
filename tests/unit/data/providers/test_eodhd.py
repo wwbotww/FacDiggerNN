@@ -19,6 +19,7 @@ from facdigger.data.providers.eodhd.client import (
     DailyCallBudget,
     EODHDBudgetError,
     EODHDClient,
+    EODHDError,
 )
 from facdigger.data.providers.eodhd.config import EODHDConfig
 from facdigger.data.providers.eodhd.mapper import (
@@ -112,6 +113,15 @@ def test_client_stops_before_exceeding_daily_budget(tmp_path: Path) -> None:
     with pytest.raises(EODHDBudgetError, match="exhausted"):
         client.get_json("eod/TSLA.US")
     assert len(transport.calls) == 1
+
+
+def test_provider_error_is_safe_for_per_attempt_production_logging(tmp_path):
+    client = make_client(tmp_path, FakeTransport({"error": "Invalid token super-secret"}))
+    with pytest.raises(EODHDError) as caught:
+        client.get_json("eod/AAPL.US")
+    assert "super-secret" not in str(caught.value)
+    assert "[REDACTED]" in str(caught.value)
+    assert list((tmp_path / "cache").glob("*.json")) == []
 
 
 def test_client_budget_accounts_for_weighted_bulk_calls(tmp_path: Path) -> None:

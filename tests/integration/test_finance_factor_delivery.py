@@ -536,7 +536,7 @@ def test_mixed_identity_pool_delivers_one_target_after_complete_scoring(
     # Only source IO is substituted. Release loading, snapshots, model execution,
     # delivery projection, deadline guard and durable daily state are real.
     monkeypatch.setattr("facdigger.production.runner.load_current_revision", lambda _: (
-        SimpleNamespace(manifest={"resolved_end": last.isoformat()})
+        SimpleNamespace(revision_id="fixture", manifest={"resolved_end": last.isoformat()})
     ))
     monkeypatch.setattr("facdigger.production.runner._source_config", lambda *_: (
         InferenceSnapshotConfig.model_validate(payload)
@@ -548,11 +548,16 @@ def test_mixed_identity_pool_delivers_one_target_after_complete_scoring(
         SimpleNamespace(client=lambda: None)
     ))
     monkeypatch.setattr("facdigger.production.runner.fetch_daily_revision", lambda *a, **kw: (
-        SimpleNamespace(request_log=({"path": "eod-bulk-last-day/US", "cache_hit": False},))
+        SimpleNamespace(
+            request_log=({"path": "eod-bulk-last-day/US", "cache_hit": False},),
+            backfilled_provider_symbols=(),
+        )
     ))
     monkeypatch.setattr(
         "facdigger.production.runner.publish_daily_source_revision",
-        lambda *a, **kw: SimpleNamespace(manifest={"resolved_end": last.isoformat()}),
+        lambda *a, **kw: SimpleNamespace(
+            revision_id="fixture", manifest={"resolved_end": last.isoformat()},
+        ),
     )
     production = ProductionServiceConfig.model_validate({
         "data": {"provider_config": tmp_path / "unused-provider.yaml"},

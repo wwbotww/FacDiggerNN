@@ -91,6 +91,23 @@ def test_market_failure_blocks_even_when_all_stocks_have_scores():
     assert report["violations"] == ["target_market_channels_unavailable"]
 
 
+def test_quarantined_members_still_count_when_new_stocks_replace_them():
+    candidates = _candidates(22, missing=[18, 19])
+    report = assess_daily_quality(
+        candidates, reference=_reference(), delivery=_delivery(),
+        inference=ProductionInferenceConfig(minimum_candidate_rows=10, minimum_eligible_rows=10),
+        policy=ProductionQualityConfig(), stage="inference", unscorable=[{
+            "security_id": f"sec-{i}", "symbol": f"S{i}", "asof_date": str(DAY),
+            "reason": "source_quality_quarantined",
+        } for i in [18, 19]],
+    )
+    assert report["computation"]["candidate_rows"] == 22
+    assert report["computation"]["eligible_rows"] == 20
+    assert report["computation"]["reference_eligible_rows"] == 20
+    assert report["computation"]["missing_fraction"] == 0.1
+    assert report["violations"] == ["computational_missing_fraction_exceeded"]
+
+
 def test_reference_excludes_target_day_and_short_history():
     history = pl.DataFrame([
         {"security_id": stock, "trade_date": DAY - timedelta(days=offset), "eligible": offset > 0}

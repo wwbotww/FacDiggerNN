@@ -206,7 +206,9 @@ class EODHDClient:
                         f"EODHD returned non-JSON data for {identity['path']}"
                     ) from exc
                 if isinstance(data, dict) and ("error" in data or "message" in data):
-                    detail = data.get("message", data.get("error"))
+                    detail = str(data.get("message", data.get("error"))).replace(
+                        self.api_token, "[REDACTED]"
+                    )
                     raise EODHDError(f"EODHD API error for {identity['path']}: {detail}")
                 fetched_at = self._write_cache(cache_path, identity, data)
                 self.request_log.append(

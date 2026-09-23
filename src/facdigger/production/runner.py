@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal
 
 import polars as pl
@@ -50,6 +52,8 @@ from facdigger.production.quality import (
     build_quality_reference,
 )
 from facdigger.production.state import ProductionRecord, ProductionState
+
+logger = logging.getLogger(__name__)
 
 TickAction = Literal[
     "not_due",
@@ -216,7 +220,17 @@ def _expired_record(
     existing: ProductionRecord | None,
 ) -> ProductionTickResult:
     attempts = existing.attempts if existing else 0
-    error = "publication cutoff reached without a complete target FactorBatch"
+    if existing is not None and existing.status == "expired":
+        return ProductionTickResult(
+            "expired", window.target_date, window.phase, attempts,
+            error=existing.error, quality=existing.quality_report,
+        )
+    error = (
+        "publication cutoff reached without a complete target FactorBatch; "
+        f"cutoff_at={window.cutoff_at.isoformat()}"
+    )
+    if existing is not None and existing.error:
+        error += f"; last_failure={existing.error}"
     state.put(
         window.target_date,
         existing.release_id if existing else config.model.release_id,
@@ -372,6 +386,23 @@ def run_production_tick(
             "running",
             attempts=attempts,
         )
+        attempt_started = datetime.now(timezone.utc)
+        started = perf_counter()
+        stage_started = started
+        stage = "load_source"
+        durations: dict[str, float] = {}
+
+        def mark_stage(name: str) -> None:
+            nonlocal stage, stage_started
+            measured = perf_counter()
+            durations[stage] = durations.get(stage, 0.0) + measured - stage_started
+            stage, stage_started = name, measured
+
+        logger.info(json.dumps({
+            "event": "production_attempt_started", "target_date": str(window.target_date),
+            "attempt": attempts, "started_at": attempt_started.isoformat(),
+            "cutoff_at": window.cutoff_at.isoformat(),
+        }, sort_keys=True))
         try:
             release_dir, release = _load_fixed_release(config)
             if config.factor_batch.delivery is None:
@@ -424,6 +455,7 @@ def run_production_tick(
                 )
             provider = EODHDProvider(provider_config)
             client = provider.client()
+            mark_stage("fetch_revision")
             revision = fetch_daily_revision(
                 client,
                 provider_config,
@@ -435,6 +467,7 @@ def run_production_tick(
                 target_date=window.target_date,
             )
             require_fresh_daily_requests(revision)
+            mark_stage("source_commit")
             try:
                 current = publish_daily_source_revision(
                     current,
@@ -444,6 +477,7 @@ def run_production_tick(
                     history_sessions=history_sessions,
                 )
             except AdjustmentBackfillRequired as required:
+                mark_stage("adjustment_backfill")
                 revision = backfill_adjusted_histories(
                     client,
                     provider_config,
@@ -452,6 +486,7 @@ def run_production_tick(
                     history_start=required.history_start,
                 )
                 require_fresh_daily_requests(revision)
+                mark_stage("source_commit")
                 current = publish_daily_source_revision(
                     current,
                     revision,
@@ -459,6 +494,13 @@ def run_production_tick(
                     config.data.store_root,
                     history_sessions=history_sessions,
                 )
+            logger.info(json.dumps({
+                "event": "production_source_quality", "target_date": str(window.target_date),
+                "attempt": attempts, "revision_id": current.revision_id,
+                "quarantines": current.manifest.get("quarantines", []),
+                "backfilled_provider_symbols": revision.backfilled_provider_symbols,
+            }, sort_keys=True))
+            mark_stage("source_readiness")
             source = _source_config(config, current)
             universe = pl.read_parquet(source.sources.universe)
             target_universe = universe.filter(pl.col("trade_date") == window.target_date)
@@ -483,6 +525,7 @@ def run_production_tick(
                 raise TargetSessionIncomplete(
                     "source readiness: " + ", ".join(quality["violations"])
                 )
+            mark_stage("snapshot")
             snapshot_dir, snapshot_manifest = build_inference_snapshot(
                 source,
                 release_dir,
@@ -509,6 +552,7 @@ def run_production_tick(
                 raise TargetSessionIncomplete(
                     "inference readiness: " + ", ".join(quality["violations"])
                 )
+            mark_stage("inference_publication")
             destination, factor_manifest = run_signal_inference(
                 release_dir,
                 output_root=config.factor_batch.output_root,
@@ -547,7 +591,11 @@ def run_production_tick(
         ) as exc:
             retry_observed = _clock_value(clock)
             if retry_observed.astimezone(NEW_YORK) >= window.cutoff_at:
-                return _expired_record(state, config, window, state.get(window.target_date))
+                record = state.put(
+                    window.target_date, config.model.release_id, "running", attempts=attempts,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return _expired_record(state, config, window, record)
             return _wait_record(
                 state,
                 config,
@@ -572,6 +620,20 @@ def run_production_tick(
                 error=f"{type(exc).__name__}: {exc}",
                 quality=record.quality_report,
             )
+        finally:
+            measured = perf_counter()
+            durations[stage] = durations.get(stage, 0.0) + measured - stage_started
+            record = state.get(window.target_date)
+            logger.info(json.dumps({
+                "event": "production_attempt_finished", "target_date": str(window.target_date),
+                "attempt": attempts, "started_at": attempt_started.isoformat(),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "elapsed_seconds": measured - started, "stage_seconds": durations,
+                "last_stage": stage, "status": record.status if record else None,
+                "error": record.error if record else None,
+                "delivery_id": record.delivery_id if record else None,
+                "cutoff_at": window.cutoff_at.isoformat(),
+            }, sort_keys=True))
 
 
 def production_status(config: ProductionServiceConfig) -> dict[str, Any]:

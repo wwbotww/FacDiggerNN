@@ -72,6 +72,7 @@ def assess_daily_quality(
     # source/window failure among the reference stocks must not be hidden by replacements.
     data_reasons = {
         "missing_target_bar", "insufficient_liquidity_history", "insufficient_model_history",
+        "source_quality_quarantined",
     }
     unavailable = (expected - current) | {
         row["security_id"] for row in unscorable
