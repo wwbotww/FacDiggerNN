@@ -1056,6 +1056,32 @@ def production_status_command(
         raise typer.Exit(code=1) from exc
 
 
+@production_app.command("resume")
+def production_resume_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    target: Annotated[str, typer.Option(help="Inspected blocked D, YYYY-MM-DD.")],
+    expected_updated_at: Annotated[
+        str, typer.Option(help="Exact updated_at from production status."),
+    ],
+    reason: Annotated[str, typer.Option(help="Audited repair reason; never include secrets.")],
+) -> None:
+    """Requeue a repaired blocked date under the producer lock; never run inference."""
+    from datetime import date
+
+    from facdigger.production.config import load_production_config
+    from facdigger.production.recovery import resume_blocked_production
+
+    try:
+        result = resume_blocked_production(
+            load_production_config(config), target_date=date.fromisoformat(target),
+            expected_updated_at=expected_updated_at, reason=reason,
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+
+
 @production_app.command("health")
 def production_health_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],

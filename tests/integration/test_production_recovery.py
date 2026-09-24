@@ -21,6 +21,7 @@ from facdigger.data.market_calendar import next_regular_session, regular_session
 from facdigger.inference import factor_batch
 from facdigger.production import runner
 from facdigger.production.config import ProductionServiceConfig
+from facdigger.production.recovery import resume_blocked_production
 from facdigger.production.state import ProductionState
 
 NY = ZoneInfo("America/New_York")
@@ -112,6 +113,51 @@ def _interrupt_after_publish(case, monkeypatch):
         assert pending.status == "running" and pending.delivery_id is None
         assert pending.quality_report["snapshot_id"] == manifest.input.snapshot_id
     return bundles[0], manifest
+
+
+@pytest.mark.parametrize("after_cutoff", [False, True])
+def test_operator_resume_reconciles_original_without_requeue_or_fresh_data(
+    production_case, monkeypatch, after_cutoff,
+):
+    case = production_case
+    bundle, original = _interrupt_after_publish(case, monkeypatch)
+    before = {p.name: p.read_bytes() for p in bundle.iterdir()}
+    target = case.now.date()
+    with ProductionState(case.config.state_database) as state:
+        previous = state.get(target)
+        blocked = state.put(target, previous.release_id, "blocked", attempts=previous.attempts,
+                            error="operator observed a post-publication interruption")
+    if after_cutoff:
+        case.now = regular_session(next_regular_session(target)).open_utc + timedelta(minutes=1)
+    result = resume_blocked_production(case.config, target_date=target,
+                                      expected_updated_at=blocked.updated_at, reason="reviewed",
+                                      now_provider=lambda: case.now)
+    assert result["action"] == "already_published"
+    assert result["delivery_id"] == original.delivery_id
+    assert before == {p.name: p.read_bytes() for p in bundle.iterdir()}
+    assert case.fetches == 1
+    with ProductionState(case.config.state_database) as state:
+        assert state.get(target).status == "published"
+
+
+def test_operator_resume_cannot_clear_ambiguous_originals(production_case, monkeypatch):
+    case = production_case
+    bundle, original = _interrupt_after_publish(case, monkeypatch)
+    frame = pl.read_parquet(bundle / "factors.parquet").with_columns(pl.col("score") + 0.01)
+    factor_batch.publish_factor_batch(
+        frame, case.config.factor_batch.output_root, source=original.source, model=original.model,
+        input_metadata=original.input, time_metadata=original.time,
+    )
+    assert _tick(case).action == "blocked"
+    with ProductionState(case.config.state_database) as state:
+        blocked = state.get(case.now.date())
+    with pytest.raises(ValueError, match="ambiguous"):
+        resume_blocked_production(case.config, target_date=case.now.date(),
+                                  expected_updated_at=blocked.updated_at, reason="cannot bypass",
+                                  now_provider=lambda: case.now)
+    with ProductionState(case.config.state_database) as state:
+        assert state.get(case.now.date()) == blocked
+    assert case.fetches == 1
 
 
 def test_restart_recovers_original_delivery_before_revised_data(production_case, monkeypatch):

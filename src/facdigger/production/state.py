@@ -27,6 +27,7 @@ class ProductionRecord:
     error: str | None
     quality_reference: dict[str, Any] | None = None
     quality_report: dict[str, Any] | None = None
+    updated_at: str = ""
 
 
 class ProductionState:
@@ -79,6 +80,12 @@ class ProductionState:
             )
             """
         )
+        self._connection.execute("""CREATE TABLE IF NOT EXISTS production_resume_events (
+            target_date TEXT NOT NULL, previous_updated_at TEXT NOT NULL,
+            resumed_at TEXT NOT NULL, release_id TEXT NOT NULL,
+            previous_error TEXT, attempts INTEGER NOT NULL, reason TEXT NOT NULL,
+            PRIMARY KEY (target_date, previous_updated_at)
+        )""")
 
     def close(self) -> None:
         self._connection.close()
@@ -92,7 +99,7 @@ class ProductionState:
     def get(self, target: date) -> ProductionRecord | None:
         row = self._connection.execute(
             """SELECT target_date, release_id, status, attempts, next_retry_at,
-                      snapshot_id, delivery_id, error, quality_reference, quality_report
+                      snapshot_id, delivery_id, error, quality_reference, quality_report, updated_at
                FROM production_runs WHERE target_date = ?""",
             (target.isoformat(),),
         ).fetchone()
@@ -110,6 +117,7 @@ class ProductionState:
             error=row[7],
             quality_reference=json.loads(row[8]) if row[8] else None,
             quality_report=json.loads(row[9]) if row[9] else None,
+            updated_at=row[10],
         )
 
     def put(
@@ -184,6 +192,53 @@ class ProductionState:
         assert result is not None
         self._report_transition(result)
         return result
+
+    def schedule_resume(
+        self, target: date, release_id: str, *, expected_updated_at: str,
+        reason: str, observed: datetime, cutoff_at: datetime,
+    ) -> tuple[ProductionRecord, bool]:
+        """Atomically retain recovery evidence and requeue, without resetting provenance."""
+        if not reason.strip() or not expected_updated_at.strip():
+            raise ValueError("resume requires a reason and expected_updated_at")
+        if observed.tzinfo is None or observed >= cutoff_at:
+            raise ValueError("cannot resume production at or after the original cutoff")
+        timestamp = observed.astimezone(timezone.utc).isoformat()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            record = self.get(target)
+            if record is None or record.release_id != release_id:
+                raise ValueError("resume target or fixed release does not match the ledger")
+            event = self._connection.execute(
+                "SELECT resumed_at FROM production_resume_events "
+                "WHERE target_date = ? AND previous_updated_at = ?",
+                (target.isoformat(), expected_updated_at),
+            ).fetchone()
+            repeated = bool(event and record.status == "waiting_data"
+                            and record.updated_at == event[0])
+            if not repeated:
+                if record.status != "blocked" or record.updated_at != expected_updated_at:
+                    raise ValueError("resume requires the inspected, unchanged blocked record")
+                if record.delivery_id is not None:
+                    raise ValueError("cannot requeue a record bound to an existing delivery")
+                self._connection.execute(
+                    "INSERT INTO production_resume_events VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (target.isoformat(), expected_updated_at, timestamp, release_id,
+                     record.error, record.attempts, reason.strip()),
+                )
+                self._connection.execute(
+                    "UPDATE production_runs SET status = 'waiting_data', next_retry_at = ?, "
+                    "updated_at = ? WHERE target_date = ?",
+                    (timestamp, timestamp, target.isoformat()),
+                )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+        result = self.get(target)
+        assert result is not None
+        if not repeated:
+            self._report_transition(result)
+        return result, repeated
 
     def _report_transition(self, record: ProductionRecord) -> None:
         if record.status == "running":

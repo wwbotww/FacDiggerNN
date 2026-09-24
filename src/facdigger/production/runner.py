@@ -662,6 +662,7 @@ def production_status(config: ProductionServiceConfig) -> dict[str, Any]:
                 "snapshot_id": latest.snapshot_id,
                 "delivery_id": latest.delivery_id,
                 "error": latest.error,
+                "updated_at": latest.updated_at,
                 "quality": latest.quality_report,
             }
         ),

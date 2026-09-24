@@ -40,6 +40,18 @@ def production_window(
         target = today
     else:
         target = previous_regular_session(today)
+    return target_production_window(target, now, schedule)
+
+
+def target_production_window(
+    target: date, now: datetime, schedule: ProductionScheduleConfig,
+) -> ProductionWindow:
+    """Inspect a specified date without moving an expired target to today's window."""
+    if now.tzinfo is None:
+        raise ValueError("production clock must be timezone-aware")
+    if regular_session(target) is None:
+        raise ValueError("production target must be a regular trading session")
+    local = now.astimezone(NEW_YORK)
     first = datetime.combine(target, schedule.first_attempt, tzinfo=NEW_YORK)
     execution_session = regular_session(next_regular_session(target))
     assert execution_session is not None
