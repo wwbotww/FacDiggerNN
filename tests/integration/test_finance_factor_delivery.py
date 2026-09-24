@@ -346,6 +346,34 @@ def test_partial_finance_signal_keeps_null_row_and_scores_remaining_cross_sectio
     )
 
 
+def test_direct_signal_cannot_deliver_an_unresolved_identity(finance_delivery, tmp_path):
+    _, _, release_dir, _, config = finance_delivery
+    last = factor_fixtures.sessions(165)[-1]
+    universe = pl.read_parquet(config.sources.universe).with_columns(
+        pl.when(pl.col("security_id") == "sec-1").then(False)
+        .otherwise(pl.col("eligible")).alias("eligible"),
+        pl.when(pl.col("security_id") == "sec-1").then(pl.lit("identity_change_quarantined"))
+        .otherwise(pl.lit("observed")).alias("trade_status_quality"),
+    )
+    path = tmp_path / "identity-universe.parquet"
+    universe.write_parquet(path)
+    payload = config.model_dump()
+    payload["sources"]["universe"] = path
+    snapshot, _ = build_inference_snapshot(
+        InferenceSnapshotConfig.model_validate(payload), release_dir, asof_date=last,
+    )
+    delivery = DeliveryConfig.model_validate({
+        "targets": [{"instrument_id": "S1.US"}],
+        "identities": [{"instrument_id": "S1.US", "security_id": "sec-1",
+                        "valid_from": last, "valid_to": last, "evidence": "Old mapping"}],
+    })
+    output = tmp_path / "unresolved-batches"
+    with pytest.raises(DataContractError, match="delivery identity is unresolved"):
+        run_signal_inference(release_dir, dataset_dir=snapshot, output_root=output,
+                             delivery=delivery, asof=last.isoformat())
+    assert not output.exists()
+
+
 def test_cached_index_cannot_score_unobserved_target_bar(finance_delivery):
     _, _, release_dir, release, config = finance_delivery
     last = factor_fixtures.sessions(165)[-1]

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import factor_fixtures
 import polars as pl
+import pytest
 import yaml
 from test_finance_factor_delivery import finance_delivery  # noqa: F401
 
@@ -23,12 +24,14 @@ from facdigger.production.config import ProductionServiceConfig
 from facdigger.production.state import ProductionState
 
 
+@pytest.mark.parametrize("scenario", ["price", "identity_elsewhere", "identity_delivery"])
 def test_backfill_failure_local_quarantine_restart_and_real_delivery(
-    request, tmp_path, monkeypatch,
+    request, tmp_path, monkeypatch, scenario,
 ):
     _, _, release_dir, release, _ = request.getfixturevalue("finance_delivery")
     days = factor_fixtures.sessions(165)
     target = days[-1]
+    isolated_index = 20 if scenario == "identity_elsewhere" else 0
     clock = SimpleNamespace(now=datetime.combine(target, time(20), tzinfo=NEW_YORK))
 
     class Clock(datetime):
@@ -47,7 +50,8 @@ def test_backfill_failure_local_quarantine_restart_and_real_delivery(
             if path.startswith("exchange-symbol-list/"):
                 data = [] if params["delisted"] else [
                     {"Code": f"S{i}", "Exchange": "NASDAQ", "Type": "Common Stock",
-                     "Isin": f"US{i:010d}"} for i in range(21)
+                     "Isin": ("US9000000000" if self.revised and scenario != "price"
+                              and i == isolated_index else f"US{i:010d}")} for i in range(21)
                 ]
             else:
                 if path.startswith("eod/") and self.interrupt:
@@ -66,7 +70,8 @@ def test_backfill_failure_local_quarantine_restart_and_real_delivery(
                     for index in indices:
                         close = 20.0 + index + days.index(day) * 0.02
                         adjusted = close * (0.5 if self.revised else 1.0)
-                        if self.revised and path.startswith("eod/") and index == 0:
+                        if (self.revised and scenario == "price"
+                                and path.startswith("eod/") and index == 0):
                             if day == days[-25]:
                                 adjusted *= 0.02  # Outside the ten-day bulk window.
                         data.append({"code": f"S{index}", "date": str(day), "open": close,
@@ -118,25 +123,36 @@ def test_backfill_failure_local_quarantine_restart_and_real_delivery(
     assert load_current_revision(store).revision_id == current.revision_id
     clock.now += timedelta(minutes=30)
     result = runner.run_production_tick(config, now=clock.now, now_provider=lambda: clock.now)
+    if scenario == "identity_delivery":
+        assert result.action == "blocked" and "delivery identity is unresolved" in result.error
+        assert not config.factor_batch.output_root.exists()
+        return
     assert result.action == "published", result.error
     assert result.quality["status"] == "degraded"
     assert result.quality["computation"]["candidate_rows"] == 21
     assert result.quality["computation"]["eligible_rows"] == 20
     assert result.quality["computation"]["missing_fraction"] == 1 / 21
-    assert result.quality["unscorable"][0]["reason"] == "source_quality_quarantined"
+    assert result.quality["unscorable"][0]["reason"] == (
+        "source_quality_quarantined" if scenario == "price" else "unresolved_security_identity"
+    )
     assert result.quality["violations"] == []
     updated = load_current_revision(store)
-    assert updated.manifest["quarantines"][0]["reasons"] == ["extreme_adjusted_return"]
-    assert "S0.US" not in updated.manifest["daily_update"]["backfilled_provider_symbols"]
+    assert updated.manifest["quarantines"][0]["reasons"] == [
+        "extreme_adjusted_return" if scenario == "price" else "identity_change_pending",
+    ]
+    assert (f"S{isolated_index}.US"
+            not in updated.manifest["daily_update"]["backfilled_provider_symbols"])
     assert pl.read_parquet(updated.root / "bars_daily.parquet").filter(
-        pl.col("symbol") == "S0"
+        pl.col("symbol") == f"S{isolated_index}"
     ).is_empty()
     assert sha256_file(current.root / "bars_daily.parquet") == initial_hash
     bundle = config.factor_batch.output_root / result.delivery_id
     manifest = factor_batch.load_factor_batch(bundle)
     rows = pl.read_parquet(bundle / "factors.parquet")
-    assert rows.height == 5 and rows["eligible"].sum() == 4
-    assert rows.filter(~pl.col("eligible"))["score"].to_list() == [None]
+    assert rows.height == 5 and rows["eligible"].sum() == (4 if scenario == "price" else 5)
+    assert rows.filter(~pl.col("eligible"))["score"].to_list() == (
+        [None] if scenario == "price" else []
+    )
     assert manifest.source.kind == "signal_inference"
     calls = transport.calls
     assert runner.run_production_tick(

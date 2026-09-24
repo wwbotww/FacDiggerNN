@@ -29,6 +29,10 @@ from facdigger.data.provenance import (
 )
 from facdigger.data.providers.eodhd.config import EODHDConfig
 from facdigger.data.providers.eodhd.daily import EODHDDailyRevision, daily_revision_audit
+from facdigger.data.providers.eodhd.identity import (
+    IDENTITY_CHANGE_PENDING,
+    isolate_identity_changes,
+)
 from facdigger.data.providers.eodhd.mapper import (
     build_metadata_index,
     build_universe,
@@ -416,15 +420,15 @@ def _refresh_current_metadata(
     exchange_code: str,
 ) -> pl.DataFrame:
     metadata = build_metadata_index(list(revision.metadata_rows), exchange_code)
+    for identity, symbol in bars.select("security_id", "provider_symbol").unique().iter_rows():
+        if symbol in metadata and security_identity(symbol, metadata[symbol])[0] != identity:
+            raise DataContractError(f"unisolated production identity change: {symbol}")
     records: list[dict[str, Any]] = []
     for provider_symbol, row in metadata.items():
-        security_id, identity_quality = security_identity(provider_symbol, row)
         records.append(
             {
                 "provider_symbol": provider_symbol,
-                "_security_id": security_id,
                 "_symbol": display_symbol(provider_symbol),
-                "_identity_quality": identity_quality,
                 "_exchange_source": row.get("exchange"),
                 "_security_type_source": row.get("security_type"),
                 "_is_delisted_source": bool(row.get("is_delisted", False)),
@@ -435,11 +439,7 @@ def _refresh_current_metadata(
     refreshed = (
         bars.join(pl.DataFrame(records), on="provider_symbol", how="left", validate="m:1")
         .with_columns(
-            pl.coalesce("_security_id", "security_id").alias("security_id"),
             pl.coalesce("_symbol", "symbol").alias("symbol"),
-            pl.coalesce("_identity_quality", "identity_quality").alias(
-                "identity_quality"
-            ),
             pl.coalesce("_exchange_source", "exchange_source").alias(
                 "exchange_source"
             ),
@@ -451,9 +451,7 @@ def _refresh_current_metadata(
             ),
         )
         .drop(
-            "_security_id",
             "_symbol",
-            "_identity_quality",
             "_exchange_source",
             "_security_type_source",
             "_is_delisted_source",
@@ -546,21 +544,24 @@ def publish_daily_source_revision(
     for symbol, row in metadata.items():
         security_id, _ = security_identity(symbol, row)
         aliases.setdefault(security_id, set()).add(symbol)
-    for row in old_universe.select("security_id", "provider_symbol").unique().to_dicts():
-        symbol = row["provider_symbol"]
-        if (
-            symbol in metadata
-            and security_identity(symbol, metadata[symbol])[0] != row["security_id"]
-        ):
-            raise DataContractError(
-                f"daily metadata remapped existing production identity: {symbol}; "
-                "review and re-bootstrap before publishing"
-            )
+    isolation = isolate_identity_changes(
+        old_universe, metadata, quarantines,
+        target_date=revision.target_date, observed_at=revision.ingested_at,
+    )
+    quarantines = merge_quarantines(quarantines, isolation.quarantines)
+    # Rejected new identities are evidence, not extra stocks in the denominator.
+    # Their raw quality audits remain in daily_update; no history is reassigned.
+    fresh_quarantines = {
+        key: row for key, row in fresh_quarantines.items() if key not in isolation.unaccepted_ids
+    }
+    known_bars = known_bars.filter(~pl.col("security_id").is_in(isolation.unaccepted_ids))
     # A new, checked full context may clear an exclusion; a clean short window cannot.
     required_days = regular_sessions(
         date.fromisoformat(current.manifest["resolved_start"]), revision.target_date,
     )[-history_sessions:]
     for security_id in list(quarantines):
+        if IDENTITY_CHANGE_PENDING in quarantines[security_id]["reasons"]:
+            continue  # Neither clean prices nor a metadata rollback establish succession.
         history = revision.bars.filter(pl.col("security_id") == security_id)
         required_aliases = aliases.get(security_id, set()) | set(
             quarantines[security_id].get("provider_symbols", [])
@@ -583,21 +584,13 @@ def publish_daily_source_revision(
             # The final merged-source gate below revalidates the full history.
             del quarantines[security_id]
     quarantines = merge_quarantines(quarantines, fresh_quarantines)
-    previous_ids = set(old_bars["security_id"])
+    old_bars = old_bars.filter(~pl.col("security_id").is_in(quarantines.keys()))
     old_bars = validate_bars(
         _refresh_current_metadata(old_bars, revision, config.exchange_code)
     )
-    remapped_ids = sorted(
-        previous_ids
-        - set(old_bars["security_id"].unique().to_list())
+    revised_bars = revision.bars.filter(
+        ~pl.col("security_id").is_in(set(quarantines) | isolation.excluded_ids)
     )
-    if remapped_ids:
-        raise DataContractError(
-            "daily metadata remapped existing production identities; review and "
-            f"re-bootstrap before publishing ({len(remapped_ids)} identities)"
-        )
-    old_bars = old_bars.filter(~pl.col("security_id").is_in(quarantines.keys()))
-    revised_bars = revision.bars.filter(~pl.col("security_id").is_in(quarantines.keys()))
     changed_adjustments = _adjustment_changes(
         old_bars,
         revised_bars,
@@ -606,7 +599,7 @@ def publish_daily_source_revision(
     backfilled_ids = {
         security_identity(symbol, metadata.get(symbol))[0]
         for symbol in revision.backfilled_provider_symbols
-    }
+    } - isolation.excluded_ids
     if changed_adjustments:
         insufficient = [
             security_id
@@ -786,7 +779,8 @@ def publish_daily_source_revision(
                 **daily_revision_audit(revision),
                 "backfilled_provider_symbols": [
                     symbol for symbol in revision.backfilled_provider_symbols
-                    if security_identity(symbol, metadata.get(symbol))[0] not in quarantines
+                    if security_identity(symbol, metadata.get(symbol))[0]
+                    not in set(quarantines) | isolation.excluded_ids
                 ],
                 "adjustment_changed_securities": changed_adjustments,
                 "target_observed_rows": observed_target_rows,

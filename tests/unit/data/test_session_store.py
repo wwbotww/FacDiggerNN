@@ -509,9 +509,17 @@ def test_metadata_cannot_silently_relabel_quarantined_isin(tmp_path):
     revision = replace(revision, metadata_rows=(
         {**revision.metadata_rows[0], "Isin": "US0000000099"}, revision.metadata_rows[1],
     ))
-    with pytest.raises(DataContractError, match="remapped existing production identity"):
-        publish_daily_source_revision(current, revision, config, store, history_sessions=40)
-    assert load_current_revision(store).revision_id == current.revision_id
+    original = sha256_file(current.root / "bars_daily.parquet")
+    updated = publish_daily_source_revision(current, revision, config, store, history_sessions=40)
+    assert sha256_file(current.root / "bars_daily.parquet") == original
+    bars = pl.read_parquet(updated.root / "bars_daily.parquet")
+    assert bars["symbol"].unique().to_list() == ["BBB"]
+    universe = pl.read_parquet(updated.root / "universe_daily.parquet")
+    isolated = universe.filter(pl.col("symbol") == "AAA")
+    assert isolated["security_id"].unique().to_list() == ["eodhd:isin:US0000000001"]
+    assert isolated["eligible"].sum() == 0
+    assert isolated["close"].null_count() == isolated.height
+    assert "identity_change_pending" in updated.manifest["quarantines"][0]["reasons"]
 
 
 def test_legacy_quarantine_recovery_requires_valid_parent_evidence(tmp_path):

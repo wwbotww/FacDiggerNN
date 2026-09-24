@@ -343,6 +343,10 @@ def describe_unscorable(
             pl.col("trade_status_quality") == "source_quality_quarantined"
             if "trade_status_quality" in universe.columns else pl.lit(False)
         ).alias("_quarantined"),
+        (
+            pl.col("trade_status_quality") == "identity_change_quarantined"
+            if "trade_status_quality" in universe.columns else pl.lit(False)
+        ).alias("_identity_unresolved"),
     )
     observed = bars.filter(pl.col("trade_date").is_in(dates.implode())).select(
         "security_id", pl.col("trade_date").alias("asof_date"),
@@ -352,7 +356,8 @@ def describe_unscorable(
         missing.join(metadata, on=["security_id", "asof_date"], validate="1:1")
         .join(observed, on=["security_id", "asof_date"], how="left", validate="1:1")
         .with_columns(
-            pl.when(pl.col("_quarantined")).then(pl.lit("source_quality_quarantined"))
+            pl.when(pl.col("_identity_unresolved")).then(pl.lit("unresolved_security_identity"))
+            .when(pl.col("_quarantined")).then(pl.lit("source_quality_quarantined"))
             .when(pl.col("_delisted")).then(pl.lit("not_active"))
             .when(pl.col("_observed_bar").is_null()).then(pl.lit("missing_target_bar"))
             .when(pl.col("_source_eligible")).then(pl.lit("insufficient_model_history"))

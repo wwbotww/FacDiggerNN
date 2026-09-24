@@ -141,6 +141,19 @@ class DeliverySelection:
         )
 
 
+def require_resolved_delivery_identities(
+    selection: DeliverySelection, unscorable: list[dict[str, Any]],
+) -> None:
+    """A mapped but unresolved source identity is not an ordinary missing score."""
+    selected = {(identity, str(day)) for identity, day in
+                selection.source_candidates.select("security_id", "asof_date").iter_rows()}
+    unresolved = sorted({row["security_id"] for row in unscorable
+                         if row["reason"] == "unresolved_security_identity"
+                         and (row["security_id"], str(row["asof_date"])) in selected})
+    if unresolved:
+        raise DataContractError("delivery identity is unresolved: " + ", ".join(unresolved))
+
+
 def resolve_delivery(
     candidates: pl.DataFrame,
     config: DeliveryConfig | None,

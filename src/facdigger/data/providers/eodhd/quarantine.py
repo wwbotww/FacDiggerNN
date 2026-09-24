@@ -9,6 +9,7 @@ import polars as pl
 
 from facdigger.data.contracts import DataContractError
 from facdigger.data.market_calendar import regular_sessions
+from facdigger.data.providers.eodhd.identity import IDENTITY_CHANGE_PENDING, merge_identity_changes
 from facdigger.data.providers.eodhd.mapper import (
     EXCHANGE_MAP,
     build_metadata_index,
@@ -41,6 +42,10 @@ def merge_quarantines(
             "last_trade_date": max(ends) if ends else None,
             "examples": examples[:6],
         }
+        if "identity_changes" in old or "identity_changes" in row:
+            merged[security_id]["identity_changes"] = merge_identity_changes(
+                old.get("identity_changes", []), row.get("identity_changes", []),
+            )
     return merged
 
 
@@ -82,6 +87,16 @@ def manifest_quarantines(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
         records = {row["security_id"]: dict(row) for row in rows}
         if len(records) != len(rows):
             raise DataContractError("duplicate persisted source quality quarantines")
+        for record in records.values():
+            if IDENTITY_CHANGE_PENDING in record["reasons"]:
+                changes = merge_identity_changes(record.get("identity_changes"))
+                if not changes or any(
+                    row["provider_symbol"] not in record.get("provider_symbols", [])
+                    for row in changes
+                ):
+                    raise DataContractError("identity quarantine lacks transition evidence")
+            elif "identity_changes" in record:
+                raise DataContractError("identity evidence is missing its quarantine reason")
         return records
     quality = manifest.get("quality") or {}
     records = audit_quarantines(quality)
@@ -158,7 +173,11 @@ def retain_quarantined_candidates(
                 )
             row.update({
                 "trade_date": day, "eligible": False, "close": None, "adv20_usd": None,
-                "trade_status_quality": "source_quality_quarantined", "liquidity_rank": None,
+                "trade_status_quality": (
+                    "identity_change_quarantined"
+                    if IDENTITY_CHANGE_PENDING in evidence["reasons"]
+                    else "source_quality_quarantined"
+                ), "liquidity_rank": None,
             })
             rows.append({column: row.get(column) for column in universe.columns})
     cleaned = universe.filter(~pl.col("security_id").is_in(records.keys()))

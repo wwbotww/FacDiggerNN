@@ -25,6 +25,7 @@ from facdigger.inference.backends import load_checkpoint_backend
 from facdigger.inference.delivery import (
     DeliveryConfig,
     delivery_identity_policy,
+    require_resolved_delivery_identities,
     resolve_delivery,
 )
 from facdigger.inference.scoring import (
@@ -289,6 +290,11 @@ def run_signal_inference(
     # Check the whole computational cross-section before any delivery projection.
     build_factor_frame(candidate_universe, scored_rows)
     selection = resolve_delivery(candidate_universe, delivery)
+    audit_path = artifact_path(dataset_path, dataset_manifest["artifacts"]["audit"], "audit")
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    require_resolved_delivery_identities(
+        selection, audit["delivery_universe"]["latest_unscorable"],
+    )
     factors = build_factor_frame(selection.candidates, selection.project_scores(scored_rows))
     source_metadata, model_metadata = factor_batch_metadata(release, source_kind="signal_inference")
     input_metadata = FactorBatchInput(

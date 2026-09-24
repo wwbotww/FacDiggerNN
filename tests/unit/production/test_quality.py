@@ -1,7 +1,9 @@
 from datetime import date, timedelta
 
 import polars as pl
+import pytest
 
+from facdigger.data.contracts import DataContractError
 from facdigger.inference.delivery import DeliveryConfig
 from facdigger.production.config import ProductionInferenceConfig, ProductionQualityConfig
 from facdigger.production.quality import (
@@ -106,6 +108,28 @@ def test_quarantined_members_still_count_when_new_stocks_replace_them():
     assert report["computation"]["reference_eligible_rows"] == 20
     assert report["computation"]["missing_fraction"] == 0.1
     assert report["violations"] == ["computational_missing_fraction_exceeded"]
+
+
+@pytest.mark.parametrize("identity", ["sec-0", "sec-18", "sec-21"])
+def test_unresolved_identity_is_not_ordinary_missing_data(identity):
+    missing = int(identity.split("-")[1])
+    kwargs = dict(
+        candidates=_candidates(22, missing=[missing]), reference=_reference(), delivery=_delivery(),
+        inference=ProductionInferenceConfig(minimum_candidate_rows=10, minimum_eligible_rows=10),
+        policy=ProductionQualityConfig(), stage="inference", unscorable=[{
+            "security_id": identity, "symbol": f"S{missing}", "asof_date": str(DAY),
+            "reason": "unresolved_security_identity",
+        }],
+    )
+    if identity == "sec-0":
+        with pytest.raises(DataContractError, match="delivery identity is unresolved"):
+            assess_daily_quality(**kwargs)
+    else:
+        report = assess_daily_quality(**kwargs)
+        assert report["status"] == "degraded" and report["violations"] == []
+        assert report["computation"]["reference_eligible_rows"] == 20
+        assert report["computation"]["missing_fraction"] == (0.05 if missing == 18 else 0)
+        assert report["unscorable"][0]["security_id"] == identity
 
 
 def test_reference_excludes_target_day_and_short_history():

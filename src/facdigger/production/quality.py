@@ -15,7 +15,11 @@ import polars as pl
 from facdigger.data.contracts import DataContractError
 from facdigger.data.market_calendar import regular_sessions
 from facdigger.data.paths import artifact_path
-from facdigger.inference.delivery import DeliveryConfig, resolve_delivery
+from facdigger.inference.delivery import (
+    DeliveryConfig,
+    require_resolved_delivery_identities,
+    resolve_delivery,
+)
 from facdigger.production.config import ProductionInferenceConfig, ProductionQualityConfig
 
 
@@ -65,6 +69,10 @@ def assess_daily_quality(
         raise DataContractError("production quality candidates must contain exactly target D")
     # Identity/row omissions are contract errors, not tolerable missing scores.
     selected = resolve_delivery(candidates, delivery)
+    require_resolved_delivery_identities(selected, unscorable)
+    unresolved = {row["security_id"] for row in unscorable
+                  if row["reason"] == "unresolved_security_identity"}
+    delivered_source_ids = set(selected.source_candidates["security_id"])
     expected = set(reference["security_ids"])
     current = set(candidates["security_id"])
     eligible = set(candidates.filter(pl.col("eligible"))["security_id"])
@@ -73,6 +81,7 @@ def assess_daily_quality(
     data_reasons = {
         "missing_target_bar", "insufficient_liquidity_history", "insufficient_model_history",
         "source_quality_quarantined",
+        "unresolved_security_identity",
     }
     unavailable = (expected - current) | {
         row["security_id"] for row in unscorable
@@ -98,10 +107,9 @@ def assess_daily_quality(
         violations.append("delivery_eligible_below_minimum")
     if market is not None:
         violations.extend(market["violations"])
-    delivered_source_ids = set(selected.source_candidates["security_id"])
-    relevant = expected | delivered_source_ids
+    relevant = expected | delivered_source_ids | unresolved
     unavailable_details = [row for row in unscorable if row["security_id"] in relevant]
-    degraded = bool(unavailable or missing_fraction or delivery_missing_fraction)
+    degraded = bool(unavailable or missing_fraction or delivery_missing_fraction or unresolved)
     return {
         "target_date": target.isoformat(),
         "stage": stage,
