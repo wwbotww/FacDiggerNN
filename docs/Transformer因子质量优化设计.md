@@ -500,7 +500,8 @@ epoch 或不同 selection 规则。
 旧 FP32 实验中，现有 E1 的 5 epoch 单 cell 约为 6—12.5 小时，36-cell 矩阵从
 2026-08-13 运行到 2026-08-23。新协议以 10 epoch、FP16、固定的金融原生模型容量、按 4 个日期累积更新，
 但增加 channel/cross-section attention。正式估时不能只按参数量猜测，工程实现完成后必须在
-真实 RTX 2070S 上运行 100 个 optimizer update 基准并计算：
+实际目标 GPU 上运行 100 个 optimizer update 基准并计算；RTX 默认值保留，学校显式提供
+资源预算，不能沿用另一设备的报告：
 
 ```text
 projected_total =
@@ -512,7 +513,7 @@ projected_total =
 
 目标上限为 14 天；低于 7 天不构成问题。若预测超过 14 天，按以下顺序优化执行效率：
 
-1. 确认 FP16、预取、持久 DataLoader worker 和 pinned memory 已生效；
+1. 确认 FP16 和 pinned memory 已生效；启用 epoch 内恢复时固定 `num_workers=0`；
 2. 确认监督路径每日期只计算一次 market embedding、预训练每个 market endpoint 只遍历一次；
 3. 调整 physical microbatch 到吞吐最高且不 OOM 的值；
 4. 启用可验证等价的编译/融合算子，并重新运行同一基准。
@@ -533,6 +534,17 @@ projected_total =
 3. scratch 与 pretrained 的最差 fold 绝对 Rank IC 都为正；
 4. pretrained 不得靠明显更高 score 波动或梯度失稳取得单期提升；
 5. 两组训练后半段梯度裁剪 step 比例低于 10%，score std 不持续单调膨胀。
+
+`comparison.json` 中原 `acceptance` 只代表第 1—3 项指标门禁。完成后另执行
+`research transformer-audit --run-dir <研究目录> --output <目录外报告.json>`：校验九阶段
+manifest 和产物后，对六个监督 cell 读取 history，不改写原结果或改变 checkpoint 选择。
+后半段按最后 `ceil(已完成 epochs / 2)` 个 epoch 统计，裁剪比例按成功 optimizer updates
+加权，AMP 跳步另列；严格要求 `<10%`。主 5 日 score std 在后半段至少有三个 epoch 时检查
+是否全部严格递增；少于三点或历史字段不足标记 `insufficient_history`。1/20 日辅助轨迹也
+保留供审核。这是明确的自动筛查口径，不能证明所有非单调波动都稳定。
+
+自动检查失败或证据不足时需要处理/解释；即使 `health_checks_status=passed`，第 4 项的
+两组 score 尺度、梯度稳定性比较和来源局限仍须人工审核，不自动赋予正式研究或发布资格。
 
 scratch 本身还应与历史 E1 的 `0.01960` 平均 Rank IC 作描述性比较，但因架构、输入和训练预算
 均已改变，不把它当作严格配对门禁。同时报告 Q5−Q1、换手、20 bps 净值、分年 IC、预测相关性
@@ -569,7 +581,7 @@ local embedding 有效秩、local/contextual residual 相关性、market attenti
 如果模型表现不佳，这些字段应能区分：输入无信息、表示塌缩、横截面模块未使用、梯度失稳、
 pretraining 无迁移和 checkpoint 选错，而不是再次只看到一个最终 IC。
 
-## 14. RTX 2070S 资源门禁
+## 14. 目标 GPU 资源门禁（保留 RTX 默认值）
 
 完整训练前先执行 100 个 optimizer update 的单 cell 基准，并用第 11.2 节公式估算全部九个长
 运行阶段：
@@ -597,7 +609,7 @@ probe 时间单独标记，首个实际预训练 epoch 若发现 probe 超出 ov
 14 天，允许的调整顺序仅限等价执行优化：
 
 1. physical microbatch 16 → 8 或向上试探，只改变显存/吞吐；
-2. 在 RAM 门禁内增加 DataLoader workers 和 persistent workers；
+2. 先优化数据读取；epoch 内恢复保持 `num_workers=0`，多 worker 仅适用于原 epoch 路径；
 3. 验证 pinned memory、FP16 和数据搬运 non-blocking；
 4. 使用有数值等价测试的编译或融合优化。
 
@@ -608,6 +620,11 @@ probe 时间单独标记，首个实际预训练 epoch 若发现 probe 超出 ov
 测量不少于 100 个 optimizer update，CUDA/FP16 为真，峰值显存和宿主 RAM 分别不超过
 7.2/13 GiB，投影不超过 14 天；随后将报告中的 scratch/pretraining 配置哈希和 dataset ID
 与当前配置及最大 fold snapshot 比对。任一条件不满足都 fail closed，不能启动九阶段矩阵。
+
+以上数值是未传 `--resource-budget` 时的兼容默认值。学校/其他设备须对 benchmark 和 runner
+传同一显式预算，按实际可见 MIG 显存、申请 RAM 和计算时长验收；硬件变化后重测。
+update 基准没有完整计量加载、probe、selection、checkpoint、恢复和最终评价，必须另做
+短作业全生命周期与中断演练，不能用 10% overhead 代替实测。
 
 ## 15. 已实现的代码边界
 

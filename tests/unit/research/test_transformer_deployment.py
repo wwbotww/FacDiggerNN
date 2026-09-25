@@ -8,7 +8,8 @@ from facdigger.data.config import load_dataset_build_config
 from facdigger.data.contracts import DataContractError
 from facdigger.experiments.manifest import sha256_json
 from facdigger.research.transformer_config import load_transformer_comparison_config
-from facdigger.research.transformer_runner import _load_resource_admission, _snapshots
+from facdigger.research.transformer_runner import _load_resource_admission
+from facdigger.research.transformer_snapshots import build_transformer_snapshots
 from facdigger.training.finance_pretrain_config import load_finance_pretraining_config
 from facdigger.training.finance_transformer_config import load_finance_transformer_config
 from facdigger.training.resources import TrainingResourceBudget
@@ -35,7 +36,9 @@ def _config(tmp_path):
     )
 
 
-@pytest.mark.parametrize("damage", [None, "protocol", "identity", "files", "missing_fold"])
+@pytest.mark.parametrize(
+    "damage", [None, "protocol", "identity", "files", "missing_fold", "mixed_sources"]
+)
 def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(tmp_path, monkeypatch, damage):
     config = _config(tmp_path)
     base = load_dataset_build_config(config.base_dataset_config)
@@ -46,6 +49,8 @@ def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(tmp_path, monke
         if damage == "protocol" and fold.fold_id == "wf1":
             protocol["split"]["embargo_sessions"] += 1
         identity = {"schema_version": 4, "config": protocol, "input_file_hashes": {"fixture": "a"}}
+        if damage == "mixed_sources" and fold.fold_id == "wf2":
+            identity["input_file_hashes"] = {"fixture": "another revision"}
         dataset_id = sha256_json(identity)
         if damage == "identity" and fold.fold_id == "wf1":
             dataset_id = "incorrect_identity"
@@ -60,15 +65,15 @@ def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(tmp_path, monke
     if damage == "missing_fold":
         del locations["wf2"]
     monkeypatch.setattr(
-        "facdigger.research.transformer_runner.build_dataset_snapshot",
+        "facdigger.research.transformer_snapshots.build_dataset_snapshot",
         lambda *_: pytest.fail("prebuilt folds must not load bronze or rebuild features"),
     )
     runtime = TrainingRuntimeConfig(fold_snapshots=locations)
     if damage:
         with pytest.raises(DataContractError):
-            _snapshots(config, runtime)
+            build_transformer_snapshots(config, runtime)
     else:
-        plans = _snapshots(config, runtime)
+        plans = build_transformer_snapshots(config, runtime)
         assert [plan["fold_id"] for plan in plans] == ["wf1", "wf2", "wf3"]
         assert [plan["dataset_path"] for plan in plans] == [
             str(location.path) for location in locations.values()

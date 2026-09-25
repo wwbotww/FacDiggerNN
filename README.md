@@ -186,7 +186,8 @@ E3 reconstruction checkpoint 独立使用 schema v2 和
 只做一次金融预训练。因此是 3 次预训练 + 6 个监督 cell，共 9 个长阶段。旧 E0—E3 和完整
 3-seed 消融不自动运行。
 
-在 RTX 机器上先为最大的 fold 构建新 snapshot，再做 100 个真实 optimizer update 的资源准入：
+先在 CPU 上构建 snapshot，再在目标 GPU 上做 100 个真实 optimizer update 的资源准入。
+下面保留 RTX 默认示例；学校与其他设备使用[显式资源预算和部署说明](configs/deployment/icf/README.md)。
 
 ```bash
 uv run facdigger dataset build \
@@ -202,7 +203,7 @@ uv run facdigger train finance-benchmark \
 
 基准只提前停止测量任务，不改变正式模型、股票池、日期、512 日上下文或 epoch 上限。报告只有
 在 CUDA/FP16 已实际启用、峰值显存/宿主 RAM 分别不超过 7.2/13 GiB，且保守矩阵投影不超过
-14 天时才给出 `admitted=true`。`transformer-run` 会强制校验这份报告的配置哈希、最大 fold
+14 天时才给出 `admitted=true`（未指定新资源预算时）。`transformer-run` 会强制校验报告的配置哈希、最大 fold
 dataset ID 和至少 100 个 update，缺失或不匹配时拒绝启动。随后执行：
 
 ```bash
@@ -220,6 +221,14 @@ uv run facdigger research transformer-run \
   --config configs/research/finance_transformer_streamlined.yaml \
   --resume-run artifacts/transformer_comparison/<research_run_id>
 ```
+
+CPU 独立准备使用 `research transformer-prepare --config <研究配置> --output <准备目录>`，
+生成三个 fold、外置校验清单和训练可直接使用的 `runtime.yaml`。中断后复用已完成 fold，
+拒绝混用源数据版本。EODHD 全量重建可先运行 `data eodhd-plan` 检查额度与候选数，再显式
+采集；命令与缓存恢复限制见[通用部署说明](docs/训练可靠性与独立部署方案.md)。
+
+完成矩阵后用 `research transformer-audit --run-dir <研究目录> --output <目录外报告.json>`
+生成独立健康报告。原 `acceptance` 仍为 Rank IC 门禁，不能替代梯度/score 波动审核。
 
 每个长任务在自身 run 目录持续追加 `progress.jsonl`，可在另一终端查看：
 

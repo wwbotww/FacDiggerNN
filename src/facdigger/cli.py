@@ -105,13 +105,31 @@ def data_probe_command(
 @data_app.command("ingest")
 def data_ingest_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    reserve_api_calls: Annotated[
+        int | None, typer.Option(min=0, help="Opt in to EODHD live account quota protection.")
+    ] = None,
+    requests_per_minute: Annotated[
+        int | None,
+        typer.Option(min=1, max=1000, help="HTTP rate with --reserve-api-calls (default 300)."),
+    ] = None,
 ) -> None:
     """Convert one configured provider into the standard Parquet boundary."""
 
     from facdigger.data.providers.registry import provider_from_config
 
     try:
-        result = provider_from_config(config).ingest()
+        if requests_per_minute is not None and reserve_api_calls is None:
+            raise ValueError("--requests-per-minute requires --reserve-api-calls")
+        provider = provider_from_config(config)
+        if reserve_api_calls is not None:
+            from facdigger.data.providers.eodhd.provider import EODHDProvider
+
+            if not isinstance(provider, EODHDProvider):
+                raise ValueError("account quota protection requires EODHD")
+            provider.configure_download(
+                reserve_calls=reserve_api_calls, requests_per_minute=requests_per_minute or 300
+            )
+        result = provider.ingest()
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
@@ -128,6 +146,32 @@ def data_ingest_command(
             sort_keys=True,
         )
     )
+
+
+@data_app.command("eodhd-plan")
+def eodhd_download_plan_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    reserve_api_calls: Annotated[int, typer.Option(min=0)] = 10000,
+    requests_per_minute: Annotated[int, typer.Option(min=1, max=1000)] = 300,
+    output: Annotated[Path | None, typer.Option(dir_okay=False)] = None,
+) -> None:
+    """Check live quota and candidate counts; fetch metadata only, no price histories."""
+    from facdigger.data.providers.eodhd.config import load_eodhd_config
+    from facdigger.data.providers.eodhd.provider import EODHDProvider
+    from facdigger.training.runtime import write_json
+
+    try:
+        provider = EODHDProvider(load_eodhd_config(config))
+        provider.configure_download(
+            reserve_calls=reserve_api_calls, requests_per_minute=requests_per_minute
+        )
+        report = provider.plan_historical_download(reserve_calls=reserve_api_calls)
+        if output is not None:
+            write_json(output, report)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 @dataset_app.command("build")
@@ -1316,6 +1360,47 @@ def transformer_research_plan_command(
             default=str,
         )
     )
+
+
+@research_app.command("transformer-prepare")
+def transformer_prepare_command(
+    config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    output: Annotated[Path, typer.Option(file_okay=False)],
+    runtime: Annotated[Path | None, typer.Option(exists=True, dir_okay=False)] = None,
+) -> None:
+    """Build three folds on CPU and publish verified inputs for independent training."""
+    from facdigger.research.transformer_config import load_transformer_comparison_config
+    from facdigger.research.transformer_snapshots import prepare_transformer_snapshots
+    from facdigger.training.runtime import load_training_runtime
+
+    try:
+        report = prepare_transformer_snapshots(
+            load_transformer_comparison_config(config), output, load_training_runtime(runtime)
+        )
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@research_app.command("transformer-audit")
+def transformer_health_command(
+    run_directory: Annotated[Path, typer.Option("--run-dir", exists=True, file_okay=False)],
+    output: Annotated[Path, typer.Option(dir_okay=False)],
+) -> None:
+    """Write a separate health review of a completed comparison without changing acceptance."""
+    from facdigger.research.transformer_health import audit_transformer_health
+    from facdigger.training.runtime import write_json
+
+    try:
+        if output.resolve().is_relative_to(run_directory.resolve()):
+            raise ValueError("audit output must be outside the frozen comparison")
+        report = audit_transformer_health(run_directory)
+        write_json(output, report)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 @research_app.command("transformer-run")

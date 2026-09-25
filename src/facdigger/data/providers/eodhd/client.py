@@ -6,7 +6,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -110,6 +110,58 @@ class EODHDClient:
         self.sleep = sleep
         self.transport = transport or self._default_transport()
         self.request_log: list[dict[str, Any]] = []
+        self._account_reserve: int | None = None
+        self._request_interval = 0.0
+        self._next_request_at = 0.0
+
+    def enable_download_guard(self, *, reserve_calls: int, requests_per_minute: int) -> None:
+        """Opt in for bulk research ingestion; existing production callers are unchanged."""
+        if reserve_calls < 0 or not 1 <= requests_per_minute <= 1000:
+            raise ValueError("download reserve must be nonnegative and request rate in 1..1000")
+        self._account_reserve = reserve_calls
+        self._request_interval = 60.0 / requests_per_minute
+
+    def _pace_request(self) -> None:
+        if self._request_interval:
+            delay = self._next_request_at - time.monotonic()
+            if delay > 0:
+                self.sleep(delay)
+            self._next_request_at = time.monotonic() + self._request_interval
+
+    def account_usage(self) -> dict[str, Any]:
+        """Read fresh quota only; never cache or return account identity or credentials."""
+        payload = self.get_json("user", call_cost=0, cache=False)
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError
+            usage_date = date.fromisoformat(str(payload["apiRequestsDate"]))
+            if any(
+                isinstance(payload[key], bool) or not str(payload[key]).isdigit()
+                for key in ("dailyRateLimit", "apiRequests")
+            ):
+                raise ValueError
+            limit = int(payload["dailyRateLimit"])
+            reported_used = int(payload["apiRequests"])
+            today = self.now().astimezone(timezone.utc).date()
+            if usage_date > today or limit < 0 or reported_used < 0:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise EODHDError("EODHD usage response has invalid or missing quota fields") from exc
+        # EODHD resets the counter lazily on the first request after midnight GMT.
+        used = reported_used if usage_date == today else 0
+        return {
+            "checked_at": self.now().isoformat(),
+            "date_utc": today.isoformat(),
+            "reported_date_utc": usage_date.isoformat(),
+            "daily_limit": limit,
+            "used_today": used,
+            "remaining_today": max(0, limit - used),
+            "extra_calls_included": False,
+        }
+
+    def has_cached_response(self, path: str, params: dict[str, Any]) -> bool:
+        identity = self._cache_identity(path, {**params, "fmt": "json"})
+        return self._read_cache(self._cache_path(identity)) is not None
 
     @staticmethod
     def _default_transport() -> Transport:
@@ -169,11 +221,16 @@ class EODHDClient:
         params: dict[str, Any] | None = None,
         *,
         call_cost: int = 1,
+        cache: bool = True,
     ) -> Any:
+        if call_cost < 0 or (call_cost == 0 and path.strip("/") != "user"):
+            raise ValueError("only the EODHD usage endpoint has zero API-call cost")
+        if path.strip("/") == "user":
+            cache = False
         public_params = {**(params or {}), "fmt": "json"}
         identity = self._cache_identity(path, public_params)
         cache_path = self._cache_path(identity)
-        cached = self._read_cache(cache_path)
+        cached = self._read_cache(cache_path) if cache else None
         if cached is not None:
             data, fetched_at = cached
             self.request_log.append(
@@ -185,7 +242,16 @@ class EODHDClient:
         url = f"{self.base_url}/{self._safe_path(path)}"
         last_status: int | None = None
         for attempt in range(self.max_retries + 1):
-            self.budget.reserve(call_cost)
+            if call_cost:
+                if self._account_reserve is not None:
+                    usage = self.account_usage()
+                    if usage["remaining_today"] - call_cost < self._account_reserve:
+                        raise EODHDBudgetError(
+                            "EODHD account reserve reached; stop research download "
+                            "and preserve the reserved API calls"
+                        )
+                self.budget.reserve(call_cost)
+            self._pace_request()
             try:
                 response = self.transport.get(
                     url, params=request_params, timeout=self.timeout_seconds
@@ -210,7 +276,10 @@ class EODHDClient:
                         self.api_token, "[REDACTED]"
                     )
                     raise EODHDError(f"EODHD API error for {identity['path']}: {detail}")
-                fetched_at = self._write_cache(cache_path, identity, data)
+                fetched_at = (
+                    self._write_cache(cache_path, identity, data)
+                    if cache else self.now().isoformat()
+                )
                 self.request_log.append(
                     {
                         **identity,

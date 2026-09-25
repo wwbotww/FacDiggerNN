@@ -12,9 +12,8 @@ import numpy as np
 import polars as pl
 import yaml
 
-from facdigger.data.config import load_dataset_build_config
 from facdigger.data.contracts import DataContractError
-from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
+from facdigger.data.snapshots import sha256_file
 from facdigger.environment import collect_environment
 from facdigger.evaluation.metrics import daily_information_coefficients
 from facdigger.experiments.manifest import collect_git_state, sha256_json
@@ -23,7 +22,7 @@ from facdigger.research.transformer_config import (
     TransformerComparisonConfig,
     validate_transformer_experiment_paths,
 )
-from facdigger.training.common import load_source_provenance
+from facdigger.research.transformer_snapshots import build_transformer_snapshots
 from facdigger.training.finance_pretrain import run_finance_pretraining
 from facdigger.training.finance_pretrain_config import (
     FinancePretrainingExperimentConfig,
@@ -122,59 +121,6 @@ def _resume_run(run_dir: Path, config: TransformerComparisonConfig) -> tuple[Pat
     if manifest.get("status") == "complete":
         raise ValueError("cannot resume a complete Transformer comparison")
     return root, manifest
-
-
-def _snapshots(
-    config: TransformerComparisonConfig,
-    runtime: TrainingRuntimeConfig | None = None,
-) -> list[dict[str, Any]]:
-    base = load_dataset_build_config(config.base_dataset_config)
-    if base.features.name != "finance_transformer":
-        raise DataContractError(
-            "streamlined comparison requires a finance_transformer dataset config"
-        )
-    plans: list[dict[str, Any]] = []
-    runtime = runtime or TrainingRuntimeConfig()
-    if runtime.fold_snapshots and set(runtime.fold_snapshots) != {f.fold_id for f in config.folds}:
-        raise DataContractError("prebuilt snapshots must specify exactly the configured folds")
-    for fold in config.folds:
-        split = fold.model_dump(exclude={"fold_id"})
-        fold_config = base.model_copy(
-            update={
-                "output_root": config.snapshot_output_root,
-                "split": base.split.model_validate(split),
-            }
-        )
-        location = runtime.fold_snapshots.get(fold.fold_id)
-        if location is None:
-            snapshot, manifest = build_dataset_snapshot(fold_config)
-        else:
-            manifest = json.loads((location.path / "manifest.json").read_text(encoding="utf-8"))
-            dataset_id = str(manifest["dataset_id"])
-            snapshot = resolve_dataset(
-                location.path,
-                TrainingRuntimeConfig(dataset_overrides={dataset_id: location}),
-                dataset_id=dataset_id,
-            )
-            expected = fold_config.model_dump(mode="json", exclude={"sources", "output_root"})
-            if manifest["config"] != expected:
-                raise DataContractError("prebuilt snapshot does not match fold dataset protocol")
-            identity = {
-                key: manifest[key] for key in ("schema_version", "config", "input_file_hashes")
-            }
-            if int(manifest["schema_version"]) < 4 or sha256_json(identity) != dataset_id:
-                raise DataContractError("prebuilt snapshot identity does not match")
-            load_source_provenance(snapshot, manifest)
-        plans.append(
-            {
-                "fold_id": fold.fold_id,
-                "split": split,
-                "dataset_id": manifest["dataset_id"],
-                "dataset_path": str(snapshot.resolve()),
-                "dataset_manifest_sha256": sha256_file(snapshot / "manifest.json"),
-            }
-        )
-    return plans
 
 
 def _same_supervised_protocol(
@@ -565,7 +511,7 @@ def _run_transformer_comparison(
     try:
         folds_path = run_dir / "folds.json"
         if not folds_path.is_file():
-            fold_plans = _snapshots(config, control.config)
+            fold_plans = build_transformer_snapshots(config, control.config)
             _validate_admission_dataset(admission, fold_plans)
             _write_json(folds_path, fold_plans)
         else:

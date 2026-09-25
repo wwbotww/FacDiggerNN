@@ -97,6 +97,55 @@ class EODHDProvider:
 
         return self._get_client()
 
+    def configure_download(self, *, reserve_calls: int, requests_per_minute: int) -> None:
+        self.client().enable_download_guard(
+            reserve_calls=reserve_calls, requests_per_minute=requests_per_minute
+        )
+
+    def plan_historical_download(self, *, reserve_calls: int = 10000) -> dict[str, Any]:
+        """Discover candidates and budget history requests without fetching price histories."""
+        if self.config.universe.mode != "historical_liquid":
+            raise ValueError("historical download planning requires historical_liquid mode")
+        if reserve_calls < 0:
+            raise ValueError("reserved API calls must be nonnegative")
+        client = self.client()
+        warnings: list[str] = []
+        symbols, _, selection = self._resolve_symbols_and_metadata(client, warnings)
+        start, end = self.config.resolved_dates()
+        dates = {"from": start.isoformat(), "to": end.isoformat()}
+        requests = cached = 0
+        for symbol in symbols:
+            endpoints = [(f"eod/{symbol}", {**dates, "period": "d", "order": "a"})]
+            if self.config.include_corporate_actions:
+                endpoints.extend([(f"div/{symbol}", dates), (f"splits/{symbol}", dates)])
+            for endpoint, params in endpoints:
+                requests += 1
+                cached += int(client.has_cached_response(endpoint, params))
+        usage = client.account_usage()
+        budget = client.budget.status()
+        missing = requests - cached
+        available = min(budget["remaining"], max(0, usage["remaining_today"] - reserve_calls))
+        return {
+            "provider": self.name,
+            "date_range": {"start": start.isoformat(), "end": end.isoformat()},
+            "selection": selection,
+            "history_requests": requests,
+            "cached_history_requests": cached,
+            "minimum_remaining_api_calls": missing,
+            "maximum_calls_with_retries": missing * (self.config.max_retries + 1),
+            "reserved_account_calls": reserve_calls,
+            "available_download_calls_today": available,
+            "minimum_download_fits_today": missing <= available,
+            "account": usage,
+            "local_budget": budget,
+            "warnings": warnings,
+            "limits": [
+                "estimate excludes future cache expiry and concurrent account consumers",
+                "budget availability does not prove endpoint subscription permissions",
+                "ingestion is resumable through cache; mapping and aggregation restart",
+            ],
+        }
+
     def _resolve_symbols_and_metadata(
         self, client: EODHDClient, warnings: list[str]
     ) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, Any]]:
