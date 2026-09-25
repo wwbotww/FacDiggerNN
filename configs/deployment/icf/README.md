@@ -9,13 +9,13 @@
 
 固定已审阅提交的完整 clone 到 `/home/$USER/facdigger/code`，保留 `.git`、配置和
 `uv.lock`；输出、配置、encoder、基准报告一旦绑定 run 就保持固定绝对路径。
-不要从 AFS 启动作业，不复制生产的 CURRENT、ledger、行情状态或 token。
+不要从 AFS 启动作业，不复制生产的 CURRENT、ledger 或行情状态；数据 API 凭据按第 2a 节单独配置。
 在准备节点安装一次环境，计算作业只运行既定 Python：
 
 ```bash
 cd "/home/$USER/facdigger/code"
 export UV_CACHE_DIR="/home/$USER/facdigger/cache/uv"
-uv sync --frozen --python /usr/bin/python3 --extra data --extra model --extra dev
+uv sync --frozen --python /usr/bin/python3 --extra data --extra model --extra eodhd --extra dev
 uv lock --check --offline
 mkdir -p "/home/$USER/facdigger/configs" "/home/$USER/facdigger/logs"
 cp configs/deployment/icf/resources.example.env "/home/$USER/facdigger/configs/resources.env"
@@ -72,6 +72,68 @@ fold_snapshots:
 替换 USER 和 ID。每次提交保留同一份指向持久输入的 runtime；包装生成本 allocation
 的实际映射，不把旧节点 scratch 路径保存为下一次唯一来源。不提供 `fold_snapshots`
 时，新矩阵仍需要 bronze；第一次从 scratch 启动矩阵必须显式提供这三份输入。
+
+**2a. 在学校重新下载 EODHD 并用 CPU 预构建三个 fold**
+
+如果不迁移旧 bronze，使用独立 CPU 作业。先固定代码提交，在 Lustre 生成三份可审阅配置：
+
+```bash
+cd "/home/$USER/facdigger/code"
+.venv/bin/python scripts/icf/configure_data.py --root "/home/$USER/facdigger"
+cp configs/deployment/icf/data.example.env "/home/$USER/facdigger/configs/data.env"
+bash scripts/icf/submit_data.sh "/home/$USER/facdigger/configs/data.env" --test-only
+```
+
+生成 `configs/eodhd.yaml`、`dataset.yaml`、`transformer.yaml`，仅替换部署路径；保留日期、
+股票池、特征、标签、split 和训练配置。重复执行不覆盖人工改动。审核配置后再开始采集；
+如需冻结新的 `device: cuda` 实验副本，先修改 `transformer.yaml` 中三份实验路径，并在
+benchmark/训练前完成冻结。生成器不安装环境、不下载数据、不提交训练。
+
+`data.env` 默认 `FD_DATA_MODE=plan`，4 CPU / 32G RAM / 4h，不申请 GPU，也不自动重排队。
+这些是起始请求，不代表全量 RAM 和时限已经实测通过。先确认上面的 `--test-only` 成功，
+再按以下顺序使用同一提交命令：
+
+```bash
+bash scripts/icf/submit_data.sh "/home/$USER/facdigger/configs/data.env"
+```
+
+| data.env 中的模式 | 工作与结果 |
+|---|---|
+| `plan` | 查询实时账户额度、活动/退市股票列表、有效缓存；写 `inputs/download_plan.json` |
+| `ingest` | 显式改为此模式才全量采集；写独立 cache/state/bronze，仍执行原质量门禁 |
+| `prepare` | 采集完成后改为此模式；CPU 生成三份不可变快照、外置清单和 `inputs/transformer/runtime.yaml` |
+
+凭据为 `/home/$USER/facdigger/secrets/eodhd.env`，内容只包含一条
+`export EODHD_API_TOKEN='实际值'`。目录必须本人所有且 `0700`，普通文件必须本人所有且
+`0600`；拒绝符号链接。提交脚本只传部署变量，计算节点才读取文件，不执行凭据内容、不把
+token 放入 Slurm 保存的环境。不要在 shell profile 中 source 凭据。`prepare` 不读取凭据。
+
+预检在无缓存时需要两次成功的股票列表请求，重试另计；不会下载价格历史。
+`max_symbols=1000` 是每日选股上限，
+历史下载需要覆盖全部历史候选，不能按 1000 只估算额度。报告按候选数、三个端点与缓存命中
+计算剩余 calls，分别列出无重试和所有请求都重试的估计。EODHD 的免费用量查询、UTC 日额度
+以及每分钟 HTTP 限制见[官方额度说明](https://eodhd.com/financial-apis/api-limits)。
+
+默认 `FD_RESERVE_API_CALLS=10000`、`FD_REQUESTS_PER_MINUTE=300`。每次付费请求及重试前
+读取实时日额度，不使用额外付费包；额度不足保留余量并失败退出。账户查询也参与 HTTP
+限速，因此最高数据请求吞吐小于 300/min。预留值需按实际生产消耗审核；这不是跨服务器的
+原子配额锁，并发消费者仍可能在查询后花费额度。原生产入口不启用这套研究下载保护。
+
+达到时限/额度或临时网络失败后，检查日志再手动重提 `ingest`。有效缓存避免重复请求；
+TTL 到期、`refresh=true` 或更改日期会重新消耗额度。映射/拼接重做，全量聚合仍驻留 RAM，
+不能把缓存恢复当成全流程流式恢复。首次全量必须观测 `MaxRSS`、空间和请求量。
+三个模式持有同一个 Lustre 数据锁，防止该部署同时采集和构建快照。
+
+`prepare` 每完成一个 fold 就保存进度；中断后复用已经校验的 fold，未完成 fold 重新计算。
+恢复时拒绝源文件版本不一致、文件损坏或配置变化，不重新生成清单掩盖损坏。全部完成后重复
+执行只验证，既不重新读取 bronze，也不改写快照。新的行情下载应使用新的准备目录和研究 run。
+若一个 fold 的 CPU 构建超过申请时限，先在 QoS 允许范围内提高时限/资源；反复提交同一个
+过短作业不会推进该 fold。这里的缓存/逐 fold 复用，与训练 update 边界的断点恢复分开验收。
+
+后续训练的 `FD_CONFIG` 指向 `configs/transformer.yaml`，`FD_RUNTIME` 指向生成的
+`inputs/transformer/runtime.yaml`；从 `folds.json` 取 `wf3.dataset_path` 作为最大 fold 基准输入。
+同一份 runtime 可用于本地或其他服务器 CLI；搬运快照后显式更新路径并保留原外置清单。
+CPU 准备还不表示 GPU 环境、订阅权限或正式研究 readiness 已通过。
 
 **3. 验证目标环境并测量预算**
 
@@ -142,6 +204,16 @@ bash scripts/icf/submit.sh "/home/$USER/facdigger/configs/resources.env"
 `allocations/<job-id>-<attempt>/` 保存环境、实际 runtime 和 staging 清单；
 `allocation_state.json` 保存受限重试计数，Slurm 日志在 `FD_LOG_ROOT`。
 JobID 不作为研究身份，多个作业可继续同一个 `FD_RUN_DIR`。
+
+完整矩阵结束后，生成独立健康报告，输出放在研究 run 外：
+
+```bash
+"$FD_PYTHON" -m facdigger research transformer-audit \
+  --run-dir "$FD_RUN_DIR" --output "$FD_ROOT/artifacts/transformer-health.json"
+```
+
+报告分开列出原 Rank IC acceptance 与六个监督 cell 的后半程健康检查；先验证九阶段产物。
+`passed` 仍要求人工比较两组 score 波动、梯度稳定性及数据来源限制，不自动晋级模型。
 
 保持旧代码环境和升级前的断点副本。新 reader 支持旧 epoch checkpoint；旧 reader
 不能读取新的 epoch 内恢复 contract。不要回滚代码后继续读新 last.pt，也不要改历史哈希。
