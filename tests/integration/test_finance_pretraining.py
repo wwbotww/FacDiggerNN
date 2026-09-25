@@ -39,11 +39,7 @@ def _frames() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
         for date_index, trade_date in enumerate(dates):
             row = {"security_id": security, "trade_date": trade_date}
             for channel_index, channel in enumerate(FINANCE_TRANSFORMER_CHANNELS):
-                row[channel] = (
-                    0.03 * date_index
-                    + 0.2 * security_index
-                    + 0.01 * channel_index
-                )
+                row[channel] = 0.03 * date_index + 0.2 * security_index + 0.01 * channel_index
                 row[f"observed_{channel}"] = True
             feature_rows.append(row)
     market_rows = []
@@ -101,14 +97,12 @@ def _frames() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     )
 
 
-def test_finance_pretraining_selects_and_writes_encoder_checkpoint(tmp_path) -> None:
+def _training_fixture():
     features, market, pretrain_index, probe_index = _frames()
     feature_store = SecurityFeatureStore(
         features=features, channels=list(FINANCE_TRANSFORMER_CHANNELS)
     )
-    market_store = MarketFeatureStore(
-        features=market, channels=list(MARKET_CONTEXT_CHANNELS)
-    )
+    market_store = MarketFeatureStore(features=market, channels=list(MARKET_CONTEXT_CHANNELS))
     pretraining_dataset = FinancePretrainingWindowDataset(
         feature_store=feature_store,
         market_store=market_store,
@@ -178,6 +172,15 @@ def test_finance_pretraining_selects_and_writes_encoder_checkpoint(tmp_path) -> 
             },
         }
     )
+    return config, pretraining_dataset, probe("probe_fit"), probe("probe_selection")
+
+
+def test_finance_pretraining_selects_and_writes_encoder_checkpoint(tmp_path) -> None:
+    config, pretraining_dataset, fit, selection = _training_fixture()
+
+    def probe(split):
+        return fit if split == "probe_fit" else selection
+
     checkpoint_dir = tmp_path / "checkpoints"
     _, audit = train_finance_pretraining(
         config,

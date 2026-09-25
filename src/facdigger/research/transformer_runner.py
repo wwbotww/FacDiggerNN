@@ -15,6 +15,7 @@ import yaml
 from facdigger.data.config import load_dataset_build_config
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
+from facdigger.environment import collect_environment
 from facdigger.evaluation.metrics import daily_information_coefficients
 from facdigger.experiments.manifest import collect_git_state, sha256_json
 from facdigger.research.statistics import panel_mean_inference
@@ -22,6 +23,7 @@ from facdigger.research.transformer_config import (
     TransformerComparisonConfig,
     validate_transformer_experiment_paths,
 )
+from facdigger.training.common import load_source_provenance
 from facdigger.training.finance_pretrain import run_finance_pretraining
 from facdigger.training.finance_pretrain_config import (
     FinancePretrainingExperimentConfig,
@@ -32,22 +34,30 @@ from facdigger.training.finance_transformer_config import (
     FinanceTransformerExperimentConfig,
     load_finance_transformer_config,
 )
-
-
-def _write_json(path: Path, payload: Any) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-        + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+from facdigger.training.resources import (
+    TrainingResourceBudget,
+    effective_resource_limits,
+    training_hardware,
+)
+from facdigger.training.run_state import verify_completed_artifacts
+from facdigger.training.runtime import (
+    TrainingControl,
+    TrainingPaused,
+    TrainingRuntimeConfig,
+    atomic_write_text,
+    resolve_dataset,
+    run_lock,
+)
+from facdigger.training.runtime import (
+    write_json as _write_json,
+)
 
 
 def _new_run(
     config: TransformerComparisonConfig,
     repository_root: Path,
     admission: dict[str, Any],
+    destination: Path | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     created_at = datetime.now(timezone.utc)
     config_payload = config.model_dump(mode="json")
@@ -58,11 +68,11 @@ def _new_run(
         "nonce": uuid.uuid4().hex,
     }
     run_id = (
-        f"{config.research_id}-{created_at.strftime('%Y%m%dT%H%M%SZ')}-"
-        f"{sha256_json(identity)[:8]}"
+        f"{config.research_id}-{created_at.strftime('%Y%m%dT%H%M%SZ')}-{sha256_json(identity)[:8]}"
     )
-    run_dir = config.output_root.resolve() / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
+    run_dir = destination or config.output_root.resolve() / run_id
+    run_id = run_dir.name
+    run_dir.mkdir(parents=True, exist_ok=destination is not None)
     manifest = {
         "status": "building_snapshots",
         "run_id": run_id,
@@ -79,6 +89,7 @@ def _new_run(
             "long_stages": 9,
         },
         "repository_root": str(repository_root),
+        "git": collect_git_state(repository_root),
         "resource_admission": {
             "report": str(config.admission_report.resolve()),
             "report_sha256": sha256_file(config.admission_report),
@@ -91,18 +102,16 @@ def _new_run(
             ),
         },
     }
-    (run_dir / "resolved_config.yaml").write_text(
+    atomic_write_text(
+        run_dir / "resolved_config.yaml",
         yaml.safe_dump(config_payload, allow_unicode=True, sort_keys=True),
-        encoding="utf-8",
     )
-    _write_json(run_dir / "manifest.json", manifest)
     _write_json(run_dir / "matrix.json", {"stages": []})
+    _write_json(run_dir / "manifest.json", manifest)
     return run_dir, manifest
 
 
-def _resume_run(
-    run_dir: Path, config: TransformerComparisonConfig
-) -> tuple[Path, dict[str, Any]]:
+def _resume_run(run_dir: Path, config: TransformerComparisonConfig) -> tuple[Path, dict[str, Any]]:
     root = run_dir.resolve()
     manifest_path = root / "manifest.json"
     if not manifest_path.is_file():
@@ -115,13 +124,19 @@ def _resume_run(
     return root, manifest
 
 
-def _snapshots(config: TransformerComparisonConfig) -> list[dict[str, Any]]:
+def _snapshots(
+    config: TransformerComparisonConfig,
+    runtime: TrainingRuntimeConfig | None = None,
+) -> list[dict[str, Any]]:
     base = load_dataset_build_config(config.base_dataset_config)
     if base.features.name != "finance_transformer":
         raise DataContractError(
             "streamlined comparison requires a finance_transformer dataset config"
         )
     plans: list[dict[str, Any]] = []
+    runtime = runtime or TrainingRuntimeConfig()
+    if runtime.fold_snapshots and set(runtime.fold_snapshots) != {f.fold_id for f in config.folds}:
+        raise DataContractError("prebuilt snapshots must specify exactly the configured folds")
     for fold in config.folds:
         split = fold.model_dump(exclude={"fold_id"})
         fold_config = base.model_copy(
@@ -130,7 +145,26 @@ def _snapshots(config: TransformerComparisonConfig) -> list[dict[str, Any]]:
                 "split": base.split.model_validate(split),
             }
         )
-        snapshot, manifest = build_dataset_snapshot(fold_config)
+        location = runtime.fold_snapshots.get(fold.fold_id)
+        if location is None:
+            snapshot, manifest = build_dataset_snapshot(fold_config)
+        else:
+            manifest = json.loads((location.path / "manifest.json").read_text(encoding="utf-8"))
+            dataset_id = str(manifest["dataset_id"])
+            snapshot = resolve_dataset(
+                location.path,
+                TrainingRuntimeConfig(dataset_overrides={dataset_id: location}),
+                dataset_id=dataset_id,
+            )
+            expected = fold_config.model_dump(mode="json", exclude={"sources", "output_root"})
+            if manifest["config"] != expected:
+                raise DataContractError("prebuilt snapshot does not match fold dataset protocol")
+            identity = {
+                key: manifest[key] for key in ("schema_version", "config", "input_file_hashes")
+            }
+            if int(manifest["schema_version"]) < 4 or sha256_json(identity) != dataset_id:
+                raise DataContractError("prebuilt snapshot identity does not match")
+            load_source_provenance(snapshot, manifest)
         plans.append(
             {
                 "fold_id": fold.fold_id,
@@ -174,15 +208,9 @@ def _same_pretraining_encoder_protocol(
     if supervised.channels != pretraining.channels or (
         supervised.market_channels != pretraining.market_channels
     ):
-        raise DataContractError(
-            "pretraining and supervised channel contracts must be identical"
-        )
-    if supervised.model.model_dump(mode="json") != pretraining.model.model_dump(
-        mode="json"
-    ):
-        raise DataContractError(
-            "pretraining and supervised encoder architecture must be identical"
-        )
+        raise DataContractError("pretraining and supervised channel contracts must be identical")
+    if supervised.model.model_dump(mode="json") != pretraining.model.model_dump(mode="json"):
+        raise DataContractError("pretraining and supervised encoder architecture must be identical")
 
 
 def _load_resource_admission(
@@ -190,12 +218,11 @@ def _load_resource_admission(
     *,
     supervised: FinanceTransformerExperimentConfig,
     pretraining: FinancePretrainingExperimentConfig,
+    resource_budget: TrainingResourceBudget | None = None,
 ) -> dict[str, Any]:
     path = config.admission_report.resolve()
     if not path.is_file():
-        raise FileNotFoundError(
-            "RTX admission report is required before transformer-run: " f"{path}"
-        )
+        raise FileNotFoundError(f"RTX admission report is required before transformer-run: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
     if int(payload.get("benchmark_optimizer_updates", 0)) < 100:
         raise DataContractError("RTX admission must measure at least 100 optimizer updates")
@@ -207,15 +234,33 @@ def _load_resource_admission(
         if payload.get(field) != expected:
             raise DataContractError(f"RTX admission {field} does not match this matrix")
     projection = payload.get("matrix_projection", {})
-    if projection.get("pretraining_runs") != 3 or projection.get(
-        "supervised_cells"
-    ) != 6:
+    if projection.get("pretraining_runs") != 3 or projection.get("supervised_cells") != 6:
         raise DataContractError("RTX admission does not project the fixed nine stages")
     admission = payload.get("admission", {})
+    if resource_budget is not None:
+        if payload.get("resource_budget") != resource_budget.model_dump(mode="json"):
+            raise DataContractError("resource admission budget does not match")
+        hardware = training_hardware()
+        if payload.get("hardware") != hardware:
+            raise DataContractError("resource admission hardware differs; repeat benchmark")
+        limits = effective_resource_limits(resource_budget, hardware)
+        gpu_peak = max(
+            int(payload[key]["cuda_peak_reserved_bytes"] or 0)
+            for key in ("supervised", "pretraining")
+        )
+        if gpu_peak > limits["cuda_peak_reserved_bytes"] or (
+            payload["host_peak_rss_bytes"] is None
+            or payload["host_peak_rss_bytes"] > limits["host_peak_rss_bytes"]
+        ):
+            raise DataContractError("resource admission exceeds current allocation")
+        if projection["projected_days"] > resource_budget.projected_days:
+            raise DataContractError("resource admission exceeds time budget")
+    elif "resource_budget" in payload:
+        raise DataContractError("explicit resource admission requires its resource budget")
     required_checks = (
         "cuda_fp16_verified",
         "within_memory_budget",
-        "within_fourteen_days",
+        "within_time_budget" if resource_budget is not None else "within_fourteen_days",
         "admitted",
     )
     failed = [name for name in required_checks if admission.get(name) is not True]
@@ -238,9 +283,7 @@ def _validate_admission_dataset(
         )
 
 
-def _record(
-    matrix: dict[str, Any], *, fold_id: str, stage: str
-) -> dict[str, Any]:
+def _record(matrix: dict[str, Any], *, fold_id: str, stage: str) -> dict[str, Any]:
     for item in matrix["stages"]:
         if item["fold_id"] == fold_id and item["stage"] == stage:
             return item
@@ -260,21 +303,65 @@ def _validate_completed_stage(record: dict[str, Any]) -> Path:
     return run_dir
 
 
-def _recoverable_checkpoint(output_root: Path) -> Path | None:
-    manifests = sorted(
-        output_root.glob("*/manifest.json"),
-        key=lambda path: path.stat().st_mtime_ns,
-        reverse=True,
-    )
-    for path in manifests:
+def _run_stage(
+    record: dict[str, Any],
+    matrix: dict[str, Any],
+    matrix_path: Path,
+    *,
+    output_root: Path,
+    experiment: Any,
+    plan: dict[str, Any],
+    dataset_path: Path,
+    repository: Path,
+    control: TrainingControl,
+    trainer: Any,
+) -> Path:
+    expected = {
+        "config_hash": sha256_json(experiment.model_dump(mode="json")),
+        "dataset_id": plan["dataset_id"],
+        "dataset_manifest_hash": plan["dataset_manifest_sha256"],
+    }
+    if "run_dir" not in record:
+        candidates = list(output_root.glob("*/manifest.json"))
+        matches = []
+        for path in candidates:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if all(payload.get(key) == value for key, value in expected.items()):
+                matches.append(path.parent)
+        if candidates and len(matches) != 1:
+            raise DataContractError("legacy stage has ambiguous or mismatched child runs")
+        record["run_dir"] = str(matches[0] if matches else output_root / "run")
+        _write_json(matrix_path, matrix)
+    child = Path(record["run_dir"]).resolve()
+    if not child.is_relative_to(output_root.resolve()):
+        raise DataContractError("bound child run is outside the stage output directory")
+    path = child / "manifest.json"
+    if path.is_file():
         payload = json.loads(path.read_text(encoding="utf-8"))
-        relative = payload.get("recoverable_checkpoint")
-        if payload.get("status") != "failed" or not relative:
-            continue
-        checkpoint = path.parent / str(relative)
-        if checkpoint.is_file():
-            return checkpoint
-    return None
+        if any(payload.get(key) != value for key, value in expected.items()):
+            raise DataContractError("bound child run protocol or dataset differs")
+        if record["status"] == "complete":
+            _validate_completed_stage(record)
+        if payload.get("status") == "complete":
+            verify_completed_artifacts(child, payload)
+            _complete_record(record, child)
+            _write_json(matrix_path, matrix)
+            return child
+    elif record["status"] == "complete":
+        raise DataContractError("completed stage has no manifest")
+    record.update({"status": "running", "started_at": datetime.now(timezone.utc).isoformat()})
+    _write_json(matrix_path, matrix)
+    try:
+        completed, _ = trainer(
+            experiment, dataset_path, repository_root=repository, run_dir=child, control=control
+        )
+    except BaseException as exc:
+        record["status"] = "paused" if isinstance(exc, TrainingPaused) else "failed"
+        _write_json(matrix_path, matrix)
+        raise
+    _complete_record(record, completed)
+    _write_json(matrix_path, matrix)
+    return completed
 
 
 def _complete_record(record: dict[str, Any], run_dir: Path) -> None:
@@ -294,10 +381,7 @@ def _paired_result(
     matrix: dict[str, Any],
     config: TransformerComparisonConfig,
 ) -> dict[str, Any]:
-    by_key = {
-        (record["fold_id"], record["stage"]): record
-        for record in matrix["stages"]
-    }
+    by_key = {(record["fold_id"], record["stage"]): record for record in matrix["stages"]}
     folds: list[dict[str, Any]] = []
     daily_delta_groups: list[list[float]] = []
     for plan in fold_plans:
@@ -327,9 +411,7 @@ def _paired_result(
         ):
             raise DataContractError(f"paired daily Rank IC dates differ for {fold_id}")
         paired = paired.with_columns(
-            (pl.col("pretrained_rank_ic") - pl.col("scratch_rank_ic")).alias(
-                "delta"
-            )
+            (pl.col("pretrained_rank_ic") - pl.col("scratch_rank_ic")).alias("delta")
         )
         delta = paired["delta"].to_list()
         daily_delta_groups.append(delta)
@@ -339,9 +421,7 @@ def _paired_result(
                 "dataset_id": plan["dataset_id"],
                 "dates": paired.height,
                 "scratch_mean_rank_ic": float(paired["scratch_rank_ic"].mean()),
-                "pretrained_mean_rank_ic": float(
-                    paired["pretrained_rank_ic"].mean()
-                ),
+                "pretrained_mean_rank_ic": float(paired["pretrained_rank_ic"].mean()),
                 "paired_mean_delta": float(paired["delta"].mean()),
             }
         )
@@ -351,8 +431,7 @@ def _paired_result(
     worst_pretrained = min(fold["pretrained_mean_rank_ic"] for fold in folds)
     decision = config.decisions
     checks = {
-        "paired_mean_delta": paired_mean
-        >= decision.minimum_paired_mean_rank_ic_delta,
+        "paired_mean_delta": paired_mean >= decision.minimum_paired_mean_rank_ic_delta,
         "positive_folds": positive_folds >= decision.minimum_positive_folds,
         "positive_worst_scratch": worst_scratch > 0,
         "positive_worst_pretrained": worst_pretrained > 0,
@@ -391,6 +470,58 @@ def run_transformer_comparison(
     *,
     repository_root: str | Path,
     resume_run: str | Path | None = None,
+    run_dir: str | Path | None = None,
+    runtime: TrainingRuntimeConfig | None = None,
+    resource_budget: TrainingResourceBudget | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    if (
+        resume_run is not None
+        and run_dir is not None
+        and Path(resume_run).resolve() != Path(run_dir).resolve()
+    ):
+        raise ValueError("resume run and run directory differ")
+    root = (
+        Path(resume_run or run_dir).resolve()
+        if (resume_run or run_dir)
+        else (config.output_root.resolve() / f"{config.research_id}-{uuid.uuid4().hex[:12]}")
+    )
+    with run_lock(root / ".research.lock"), TrainingControl(runtime) as control:
+        existing = root / "manifest.json"
+        if existing.is_file():
+            manifest = json.loads(existing.read_text(encoding="utf-8"))
+            if manifest.get("status") == "complete":
+                if manifest["config_hash"] != sha256_json(config.model_dump(mode="json")):
+                    raise DataContractError("completed research configuration differs")
+                if sha256_file(root / "comparison.json") != manifest["comparison_sha256"]:
+                    raise DataContractError("completed comparison changed")
+                for record in json.loads((root / "matrix.json").read_text(encoding="utf-8"))[
+                    "stages"
+                ]:
+                    child = _validate_completed_stage(record)
+                    verify_completed_artifacts(
+                        child, json.loads((child / "manifest.json").read_text(encoding="utf-8"))
+                    )
+                return root, manifest
+        elif resume_run is not None:
+            raise FileNotFoundError(f"Transformer comparison manifest missing: {existing}")
+        return _run_transformer_comparison(
+            config,
+            repository_root=repository_root,
+            destination=root,
+            resume_run=root if existing.is_file() else None,
+            control=control,
+            resource_budget=resource_budget,
+        )
+
+
+def _run_transformer_comparison(
+    config: TransformerComparisonConfig,
+    *,
+    repository_root: str | Path,
+    destination: Path,
+    resume_run: Path | None,
+    control: TrainingControl,
+    resource_budget: TrainingResourceBudget | None,
 ) -> tuple[Path, dict[str, Any]]:
     repository = Path(repository_root).resolve()
     paths = validate_transformer_experiment_paths(config)
@@ -403,71 +534,68 @@ def run_transformer_comparison(
         config,
         supervised=scratch_template,
         pretraining=pretraining_template,
+        resource_budget=resource_budget,
     )
     if resume_run is None:
-        run_dir, manifest = _new_run(config, repository, admission)
-        try:
-            fold_plans = _snapshots(config)
-            _validate_admission_dataset(admission, fold_plans)
-            _write_json(run_dir / "folds.json", fold_plans)
-        except Exception as exc:
-            manifest.update(
-                {
-                    "status": "failed",
-                    "failed_at": datetime.now(timezone.utc).isoformat(),
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
-                }
-            )
-            _write_json(run_dir / "manifest.json", manifest)
-            raise
+        run_dir, manifest = _new_run(config, repository, admission, destination)
     else:
         run_dir, manifest = _resume_run(Path(resume_run), config)
-        expected_report_hash = manifest.get("resource_admission", {}).get(
-            "report_sha256"
-        )
+        expected_report_hash = manifest.get("resource_admission", {}).get("report_sha256")
         if expected_report_hash != sha256_file(config.admission_report):
             raise DataContractError("RTX admission report changed after matrix creation")
-        fold_plans = json.loads((run_dir / "folds.json").read_text(encoding="utf-8"))
-        _validate_admission_dataset(admission, fold_plans)
     matrix_path = run_dir / "matrix.json"
     matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
     manifest.update(
         {
             "status": "running",
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "stop_reason": None,
+            "error": None,
+        }
+    )
+    manifest.setdefault("attempts", []).append(
+        {
+            "started_at": manifest["updated_at"],
+            "runtime": control.config.model_dump(mode="json"),
+            "git": collect_git_state(repository),
+            "environment": collect_environment(include_model_dependencies=True),
         }
     )
     _write_json(run_dir / "manifest.json", manifest)
     try:
+        folds_path = run_dir / "folds.json"
+        if not folds_path.is_file():
+            fold_plans = _snapshots(config, control.config)
+            _validate_admission_dataset(admission, fold_plans)
+            _write_json(folds_path, fold_plans)
+        else:
+            fold_plans = json.loads(folds_path.read_text(encoding="utf-8"))
+            _validate_admission_dataset(admission, fold_plans)
         for plan in fold_plans:
             fold_id = plan["fold_id"]
-            dataset_path = Path(plan["dataset_path"])
+            dataset_path = resolve_dataset(
+                Path(plan["dataset_path"]),
+                control.config,
+                dataset_id=plan["dataset_id"],
+                manifest_hash=plan["dataset_manifest_sha256"],
+            )
             pretrain_record = _record(matrix, fold_id=fold_id, stage="pretraining")
-            if pretrain_record["status"] == "complete":
-                pretrain_run = _validate_completed_stage(pretrain_record)
-            else:
-                output_root = run_dir / "runs" / fold_id / "pretraining"
-                output_root.mkdir(parents=True, exist_ok=True)
-                resume = _recoverable_checkpoint(output_root)
-                pretrain_record.update(
-                    {
-                        "status": "running",
-                        "started_at": datetime.now(timezone.utc).isoformat(),
-                        "resume_from": str(resume) if resume else None,
-                    }
-                )
-                _write_json(matrix_path, matrix)
-                pretrain_config = pretraining_template.model_copy(
-                    update={"seed": 42, "output_root": output_root}
-                )
-                pretrain_run, _ = run_finance_pretraining(
-                    pretrain_config,
-                    dataset_path,
-                    repository_root=repository,
-                    resume_from=resume,
-                )
-                _complete_record(pretrain_record, pretrain_run)
-                _write_json(matrix_path, matrix)
+            output_root = run_dir / "runs" / fold_id / "pretraining"
+            pretrain_config = pretraining_template.model_copy(
+                update={"seed": 42, "output_root": output_root}
+            )
+            pretrain_run = _run_stage(
+                pretrain_record,
+                matrix,
+                matrix_path,
+                output_root=output_root,
+                experiment=pretrain_config,
+                plan=plan,
+                dataset_path=dataset_path,
+                repository=repository,
+                control=control,
+                trainer=run_finance_pretraining,
+            )
             encoder = pretrain_run / "checkpoints" / "best_encoder.pt"
             if not encoder.is_file():
                 raise FileNotFoundError(f"pretraining encoder is missing: {encoder}")
@@ -477,12 +605,7 @@ def run_transformer_comparison(
                 ("finance_pretrained", pretrained_template),
             ):
                 record = _record(matrix, fold_id=fold_id, stage=stage)
-                if record["status"] == "complete":
-                    _validate_completed_stage(record)
-                    continue
                 output_root = run_dir / "runs" / fold_id / stage
-                output_root.mkdir(parents=True, exist_ok=True)
-                resume = _recoverable_checkpoint(output_root)
                 update: dict[str, Any] = {
                     "seed": 42,
                     "output_root": output_root,
@@ -492,22 +615,18 @@ def run_transformer_comparison(
                 if stage == "finance_pretrained":
                     update["pretrained_checkpoint"] = encoder
                 experiment = template.model_copy(update=update)
-                record.update(
-                    {
-                        "status": "running",
-                        "started_at": datetime.now(timezone.utc).isoformat(),
-                        "resume_from": str(resume) if resume else None,
-                    }
+                _run_stage(
+                    record,
+                    matrix,
+                    matrix_path,
+                    output_root=output_root,
+                    experiment=experiment,
+                    plan=plan,
+                    dataset_path=dataset_path,
+                    repository=repository,
+                    control=control,
+                    trainer=run_finance_transformer,
                 )
-                _write_json(matrix_path, matrix)
-                completed_run, _ = run_finance_transformer(
-                    experiment,
-                    dataset_path,
-                    repository_root=repository,
-                    resume_from=resume,
-                )
-                _complete_record(record, completed_run)
-                _write_json(matrix_path, matrix)
         result = _paired_result(fold_plans, matrix, config)
         _write_json(run_dir / "comparison.json", result)
         manifest.update(
@@ -520,10 +639,11 @@ def run_transformer_comparison(
             }
         )
         _write_json(run_dir / "manifest.json", manifest)
-    except Exception as exc:
+    except BaseException as exc:
         manifest.update(
             {
-                "status": "failed",
+                "status": "paused" if isinstance(exc, TrainingPaused) else "failed",
+                "stop_reason": exc.reason if isinstance(exc, TrainingPaused) else None,
                 "failed_at": datetime.now(timezone.utc).isoformat(),
                 "error": {"type": type(exc).__name__, "message": str(exc)},
             }

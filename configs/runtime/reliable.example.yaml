@@ -1,0 +1,7 @@
+# Portable opt-in controls. No scheduler, storage or model settings belong here.
+checkpoint_interval_seconds: 600
+max_walltime_seconds: null
+shutdown_margin_seconds: 0
+handle_signals: false
+dataset_overrides: {}
+fold_snapshots: {}

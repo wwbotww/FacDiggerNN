@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -94,6 +96,7 @@ def predict_finance_transformer(
     device: str,
     precision: str,
     num_workers: int,
+    check_stop: Callable[[], None] | None = None,
 ) -> np.ndarray:
     loader, sampler = _full_date_loader(
         dataset,
@@ -109,6 +112,8 @@ def predict_finance_transformer(
     model.eval()
     with torch.no_grad():
         for full_date_batch in loader:
+            if check_stop is not None:
+                check_stop()
             local_chunks: list[torch.Tensor] = []
             for microbatch in _device_microbatches(full_date_batch, batch_size=batch_size):
                 values = microbatch["values"].to(

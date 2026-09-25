@@ -310,6 +310,22 @@ def train_e2_command(
     )
 
 
+@train_app.command("snapshot-checksums")
+def training_snapshot_checksums_command(
+    dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
+    output: Annotated[Path, typer.Option(help="External inventory for snapshot transfer checks.")],
+) -> None:
+    """Inventory an immutable training snapshot without modifying it."""
+    from facdigger.training.runtime import write_snapshot_checksums
+
+    try:
+        write_snapshot_checksums(dataset, output)
+    except Exception as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(str(output.resolve()))
+
+
 @train_app.command("finance-transformer")
 def train_finance_transformer_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
@@ -318,6 +334,14 @@ def train_finance_transformer_command(
         Path | None,
         typer.Option(exists=True, dir_okay=False, readable=True, help="Resume from last.pt."),
     ] = None,
+    runtime: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, help="Optional training run controls."),
+    ] = None,
+    run_directory: Annotated[
+        Path | None,
+        typer.Option("--run-dir", file_okay=False, help="Create or continue this run."),
+    ] = None,
 ) -> None:
     """Train the finance-native full-date Transformer factor model."""
 
@@ -325,6 +349,7 @@ def train_finance_transformer_command(
     from facdigger.training.finance_transformer_config import (
         load_finance_transformer_config,
     )
+    from facdigger.training.runtime import TrainingPaused, load_training_runtime
 
     try:
         run_dir, metrics = run_finance_transformer(
@@ -332,7 +357,12 @@ def train_finance_transformer_command(
             dataset,
             repository_root=Path.cwd(),
             resume_from=resume,
+            runtime=load_training_runtime(runtime),
+            run_dir=run_directory,
         )
+    except TrainingPaused as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=75) from exc
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
@@ -346,9 +376,7 @@ def train_finance_transformer_command(
                 "coverage": metrics["coverage"]["coverage"],
                 "mean_rank_ic": raw["rank_ic"]["mean"],
                 "rank_icir": raw["rank_ic"]["ir"],
-                "gross_q_high_minus_low": raw["portfolio"].get(
-                    "gross_q_high_minus_low"
-                ),
+                "gross_q_high_minus_low": raw["portfolio"].get("gross_q_high_minus_low"),
             },
             ensure_ascii=False,
             indent=2,
@@ -365,6 +393,14 @@ def train_finance_pretrain_command(
         Path | None,
         typer.Option(exists=True, dir_okay=False, readable=True, help="Resume from last.pt."),
     ] = None,
+    runtime: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, help="Optional training run controls."),
+    ] = None,
+    run_directory: Annotated[
+        Path | None,
+        typer.Option("--run-dir", file_okay=False, help="Create or continue this run."),
+    ] = None,
 ) -> None:
     """Pretrain finance-native encoders on one fold's Train partition."""
 
@@ -372,6 +408,7 @@ def train_finance_pretrain_command(
     from facdigger.training.finance_pretrain_config import (
         load_finance_pretraining_config,
     )
+    from facdigger.training.runtime import TrainingPaused, load_training_runtime
 
     try:
         run_dir, audit = run_finance_pretraining(
@@ -379,7 +416,12 @@ def train_finance_pretrain_command(
             dataset,
             repository_root=Path.cwd(),
             resume_from=resume,
+            runtime=load_training_runtime(runtime),
+            run_dir=run_directory,
         )
+    except TrainingPaused as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=75) from exc
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
@@ -400,16 +442,10 @@ def train_finance_pretrain_command(
 
 @train_app.command("finance-benchmark")
 def train_finance_benchmark_command(
-    supervised_config: Annotated[
-        Path, typer.Option(exists=True, dir_okay=False, readable=True)
-    ],
-    pretraining_config: Annotated[
-        Path, typer.Option(exists=True, dir_okay=False, readable=True)
-    ],
+    supervised_config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    pretraining_config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
     dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
-    output: Annotated[
-        Path, typer.Option(help="JSON report path for the RTX admission decision.")
-    ],
+    output: Annotated[Path, typer.Option(help="JSON report path for the RTX admission decision.")],
     updates: Annotated[
         int,
         typer.Option(
@@ -417,6 +453,10 @@ def train_finance_benchmark_command(
             help="Measured optimizer updates per main update type; admission requires 100.",
         ),
     ] = 100,
+    resource_budget: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, help="Optional platform resource budget."),
+    ] = None,
 ) -> None:
     """Benchmark unchanged full-size model updates before the nine-stage run."""
 
@@ -430,6 +470,7 @@ def train_finance_benchmark_command(
     from facdigger.training.finance_transformer_config import (
         load_finance_transformer_config,
     )
+    from facdigger.training.resources import load_resource_budget
 
     try:
         report = run_finance_training_benchmark(
@@ -437,6 +478,7 @@ def train_finance_benchmark_command(
             load_finance_pretraining_config(pretraining_config),
             dataset,
             optimizer_updates=updates,
+            resource_budget=load_resource_budget(resource_budget),
         )
         destination = write_finance_training_benchmark(output, report)
     except Exception as exc:
@@ -764,9 +806,14 @@ def factor_history_plan_command(
     )
 
     try:
-        plan = plan_historical_replay(load_historical_replay_config(
-            config, release_dir=release, inference_snapshot_dir=dataset, output_root=output_root,
-        ))
+        plan = plan_historical_replay(
+            load_historical_replay_config(
+                config,
+                release_dir=release,
+                inference_snapshot_dir=dataset,
+                output_root=output_root,
+            )
+        )
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
@@ -806,8 +853,10 @@ def factor_history_run_command(
     try:
         destination, manifest = run_historical_replay(
             load_historical_replay_config(
-                config, release_dir=release,
-                inference_snapshot_dir=dataset, output_root=output_root,
+                config,
+                release_dir=release,
+                inference_snapshot_dir=dataset,
+                output_root=output_root,
             ),
             on_partition=report_partition,
         )
@@ -854,7 +903,9 @@ def factor_history_verify_command(
 
     try:
         manifest = verify_historical_replay(
-            export, release_dir=release, inference_snapshot_dir=dataset,
+            export,
+            release_dir=release,
+            inference_snapshot_dir=dataset,
         )
     except Exception as exc:
         typer.echo(str(exc), err=True)
@@ -971,9 +1022,7 @@ def production_plan_command(
                 "phase": window.phase,
                 "fixed_release_id": production.model.release_id,
                 "training_snapshots": "never_modified",
-                "inference_retention_sessions": (
-                    production.inference.retention_sessions
-                ),
+                "inference_retention_sessions": (production.inference.retention_sessions),
                 "factor_batch_retention": production.factor_batch.retention,
             },
             ensure_ascii=False,
@@ -987,7 +1036,8 @@ def production_plan_command(
 def production_bootstrap_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
     live: Annotated[
-        bool, typer.Option(help="Fetch current-identity history into an empty production store."),
+        bool,
+        typer.Option(help="Fetch current-identity history into an empty production store."),
     ] = False,
 ) -> None:
     """Initialize from accepted bronze, or explicitly fetch live history with --live."""
@@ -1061,7 +1111,8 @@ def production_resume_command(
     config: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
     target: Annotated[str, typer.Option(help="Inspected blocked D, YYYY-MM-DD.")],
     expected_updated_at: Annotated[
-        str, typer.Option(help="Exact updated_at from production status."),
+        str,
+        typer.Option(help="Exact updated_at from production status."),
     ],
     reason: Annotated[str, typer.Option(help="Audited repair reason; never include secrets.")],
 ) -> None:
@@ -1073,8 +1124,10 @@ def production_resume_command(
 
     try:
         result = resume_blocked_production(
-            load_production_config(config), target_date=date.fromisoformat(target),
-            expected_updated_at=expected_updated_at, reason=reason,
+            load_production_config(config),
+            target_date=date.fromisoformat(target),
+            expected_updated_at=expected_updated_at,
+            reason=reason,
         )
     except Exception as exc:
         typer.echo(str(exc), err=True)
@@ -1122,12 +1175,8 @@ def production_serve_command(
 
 @app.command("evaluate")
 def evaluate_command(
-    predictions: Annotated[
-        Path, typer.Option(exists=True, dir_okay=False, readable=True)
-    ],
-    dataset: Annotated[
-        Path, typer.Option(exists=True, file_okay=False, readable=True)
-    ],
+    predictions: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    dataset: Annotated[Path, typer.Option(exists=True, file_okay=False, readable=True)],
     output: Annotated[Path, typer.Option(help="New independent evaluation directory.")],
     costs_bps: Annotated[
         str, typer.Option(help="Comma-separated one-way cost assumptions in basis points.")
@@ -1281,6 +1330,18 @@ def transformer_research_run_command(
             help="Resume a failed streamlined Transformer comparison.",
         ),
     ] = None,
+    runtime: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, help="Optional training run controls."),
+    ] = None,
+    run_directory: Annotated[
+        Path | None,
+        typer.Option("--run-dir", file_okay=False, help="Create or continue this run."),
+    ] = None,
+    resource_budget: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, help="Explicit benchmark resource budget."),
+    ] = None,
 ) -> None:
     """Run exactly three pretrains and six paired supervised cells."""
 
@@ -1288,13 +1349,21 @@ def transformer_research_run_command(
         load_transformer_comparison_config,
     )
     from facdigger.research.transformer_runner import run_transformer_comparison
+    from facdigger.training.resources import load_resource_budget
+    from facdigger.training.runtime import TrainingPaused, load_training_runtime
 
     try:
         run_dir, manifest = run_transformer_comparison(
             load_transformer_comparison_config(config),
             repository_root=Path.cwd(),
             resume_run=resume_run,
+            runtime=load_training_runtime(runtime),
+            run_dir=run_directory,
+            resource_budget=load_resource_budget(resource_budget),
         )
+    except TrainingPaused as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=75) from exc
     except Exception as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc

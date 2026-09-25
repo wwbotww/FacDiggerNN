@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import json
-import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import polars as pl
-import yaml
 
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
@@ -20,7 +19,7 @@ from facdigger.datasets.window import (
     SecurityFeatureStore,
 )
 from facdigger.environment import collect_environment
-from facdigger.experiments.manifest import collect_git_state, sha256_json
+from facdigger.experiments.manifest import collect_git_state
 from facdigger.training.common import (
     load_required_market_features,
     load_required_snapshot_features,
@@ -30,14 +29,14 @@ from facdigger.training.finance_pretrain_config import (
     FinancePretrainingExperimentConfig,
 )
 from facdigger.training.finance_pretrain_engine import train_finance_pretraining
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-        + "\n",
-        encoding="utf-8",
-    )
+from facdigger.training.run_state import TrainingRun, training_run
+from facdigger.training.runtime import (
+    TrainingControl,
+    TrainingRuntimeConfig,
+)
+from facdigger.training.runtime import (
+    write_json as _write_json,
+)
 
 
 def _append_progress(path: Path, payload: dict[str, Any]) -> None:
@@ -68,24 +67,20 @@ def _probe_index(
     fit_candidates = official_train.filter(pl.col("label_end") < selection_start)
     available_fit_dates = fit_candidates["asof_date"].unique().sort().to_list()
     if len(available_fit_dates) < fit_dates:
-        raise DataContractError(
-            "finance pretraining probe purge leaves too few fit dates"
-        )
+        raise DataContractError("finance pretraining probe purge leaves too few fit dates")
     fit = available_fit_dates[-fit_dates:]
     probe_fit = official_train.filter(pl.col("asof_date").is_in(fit)).with_columns(
         pl.lit("probe_fit").alias("split")
     )
-    probe_selection = official_train.filter(
-        pl.col("asof_date").is_in(selection)
-    ).with_columns(pl.lit("probe_selection").alias("split"))
+    probe_selection = official_train.filter(pl.col("asof_date").is_in(selection)).with_columns(
+        pl.lit("probe_selection").alias("split")
+    )
     if probe_fit.is_empty() or probe_selection.is_empty():
         raise DataContractError("finance pretraining probe produced an empty partition")
     if probe_fit["label_end"].max() >= selection_start:
         raise DataContractError("finance pretraining probe labels overlap selection")
     return (
-        pl.concat([probe_fit, probe_selection], how="vertical").sort(
-            ["asof_date", "security_id"]
-        ),
+        pl.concat([probe_fit, probe_selection], how="vertical").sort(["asof_date", "security_id"]),
         {
             "policy": "fixed_train_tail_probe_with_label_overlap_purge",
             "fit_dates": fit_dates,
@@ -102,58 +97,45 @@ def _probe_index(
     )
 
 
-def _new_run_dir(
-    config: FinancePretrainingExperimentConfig, dataset_id: str
-) -> tuple[Path, str, str]:
-    created_at = datetime.now(timezone.utc)
-    identity = {
-        "config": config.model_dump(mode="json"),
-        "dataset_id": dataset_id,
-        "created_at": created_at.isoformat(),
-        "nonce": uuid.uuid4().hex,
-    }
-    run_id = (
-        f"{config.experiment_id}-{created_at.strftime('%Y%m%dT%H%M%SZ')}-"
-        f"{sha256_json(identity)[:8]}"
-    )
-    run_dir = config.output_root.resolve() / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
-    return run_dir, run_id, created_at.isoformat()
-
-
-def _resume_run_dir(
-    resume_from: Path, *, dataset_id: str, config_hash: str
-) -> tuple[Path, str, str]:
-    checkpoint = resume_from.resolve()
-    if not checkpoint.is_file() or checkpoint.parent.name != "checkpoints":
-        raise FileNotFoundError(
-            "finance pretraining resume checkpoint must be inside checkpoints"
-        )
-    run_dir = checkpoint.parent.parent
-    manifest_path = run_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"pretraining run manifest not found: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("status") == "complete":
-        raise ValueError("cannot resume an already-complete pretraining run")
-    if manifest.get("dataset_id") != dataset_id:
-        raise ValueError("pretraining resume run dataset_id does not match")
-    if manifest.get("config_hash") != config_hash:
-        raise ValueError("pretraining resume configuration does not match")
-    return run_dir, str(manifest["run_id"]), str(manifest["created_at"])
-
-
 def run_finance_pretraining(
     config: FinancePretrainingExperimentConfig,
     dataset_dir: str | Path,
     *,
     repository_root: str | Path,
     resume_from: str | Path | None = None,
+    runtime: TrainingRuntimeConfig | None = None,
+    run_dir: str | Path | None = None,
+    control: TrainingControl | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    dataset_path = Path(dataset_dir).resolve()
-    dataset_manifest, frames = load_training_snapshot(
-        dataset_path, include_features=False
-    )
+    session_control = control or TrainingControl(runtime)
+    with nullcontext(session_control) if control is not None else session_control:
+        with training_run(
+            config,
+            dataset_dir,
+            repository_root=repository_root,
+            model_type="finance_patch_pretrain",
+            control=session_control,
+            resume_from=resume_from,
+            run_dir=run_dir,
+        ) as run:
+            if run.manifest["status"] == "complete":
+                return run.path, json.loads(
+                    (run.path / "training_audit.json").read_text(encoding="utf-8")
+                )
+            return _run_finance_pretraining(
+                config, run, repository_root=repository_root, control=session_control
+            )
+
+
+def _run_finance_pretraining(
+    config: FinancePretrainingExperimentConfig,
+    run: TrainingRun,
+    *,
+    repository_root: str | Path,
+    control: TrainingControl,
+) -> tuple[Path, dict[str, Any]]:
+    dataset_path = run.dataset
+    dataset_manifest, frames = load_training_snapshot(dataset_path, include_features=False)
     if int(dataset_manifest.get("schema_version", 0)) < 4:
         raise DataContractError(
             "finance pretraining requires a schema-v4 snapshot; rebuild the snapshot"
@@ -187,9 +169,7 @@ def run_finance_pretraining(
         raise DataContractError("model statistics window exceeds snapshot context")
     required_rows = pl.concat(
         [
-            pretraining_index.select(
-                "security_id", "feature_start", "asof_date", "future_end"
-            ),
+            pretraining_index.select("security_id", "feature_start", "asof_date", "future_end"),
             probe_index.select("security_id", "feature_start", "asof_date").with_columns(
                 pl.col("asof_date").alias("future_end")
             ),
@@ -197,16 +177,12 @@ def run_finance_pretraining(
         how="vertical",
     )
     feature_store = SecurityFeatureStore(
-        features=load_required_snapshot_features(
-            dataset_path, dataset_manifest, required_rows
-        ),
+        features=load_required_snapshot_features(dataset_path, dataset_manifest, required_rows),
         channels=config.channels,
         presorted=True,
     )
     market_store = MarketFeatureStore(
-        features=load_required_market_features(
-            dataset_path, dataset_manifest, required_rows
-        ),
+        features=load_required_market_features(dataset_path, dataset_manifest, required_rows),
         channels=config.market_channels,
     )
     pretraining_dataset = FinancePretrainingWindowDataset(
@@ -218,9 +194,7 @@ def run_finance_pretraining(
         context_length=context_length,
         future_horizon=config.future_horizon,
     )
-    horizons = sorted(
-        [label_config["horizon"], *label_config.get("auxiliary_horizons", [])]
-    )
+    horizons = sorted([label_config["horizon"], *label_config.get("auxiliary_horizons", [])])
 
     def probe_dataset(split: str) -> FinanceTransformerWindowDataset:
         return FinanceTransformerWindowDataset(
@@ -237,104 +211,76 @@ def run_finance_pretraining(
 
     probe_fit_dataset = probe_dataset("probe_fit")
     probe_selection_dataset = probe_dataset("probe_selection")
-    config_payload = config.model_dump(mode="json")
-    config_hash = sha256_json(config_payload)
-    resume_path = Path(resume_from).resolve() if resume_from is not None else None
-    if resume_path is None:
-        run_dir, run_id, created_at = _new_run_dir(
-            config, str(dataset_manifest["dataset_id"])
-        )
-    else:
-        run_dir, run_id, created_at = _resume_run_dir(
-            resume_path,
-            dataset_id=str(dataset_manifest["dataset_id"]),
-            config_hash=config_hash,
-        )
+    run_dir = run.path
+    resume_path = run.resume
     manifest_path = run_dir / "manifest.json"
     initial_manifest = {
+        **run.manifest,
         "status": "running",
-        "run_id": run_id,
-        "created_at": created_at,
+        "run_id": run.manifest["run_id"],
+        "created_at": run.manifest["created_at"],
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "model_id": config.experiment_id,
         "model_type": "finance_patch_pretrain",
         "dataset_id": dataset_manifest["dataset_id"],
         "dataset_path": str(dataset_path),
         "dataset_manifest_hash": sha256_file(dataset_path / "manifest.json"),
-        "config_hash": config_hash,
+        "config_hash": run.manifest["config_hash"],
         "seed": config.seed,
         "resumed_from": str(resume_path) if resume_path is not None else None,
         "probe_protocol": probe_audit,
     }
-    (run_dir / "resolved_config.yaml").write_text(
-        yaml.safe_dump(config_payload, allow_unicode=True, sort_keys=True),
-        encoding="utf-8",
-    )
     _write_json(manifest_path, initial_manifest)
-    try:
-        _, training_audit = train_finance_pretraining(
-            config,
-            pretraining_dataset=pretraining_dataset,
-            probe_fit_dataset=probe_fit_dataset,
-            probe_selection_dataset=probe_selection_dataset,
-            dataset_id=str(dataset_manifest["dataset_id"]),
-            checkpoint_dir=run_dir / "checkpoints",
-            resume_from=resume_path,
-            progress_callback=lambda event: _append_progress(
-                run_dir / "progress.jsonl", event
-            ),
-        )
-        best_checkpoint = run_dir / "checkpoints" / "best_encoder.pt"
-        _write_json(run_dir / "training_audit.json", training_audit)
-        manifest = {
-            **initial_manifest,
-            "status": "complete",
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "architecture": config.model.model_dump(mode="json"),
-            "objective": config.training.objective.model_dump(mode="json"),
-            "input": {
-                "feature_set": feature_config["name"],
-                "context_length": context_length,
-                "channels": config.channels,
-                "market_channels": config.market_channels,
-                "future_horizon": config.future_horizon,
-                "supervised_target_in_pretraining_index": False,
-                "outer_validation_rows_used": 0,
-                "outer_test_rows_used": 0,
-            },
-            "row_counts": {
-                "pretraining": len(pretraining_dataset),
-                "probe_fit": len(probe_fit_dataset),
-                "probe_selection": len(probe_selection_dataset),
-            },
-            "checkpoint": {
-                "file": "checkpoints/best_encoder.pt",
-                "sha256": sha256_file(best_checkpoint),
-                "last_file": "checkpoints/last.pt",
-                "last_sha256": sha256_file(run_dir / "checkpoints" / "last.pt"),
-            },
-            "training": training_audit,
-            "git": collect_git_state(repository_root),
-            "environment": collect_environment(include_model_dependencies=True),
-            "artifacts": {
-                "training_audit": "training_audit.json",
-                "resolved_config": "resolved_config.yaml",
-                "progress": "progress.jsonl",
-            },
-        }
-        _write_json(manifest_path, manifest)
-    except Exception as exc:
-        failed_manifest = {
-            **initial_manifest,
-            "status": "failed",
-            "failed_at": datetime.now(timezone.utc).isoformat(),
-            "error": {"type": type(exc).__name__, "message": str(exc)},
-            "recoverable_checkpoint": (
-                "checkpoints/last.pt"
-                if (run_dir / "checkpoints" / "last.pt").is_file()
-                else None
-            ),
-        }
-        _write_json(manifest_path, failed_manifest)
-        raise
+    _, training_audit = train_finance_pretraining(
+        config,
+        pretraining_dataset=pretraining_dataset,
+        probe_fit_dataset=probe_fit_dataset,
+        probe_selection_dataset=probe_selection_dataset,
+        dataset_id=str(dataset_manifest["dataset_id"]),
+        checkpoint_dir=run_dir / "checkpoints",
+        resume_from=resume_path,
+        control=control,
+        progress_callback=lambda event: _append_progress(run_dir / "progress.jsonl", event),
+    )
+    control.raise_if_stopping(run_dir / "checkpoints" / "last.pt")
+    best_checkpoint = run_dir / "checkpoints" / "best_encoder.pt"
+    _write_json(run_dir / "training_audit.json", training_audit)
+    manifest = {
+        **initial_manifest,
+        "status": "complete",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "architecture": config.model.model_dump(mode="json"),
+        "objective": config.training.objective.model_dump(mode="json"),
+        "input": {
+            "feature_set": feature_config["name"],
+            "context_length": context_length,
+            "channels": config.channels,
+            "market_channels": config.market_channels,
+            "future_horizon": config.future_horizon,
+            "supervised_target_in_pretraining_index": False,
+            "outer_validation_rows_used": 0,
+            "outer_test_rows_used": 0,
+        },
+        "row_counts": {
+            "pretraining": len(pretraining_dataset),
+            "probe_fit": len(probe_fit_dataset),
+            "probe_selection": len(probe_selection_dataset),
+        },
+        "checkpoint": {
+            "file": "checkpoints/best_encoder.pt",
+            "sha256": sha256_file(best_checkpoint),
+            "last_file": "checkpoints/last.pt",
+            "last_sha256": sha256_file(run_dir / "checkpoints" / "last.pt"),
+        },
+        "training": training_audit,
+        "git": collect_git_state(repository_root),
+        "environment": collect_environment(include_model_dependencies=True),
+        "artifacts": {
+            "training_audit": "training_audit.json",
+            "resolved_config": "resolved_config.yaml",
+            "progress": "progress.jsonl",
+        },
+    }
+    control.raise_if_stopping(run_dir / "checkpoints" / "last.pt")
+    _write_json(manifest_path, manifest)
     return run_dir, training_audit

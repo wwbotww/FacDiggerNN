@@ -39,8 +39,15 @@ from facdigger.training.ranking import (
     cross_sectional_rank_targets,
     grouped_rank_ic_audit,
 )
+from facdigger.training.runtime import (
+    TrainingControl,
+    checkpoint_copy,
+    remaining_loader,
+    save_checkpoint,
+)
 
 FINANCE_PRETRAIN_RESUME_CHECKPOINT = "finance_patch_pretrain_resume"
+FINANCE_PRETRAIN_PROGRESS_CHECKPOINT = "finance_patch_pretrain_progress"
 FINANCE_PRETRAIN_OBJECTIVE = "continuous_patch_reconstruction_plus_future_summary"
 
 
@@ -204,15 +211,11 @@ def _apply_pretraining_update(
     return (
         {
             "loss": float(output.loss.detach().cpu()),
-            "reconstruction_loss": float(
-                output.reconstruction_loss.detach().cpu()
-            ),
+            "reconstruction_loss": float(output.reconstruction_loss.detach().cpu()),
             "future_summary_loss": float(output.future_summary_loss.detach().cpu()),
             "masked_patch_ratio": output.masked_patch_ratio,
             "masked_observed_elements": float(output.masked_observed_elements),
-            "future_summary_elements": float(
-                output.observed_future_summary_elements
-            ),
+            "future_summary_elements": float(output.observed_future_summary_elements),
         },
         gradient_norm,
     )
@@ -226,6 +229,7 @@ def _extract_local_embeddings(
     device: str,
     amp_enabled: bool,
     num_workers: int,
+    check_stop: Callable[[], None] | None = None,
 ) -> torch.Tensor:
     loader = DataLoader(
         dataset,
@@ -243,15 +247,11 @@ def _extract_local_embeddings(
     model.eval()
     with torch.inference_mode():
         for batch in loader:
-            values = batch["values"].to(
-                device=device, dtype=torch.float32, non_blocking=True
-            )
-            observed = batch["observed_mask"].to(
-                device=device, dtype=torch.bool, non_blocking=True
-            )
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-            ):
+            if check_stop is not None:
+                check_stop()
+            values = batch["values"].to(device=device, dtype=torch.float32, non_blocking=True)
+            observed = batch["observed_mask"].to(device=device, dtype=torch.bool, non_blocking=True)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
                 embeddings = model.local_encoder(values, observed).embedding
             indices = batch["sample_index"].long()
             result[indices] = embeddings.detach().float().cpu()
@@ -267,6 +267,7 @@ def evaluate_train_only_linear_probe(
     config: FinancePretrainingExperimentConfig,
     device: str,
     amp_enabled: bool,
+    check_stop: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Select an encoder by complete-date 5-day Rank IC, never outer valid/test."""
 
@@ -278,6 +279,7 @@ def evaluate_train_only_linear_probe(
         device=device,
         amp_enabled=amp_enabled,
         num_workers=config.training.num_workers,
+        check_stop=check_stop,
     ).to(device)
     selection_embeddings = _extract_local_embeddings(
         model,
@@ -286,6 +288,7 @@ def evaluate_train_only_linear_probe(
         device=device,
         amp_enabled=amp_enabled,
         num_workers=config.training.num_workers,
+        check_stop=check_stop,
     ).to(device)
     fit_ranks = torch.from_numpy(
         cross_sectional_rank_targets(
@@ -321,20 +324,18 @@ def evaluate_train_only_linear_probe(
     for _ in range(probe.epochs):
         order = torch.randperm(len(groups), generator=generator).tolist()
         for index in order:
+            if check_stop is not None:
+                check_stop()
             group = groups[index]
             scores = head(fit_embeddings[group]).squeeze(1)
-            loss = cross_sectional_rank_correlation_loss(
-                scores, fit_ranks[group], epsilon=1e-6
-            )
+            loss = cross_sectional_rank_correlation_loss(scores, fit_ranks[group], epsilon=1e-6)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
     head.eval()
     with torch.inference_mode():
-        selection_scores = (
-            head(selection_embeddings).squeeze(1).detach().float().cpu().numpy()
-        )
+        selection_scores = head(selection_embeddings).squeeze(1).detach().float().cpu().numpy()
     audit = grouped_rank_ic_audit(
         selection_scores,
         selection_dataset.sample_rows["target_5"].to_numpy(),
@@ -356,8 +357,7 @@ def evaluate_train_only_linear_probe(
     }
 
 
-def _save_resume_checkpoint(
-    path: Path,
+def _resume_payload(
     *,
     model: FinanceNativePretrainer,
     optimizer: torch.optim.Optimizer,
@@ -372,34 +372,27 @@ def _save_resume_checkpoint(
     history: list[dict[str, Any]],
     dataset_id: str,
     protocol_hash: str,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
-        {
-            "contract": FINANCE_PRETRAIN_RESUME_CHECKPOINT,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
-            "scaler_state": scaler.state_dict(),
-            "sampler_state": sampler.state_dict(),
-            "epoch": epoch,
-            "global_step": global_step,
-            "best_probe_rank_ic": best_probe_rank_ic,
-            "best_epoch": best_epoch,
-            "stale_epochs": stale_epochs,
-            "history": history,
-            "dataset_id": dataset_id,
-            "protocol_hash": protocol_hash,
-            "rng_state": _rng_state(),
-        },
-        temporary,
-    )
-    temporary.replace(path)
+) -> dict[str, Any]:
+    return {
+        "contract": FINANCE_PRETRAIN_RESUME_CHECKPOINT,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "scaler_state": scaler.state_dict(),
+        "sampler_state": sampler.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_probe_rank_ic": best_probe_rank_ic,
+        "best_epoch": best_epoch,
+        "stale_epochs": stale_epochs,
+        "history": history,
+        "dataset_id": dataset_id,
+        "protocol_hash": protocol_hash,
+        "rng_state": _rng_state(),
+    }
 
 
-def _save_encoder_checkpoint(
-    path: Path,
+def _encoder_payload(
     *,
     model: FinanceNativePretrainer,
     epoch: int,
@@ -407,28 +400,22 @@ def _save_encoder_checkpoint(
     dataset_id: str,
     protocol_hash: str,
     config: FinancePretrainingExperimentConfig,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
-        {
-            "contract": FINANCE_PRETRAIN_ENCODER_CHECKPOINT,
-            "objective": FINANCE_PRETRAIN_OBJECTIVE,
-            "local_encoder_state": model.local_encoder.state_dict(),
-            "market_encoder_state": model.market_encoder.state_dict(),
-            "epoch": epoch,
-            "probe_rank_ic": probe["mean_rank_ic"],
-            "probe": probe,
-            "dataset_id": dataset_id,
-            "protocol_hash": protocol_hash,
-            "context_length": model.context_length,
-            "channels": config.channels,
-            "market_channels": config.market_channels,
-            "model_config": config.model.model_dump(mode="json"),
-        },
-        temporary,
-    )
-    temporary.replace(path)
+) -> dict[str, Any]:
+    return {
+        "contract": FINANCE_PRETRAIN_ENCODER_CHECKPOINT,
+        "objective": FINANCE_PRETRAIN_OBJECTIVE,
+        "local_encoder_state": model.local_encoder.state_dict(),
+        "market_encoder_state": model.market_encoder.state_dict(),
+        "epoch": epoch,
+        "probe_rank_ic": probe["mean_rank_ic"],
+        "probe": probe,
+        "dataset_id": dataset_id,
+        "protocol_hash": protocol_hash,
+        "context_length": model.context_length,
+        "channels": config.channels,
+        "market_channels": config.market_channels,
+        "model_config": config.model.model_dump(mode="json"),
+    }
 
 
 def train_finance_pretraining(
@@ -441,15 +428,19 @@ def train_finance_pretraining(
     checkpoint_dir: Path,
     resume_from: Path | None = None,
     stop_after_epoch: int | None = None,
+    control: TrainingControl | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[FinanceNativePretrainer, dict[str, Any]]:
     started_at = time.perf_counter()
+    control = control or TrainingControl()
+    if control.enabled and config.training.num_workers:
+        raise ValueError("mid-epoch recovery requires num_workers=0")
     seed_everything(config.seed)
     device = select_device(config.training.device)
     amp_enabled = device == "cuda" and config.training.precision == "fp16"
-    model = build_finance_pretrainer(
-        config, context_length=pretraining_dataset.context_length
-    ).to(device)
+    model = build_finance_pretrainer(config, context_length=pretraining_dataset.context_length).to(
+        device
+    )
     optimizer = _pretraining_optimizer(model, config)
     loader, sampler = _pretraining_loader(
         pretraining_dataset,
@@ -481,9 +472,16 @@ def train_finance_pretraining(
     stale_epochs = 0
     history: list[dict[str, Any]] = []
     resumed_from_epoch: int | None = None
+    progress: dict[str, Any] = {}
+    best_payload: dict[str, Any] | None = None
+    last_checkpoint = checkpoint_dir / "last.pt"
+    best_checkpoint = checkpoint_dir / "best_encoder.pt"
     if resume_from is not None:
-        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
-        if checkpoint.get("contract") != FINANCE_PRETRAIN_RESUME_CHECKPOINT:
+        checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
+        if checkpoint.get("contract") not in {
+            FINANCE_PRETRAIN_RESUME_CHECKPOINT,
+            FINANCE_PRETRAIN_PROGRESS_CHECKPOINT,
+        }:
             raise ValueError("resume checkpoint is not a finance pretraining checkpoint")
         if checkpoint["dataset_id"] != dataset_id:
             raise ValueError("pretraining resume dataset_id does not match")
@@ -502,9 +500,101 @@ def train_finance_pretraining(
         history = list(checkpoint["history"])
         _restore_rng_state(checkpoint["rng_state"])
         resumed_from_epoch = int(checkpoint["epoch"])
+        if checkpoint["contract"] == FINANCE_PRETRAIN_PROGRESS_CHECKPOINT:
+            progress = checkpoint["progress"]
+            if progress["phase"] not in {"local", "market", "probe", "epoch_complete"}:
+                raise ValueError("unknown pretraining resume phase")
+            if progress["phase"] != "epoch_complete":
+                if config.training.num_workers:
+                    raise ValueError("mid-epoch recovery requires num_workers=0")
+                start_epoch = int(checkpoint["epoch"])
+            best_payload = checkpoint["best_checkpoint"]
+        elif best_epoch:
+            best_payload = torch.load(best_checkpoint, map_location="cpu", weights_only=False)
+        if best_epoch:
+            if (
+                best_payload is None
+                or best_payload.get("epoch") != best_epoch
+                or (
+                    best_payload.get("dataset_id") != dataset_id
+                    or best_payload.get("protocol_hash") != protocol_hash
+                    or best_payload.get("probe_rank_ic") != best_probe_rank_ic
+                )
+            ):
+                raise ValueError("best encoder differs from resume selection state")
+            save_checkpoint(best_checkpoint, best_payload)
+        if progress.get("finished") or (
+            int(checkpoint["epoch"]) >= config.training.minimum_epochs
+            and stale_epochs >= config.training.patience
+        ):
+            start_epoch = config.training.max_epochs + 1
 
-    last_checkpoint = checkpoint_dir / "last.pt"
-    best_checkpoint = checkpoint_dir / "best_encoder.pt"
+    epoch = int(checkpoint["epoch"]) if resume_from else 1
+    phase = progress.get("phase", "local")
+    local_cursor = int(progress.get("local_cursor", 0))
+    market_cursor = int(progress.get("market_cursor", 0))
+    if not 0 <= local_cursor <= len(loader) or not 0 <= market_cursor <= market_updates:
+        raise ValueError("pretraining resume cursor is out of bounds")
+    local_audits = list(progress.get("local_audits", []))
+    market_audits = list(progress.get("market_audits", []))
+    gradient_norms = list(progress.get("gradient_norms", []))
+    clipped_steps = int(progress.get("clipped_steps", 0))
+    skipped_steps = int(progress.get("skipped_steps", 0))
+    finished = bool(progress.get("finished", False))
+
+    def persist(*, force: bool = False) -> None:
+        if force or control.checkpoint_due():
+            state = _resume_payload(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                sampler=sampler,
+                epoch=epoch,
+                global_step=global_step,
+                best_probe_rank_ic=best_probe_rank_ic,
+                best_epoch=best_epoch,
+                stale_epochs=stale_epochs,
+                history=history,
+                dataset_id=dataset_id,
+                protocol_hash=protocol_hash,
+            )
+            state.update(
+                {
+                    "contract": FINANCE_PRETRAIN_PROGRESS_CHECKPOINT,
+                    "best_checkpoint": best_payload,
+                    "progress": {
+                        "phase": phase,
+                        "local_cursor": local_cursor,
+                        "market_cursor": market_cursor,
+                        "finished": finished,
+                        "local_audits": local_audits,
+                        "market_audits": market_audits,
+                        "gradient_norms": gradient_norms,
+                        "clipped_steps": clipped_steps,
+                        "skipped_steps": skipped_steps,
+                    },
+                }
+            )
+            save_checkpoint(last_checkpoint, state)
+            control.saved()
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "checkpoint_saved",
+                        "epoch": epoch,
+                        "phase": phase,
+                        "local_cursor": local_cursor,
+                        "market_cursor": market_cursor,
+                        "global_step": global_step,
+                    }
+                )
+            control.raise_if_stopping(last_checkpoint)
+
+    if resume_from is None and control.enabled:
+        persist(force=True)
+    elif resume_from is not None:
+        control.raise_if_stopping(last_checkpoint)
     if progress_callback is not None:
         progress_callback(
             {
@@ -521,31 +611,25 @@ def train_finance_pretraining(
         epoch_started_at = time.perf_counter()
         sampler.set_epoch(epoch)
         model.train()
-        local_audits: list[dict[str, float]] = []
-        market_audits: list[dict[str, float]] = []
-        gradient_norms: list[float] = []
-        clipped_steps = 0
-        skipped_steps = 0
-
-        for batch in loader:
-            values = batch["values"].to(
-                device=device, dtype=torch.float32, non_blocking=True
-            )
-            observed = batch["observed_mask"].to(
-                device=device, dtype=torch.bool, non_blocking=True
-            )
+        if not progress or progress["phase"] == "epoch_complete":
+            local_cursor = market_cursor = 0
+            local_audits = []
+            market_audits = []
+            gradient_norms = []
+            clipped_steps = skipped_steps = 0
+        progress = {}
+        phase = "local"
+        for batch in remaining_loader(loader, sampler, local_cursor):
+            values = batch["values"].to(device=device, dtype=torch.float32, non_blocking=True)
+            observed = batch["observed_mask"].to(device=device, dtype=torch.bool, non_blocking=True)
             future = batch["future_values"].to(
                 device=device, dtype=torch.float32, non_blocking=True
             )
             future_observed = batch["future_observed_mask"].to(
                 device=device, dtype=torch.bool, non_blocking=True
             )
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-            ):
-                output = model.forward_local(
-                    values, observed, future, future_observed
-                )
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                output = model.forward_local(values, observed, future, future_observed)
             audit, gradient_norm = _apply_pretraining_update(
                 output,
                 model=model,
@@ -559,14 +643,10 @@ def train_finance_pretraining(
             else:
                 local_audits.append(audit)
                 gradient_norms.append(gradient_norm)
-                clipped_steps += int(
-                    gradient_norm > config.training.max_grad_norm
-                )
+                clipped_steps += int(gradient_norm > config.training.max_grad_norm)
                 global_step += 1
                 scheduler.step()
-                if progress_callback is not None and (
-                    global_step == 1 or global_step % 100 == 0
-                ):
+                if progress_callback is not None and (global_step == 1 or global_step % 100 == 0):
                     progress_callback(
                         {
                             "event": "pretraining_optimizer_progress",
@@ -579,24 +659,25 @@ def train_finance_pretraining(
                         }
                     )
 
+            local_cursor += 1
+            persist()
+
+        phase = "market"
+        persist(force=control.enabled)
         for values_np, observed_np, future_np, future_observed_np in _market_batches(
             pretraining_dataset,
             batch_size=config.training.batch_size,
             seed=config.seed,
             epoch=epoch,
-        ):
+        )[market_cursor:]:
             values = torch.from_numpy(values_np).to(device=device, dtype=torch.float32)
             observed = torch.from_numpy(observed_np).to(device=device, dtype=torch.bool)
             future = torch.from_numpy(future_np).to(device=device, dtype=torch.float32)
             future_observed = torch.from_numpy(future_observed_np).to(
                 device=device, dtype=torch.bool
             )
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-            ):
-                output = model.forward_market(
-                    values, observed, future, future_observed
-                )
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                output = model.forward_market(values, observed, future, future_observed)
             audit, gradient_norm = _apply_pretraining_update(
                 output,
                 model=model,
@@ -610,9 +691,7 @@ def train_finance_pretraining(
             else:
                 market_audits.append(audit)
                 gradient_norms.append(gradient_norm)
-                clipped_steps += int(
-                    gradient_norm > config.training.max_grad_norm
-                )
+                clipped_steps += int(gradient_norm > config.training.max_grad_norm)
                 global_step += 1
                 scheduler.step()
                 if progress_callback is not None and global_step % 100 == 0:
@@ -628,6 +707,11 @@ def train_finance_pretraining(
                         }
                     )
 
+            market_cursor += 1
+            persist()
+
+        phase = "probe"
+        persist(force=control.enabled)
         if not local_audits or not market_audits:
             raise RuntimeError("pretraining epoch produced no successful updates")
         probe = evaluate_train_only_linear_probe(
@@ -637,30 +721,30 @@ def train_finance_pretraining(
             config=config,
             device=device,
             amp_enabled=amp_enabled,
+            check_stop=lambda: control.raise_if_stopping(last_checkpoint),
         )
+        control.raise_if_stopping(last_checkpoint)
         probe_rank_ic = float(probe["mean_rank_ic"])
         improved = probe_rank_ic > best_probe_rank_ic + 1e-12
         if improved:
             best_probe_rank_ic = probe_rank_ic
             best_epoch = epoch
             stale_epochs = 0
-            _save_encoder_checkpoint(
-                best_checkpoint,
-                model=model,
-                epoch=epoch,
-                probe=probe,
-                dataset_id=dataset_id,
-                protocol_hash=protocol_hash,
-                config=config,
+            best_payload = checkpoint_copy(
+                _encoder_payload(
+                    model=model,
+                    epoch=epoch,
+                    probe=probe,
+                    dataset_id=dataset_id,
+                    protocol_hash=protocol_hash,
+                    config=config,
+                )
             )
         else:
             stale_epochs += 1
 
         def means(audits: list[dict[str, float]]) -> dict[str, float]:
-            return {
-                key: float(np.mean([audit[key] for audit in audits]))
-                for key in audits[0]
-            }
+            return {key: float(np.mean([audit[key] for audit in audits])) for key in audits[0]}
 
         history.append(
             {
@@ -670,9 +754,7 @@ def train_finance_pretraining(
                 "local_updates": len(local_audits),
                 "market_updates": len(market_audits),
                 "mean_pre_clip_gradient_norm": float(np.mean(gradient_norms)),
-                "p95_pre_clip_gradient_norm": float(
-                    np.percentile(gradient_norms, 95)
-                ),
+                "p95_pre_clip_gradient_norm": float(np.percentile(gradient_norms, 95)),
                 "gradient_clip_ratio": clipped_steps / len(gradient_norms),
                 "amp_skipped_optimizer_steps": skipped_steps,
                 "probe": probe,
@@ -681,22 +763,13 @@ def train_finance_pretraining(
                 "epoch_elapsed_seconds": time.perf_counter() - epoch_started_at,
             }
         )
-        _save_resume_checkpoint(
-            last_checkpoint,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            sampler=sampler,
-            epoch=epoch,
-            global_step=global_step,
-            best_probe_rank_ic=best_probe_rank_ic,
-            best_epoch=best_epoch,
-            stale_epochs=stale_epochs,
-            history=history,
-            dataset_id=dataset_id,
-            protocol_hash=protocol_hash,
+        phase = "epoch_complete"
+        finished = epoch == config.training.max_epochs or (
+            epoch >= config.training.minimum_epochs and stale_epochs >= config.training.patience
         )
+        persist(force=True)
+        if best_payload is not None:
+            save_checkpoint(best_checkpoint, best_payload)
         if progress_callback is not None:
             progress_callback(
                 {
@@ -710,6 +783,7 @@ def train_finance_pretraining(
                     "best_epoch": best_epoch,
                 }
             )
+        control.raise_if_stopping(last_checkpoint)
         if stop_after_epoch is not None and epoch >= stop_after_epoch:
             break
         if epoch >= config.training.minimum_epochs and stale_epochs >= config.training.patience:
@@ -759,9 +833,9 @@ def benchmark_finance_pretraining_updates(
     seed_everything(config.seed)
     device = select_device(config.training.device)
     amp_enabled = device == "cuda" and config.training.precision == "fp16"
-    model = build_finance_pretrainer(
-        config, context_length=pretraining_dataset.context_length
-    ).to(device)
+    model = build_finance_pretrainer(config, context_length=pretraining_dataset.context_length).to(
+        device
+    )
     optimizer = _pretraining_optimizer(model, config)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     loader, sampler = _pretraining_loader(
@@ -787,24 +861,16 @@ def benchmark_finance_pretraining_updates(
         sampler.set_epoch(epoch)
         for batch in loader:
             started = time.perf_counter()
-            values = batch["values"].to(
-                device=device, dtype=torch.float32, non_blocking=True
-            )
-            observed = batch["observed_mask"].to(
-                device=device, dtype=torch.bool, non_blocking=True
-            )
+            values = batch["values"].to(device=device, dtype=torch.float32, non_blocking=True)
+            observed = batch["observed_mask"].to(device=device, dtype=torch.bool, non_blocking=True)
             future = batch["future_values"].to(
                 device=device, dtype=torch.float32, non_blocking=True
             )
             future_observed = batch["future_observed_mask"].to(
                 device=device, dtype=torch.bool, non_blocking=True
             )
-            with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-            ):
-                output = model.forward_local(
-                    values, observed, future, future_observed
-                )
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                output = model.forward_local(values, observed, future, future_observed)
             audit, gradient_norm = _apply_pretraining_update(
                 output,
                 model=model,
@@ -831,19 +897,15 @@ def benchmark_finance_pretraining_updates(
         epoch=1,
     )
     for batch_index in range(market_optimizer_updates):
-        values_np, observed_np, future_np, future_observed_np = (
-            available_market_batches[batch_index % len(available_market_batches)]
-        )
+        values_np, observed_np, future_np, future_observed_np = available_market_batches[
+            batch_index % len(available_market_batches)
+        ]
         started = time.perf_counter()
         values = torch.from_numpy(values_np).to(device=device, dtype=torch.float32)
         observed = torch.from_numpy(observed_np).to(device=device, dtype=torch.bool)
         future = torch.from_numpy(future_np).to(device=device, dtype=torch.float32)
-        future_observed = torch.from_numpy(future_observed_np).to(
-            device=device, dtype=torch.bool
-        )
-        with torch.autocast(
-            device_type="cuda", dtype=torch.float16, enabled=amp_enabled
-        ):
+        future_observed = torch.from_numpy(future_observed_np).to(device=device, dtype=torch.bool)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
             output = model.forward_market(values, observed, future, future_observed)
         audit, gradient_norm = _apply_pretraining_update(
             output,
@@ -875,16 +937,12 @@ def benchmark_finance_pretraining_updates(
         "warmup_local_updates_excluded": warmup_updates,
         "local_rows_processed": local_rows,
         "mean_local_seconds_per_update": local_seconds,
-        "p95_local_seconds_per_update": float(
-            np.percentile(measured_local, 95)
-        ),
+        "p95_local_seconds_per_update": float(np.percentile(measured_local, 95)),
         "mean_market_seconds_per_update": market_seconds,
         "local_updates_per_epoch": len(loader),
         "market_updates_per_epoch": market_updates_per_epoch,
         "projected_epoch_hours": projected_epoch_seconds / 3600.0,
-        "projected_run_hours": (
-            projected_epoch_seconds * config.training.max_epochs / 3600.0
-        ),
+        "projected_run_hours": (projected_epoch_seconds * config.training.max_epochs / 3600.0),
         "probe_time_not_included": True,
         "cuda_peak_allocated_bytes": (
             int(torch.cuda.max_memory_allocated()) if device == "cuda" else None

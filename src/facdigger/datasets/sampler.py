@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
+from itertools import islice
 from typing import Any
 
 
@@ -112,6 +113,7 @@ class FullDateBatchSampler:
         self.minimum_group_size = minimum_group_size
         self.drop_last = drop_last
         self.epoch = 0
+        self.start_batch = 0
         self.groups: list[tuple[int, int]] = []
         seen: set[Any] = set()
         group_start = 0
@@ -133,9 +135,7 @@ class FullDateBatchSampler:
         if not self.groups:
             raise ValueError("FullDateBatchSampler requires at least one date group")
         undersized = [
-            stop - start
-            for start, stop in self.groups
-            if stop - start < minimum_group_size
+            stop - start for start, stop in self.groups if stop - start < minimum_group_size
         ]
         if undersized:
             raise ValueError(
@@ -164,7 +164,7 @@ class FullDateBatchSampler:
             yield group
 
     def __iter__(self) -> Iterator[list[int]]:
-        yield from self._batches()
+        yield from islice(self._batches(), self.start_batch, None)
 
     def __len__(self) -> int:
         return len(self.groups)
@@ -245,6 +245,7 @@ class DateSecurityBalancedBatchSampler:
         self.batch_size = batch_size
         self.seed = seed
         self.epoch = 0
+        self.start_batch = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -282,7 +283,7 @@ class DateSecurityBalancedBatchSampler:
         return batches
 
     def __iter__(self) -> Iterator[list[int]]:
-        yield from self._batches()
+        yield from islice(self._batches(), self.start_batch, None)
 
     def __len__(self) -> int:
         return (self.size + self.batch_size - 1) // self.batch_size

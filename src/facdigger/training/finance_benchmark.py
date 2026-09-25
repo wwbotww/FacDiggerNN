@@ -36,6 +36,12 @@ from facdigger.training.finance_transformer_config import (
 from facdigger.training.finance_transformer_engine import (
     benchmark_finance_transformer_updates,
 )
+from facdigger.training.resources import (
+    TrainingResourceBudget,
+    cgroup_memory_limit,
+    effective_resource_limits,
+    training_hardware,
+)
 
 RTX_2070S_RESERVED_MEMORY_LIMIT_BYTES = int(7.2 * 1024**3)
 HOST_MEMORY_LIMIT_BYTES = 13 * 1024**3
@@ -58,6 +64,7 @@ def run_finance_training_benchmark(
     dataset_dir: str | Path,
     *,
     optimizer_updates: int = 100,
+    resource_budget: TrainingResourceBudget | None = None,
 ) -> dict[str, Any]:
     """Benchmark one largest fold and conservatively project all nine stages."""
 
@@ -90,26 +97,20 @@ def run_finance_training_benchmark(
     train_rows = protocol_index.filter(pl.col("split") == "train_fit")
     required_rows = pl.concat(
         [
-            pretraining_index.select(
-                "security_id", "feature_start", "asof_date", "future_end"
+            pretraining_index.select("security_id", "feature_start", "asof_date", "future_end"),
+            train_rows.select("security_id", "feature_start", "asof_date").with_columns(
+                pl.col("asof_date").alias("future_end")
             ),
-            train_rows.select(
-                "security_id", "feature_start", "asof_date"
-            ).with_columns(pl.col("asof_date").alias("future_end")),
         ],
         how="vertical",
     )
     feature_store = SecurityFeatureStore(
-        features=load_required_snapshot_features(
-            dataset_path, manifest, required_rows
-        ),
+        features=load_required_snapshot_features(dataset_path, manifest, required_rows),
         channels=supervised_config.channels,
         presorted=True,
     )
     market_store = MarketFeatureStore(
-        features=load_required_market_features(
-            dataset_path, manifest, required_rows
-        ),
+        features=load_required_market_features(dataset_path, manifest, required_rows),
         channels=supervised_config.market_channels,
     )
     context_length = int(feature_config["context_length"])
@@ -148,9 +149,8 @@ def run_finance_training_benchmark(
         market_optimizer_updates=min(20, optimizer_updates),
         warmup_updates=min(10, optimizer_updates - 1),
     )
-    raw_hours = (
-        6.0 * float(supervised["projected_cell_hours"])
-        + 3.0 * float(pretraining["projected_run_hours"])
+    raw_hours = 6.0 * float(supervised["projected_cell_hours"]) + 3.0 * float(
+        pretraining["projected_run_hours"]
     )
     projected_hours = raw_hours * 1.1
     projected_days = projected_hours / 24.0
@@ -165,13 +165,34 @@ def run_finance_training_benchmark(
         and pretraining["device"] == "cuda"
         and pretraining["precision"] == "fp16"
     )
+    budget = resource_budget or TrainingResourceBudget()
+    hardware = training_hardware()
+    limits = (
+        effective_resource_limits(budget, hardware)
+        if resource_budget
+        else {
+            "cuda_peak_reserved_bytes": RTX_2070S_RESERVED_MEMORY_LIMIT_BYTES,
+            "host_peak_rss_bytes": HOST_MEMORY_LIMIT_BYTES,
+            "projected_days": 14.0,
+        }
+    )
     memory_gate = (
         host_peak_rss_bytes is not None
-        and host_peak_rss_bytes <= HOST_MEMORY_LIMIT_BYTES
-        and cuda_peak_reserved_bytes <= RTX_2070S_RESERVED_MEMORY_LIMIT_BYTES
+        and host_peak_rss_bytes <= limits["host_peak_rss_bytes"]
+        and cuda_peak_reserved_bytes <= limits["cuda_peak_reserved_bytes"]
     )
-    time_gate = projected_days <= 14.0
+    time_gate = projected_days <= limits["projected_days"]
     return {
+        **(
+            {
+                "resource_budget": budget.model_dump(mode="json"),
+                "hardware": hardware,
+                "cgroup_memory_limit_bytes": cgroup_memory_limit(),
+                "job_time_admission": "requires_loading_probe_selection_checkpoint_measurement",
+            }
+            if resource_budget is not None
+            else {}
+        ),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset_id": manifest["dataset_id"],
         "dataset_path": str(dataset_path),
@@ -179,12 +200,8 @@ def run_finance_training_benchmark(
         "supervised_train_rows": len(supervised_dataset),
         "pretraining_rows": len(pretraining_dataset),
         "benchmark_optimizer_updates": optimizer_updates,
-        "supervised_config_hash": sha256_json(
-            supervised_config.model_dump(mode="json")
-        ),
-        "pretraining_config_hash": sha256_json(
-            pretraining_config.model_dump(mode="json")
-        ),
+        "supervised_config_hash": sha256_json(supervised_config.model_dump(mode="json")),
+        "pretraining_config_hash": sha256_json(pretraining_config.model_dump(mode="json")),
         "host_peak_rss_bytes": host_peak_rss_bytes,
         "supervised": supervised,
         "pretraining": pretraining,
@@ -201,15 +218,15 @@ def run_finance_training_benchmark(
         "admission": {
             "cuda_fp16_verified": device_gate,
             "within_memory_budget": memory_gate,
-            "within_fourteen_days": time_gate,
+            "within_fourteen_days": projected_days <= 14.0,
+            "within_time_budget": time_gate,
             "admitted": device_gate and memory_gate and time_gate,
-            "limits": {
-                "cuda_peak_reserved_bytes": RTX_2070S_RESERVED_MEMORY_LIMIT_BYTES,
-                "host_peak_rss_bytes": HOST_MEMORY_LIMIT_BYTES,
-                "projected_days": 14.0,
-            },
+            "limits": limits,
             "rule": (
-                "CUDA FP16 must be active, peak memory must fit RTX 2070S/16 GB RAM, "
+                "CUDA FP16, explicit memory and matrix compute-time budgets; "
+                "single-job lifecycle time requires a separate interruption rehearsal"
+                if resource_budget
+                else "CUDA FP16 must be active, peak memory must fit RTX 2070S/16 GB RAM, "
                 "and the largest-fold conservative projection must not exceed 14 days"
             ),
         },
@@ -228,8 +245,7 @@ def write_finance_training_benchmark(path: str | Path, report: dict[str, Any]) -
     destination = Path(path).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-        + "\n",
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
     return destination
