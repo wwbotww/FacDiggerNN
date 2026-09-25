@@ -1,0 +1,8 @@
+# Optional controls, separate from the frozen model/research configuration.
+# scripts/icf/job.py fills max_walltime_seconds from the current allocation.
+checkpoint_interval_seconds: 600
+max_walltime_seconds: null
+shutdown_margin_seconds: 300
+handle_signals: true
+dataset_overrides: {}
+fold_snapshots: {}

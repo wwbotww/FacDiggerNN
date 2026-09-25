@@ -1,0 +1,5 @@
+# Effective GPU limit is also capped by the actual visible GPU/MIG capacity.
+cuda_peak_reserved_bytes: 17179869184
+cuda_memory_fraction: 0.85
+host_peak_rss_bytes: 16106127360
+projected_days: 14
