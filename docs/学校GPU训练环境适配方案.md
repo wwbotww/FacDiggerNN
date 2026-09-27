@@ -1,9 +1,9 @@
 **FacDiggerNN 学校 GPU 训练环境适配方案**
 
-调查日期：2026-09-25。代码基线：`70390e3b3aa9cdcc9330fd6e0ef275655ba87834`。
+调查日期：2026-09-25；部署更新：2026-09-27。原调查基线：`70390e3`；当前学校运行基线：`e418570`。
 适用环境：爱丁堡大学 Informatics DICE / ICF，当前账户 `s2977852`。
 
-本文记录实际环境检查、学校部署配置和执行方案。**2026-09-25 已实现通用训练恢复、独立快照输入和学校包装；尚未把这套新包装部署到 ICF，也未迁移真实数据或启动正式训练。** 文中的实测资源属于此前诊断，不能代替新代码的 GPU/Slurm 验收。直接操作见 [ICF 部署说明](../configs/deployment/icf/README.md)。
+本文记录实际环境检查、学校部署配置和执行方案。**2026-09-27 已在 ICF 安装独立锁定环境，CUDA/FP16 合成恢复通过，真实历史下载已启动；真实数据基准和正式矩阵尚未运行。** 实际作业与验收边界见第 10 节，操作见 [ICF 部署说明](../configs/deployment/icf/README.md)。
 
 方案分为两份独立文档：[训练可靠性与独立部署方案](训练可靠性与独立部署方案.md)定义适用于本地及其他服务器的恢复、限时、资源接口和兼容性要求；本文只定义 ICF 如何配置和使用这些能力。学校部署不成为项目的默认运行方式。
 
@@ -78,18 +78,24 @@ GPU 选择以本项目基准为准：H200 MIG 的预算是切片资源，不能�
 
 **4. 目录、数据和备份安排**
 
-建议的持久目录如下；这些是拟采用的目录，本次没有在集群创建项目部署。
+2026-09-27 已采用以下持久布局；bronze、快照及训练产物在对应阶段成功后生成。
 
 ```text
 /home/s2977852/facdigger/
-├── code/                    # 固定提交的完整 Git clone，包含 .git
-├── environments/            # 锁定环境或已验收 SIF 镜像
+├── code/                    # 固定提交的完整 Git clone，含 .git、.venv
+├── tools/                   # uv 与经过校验的提交入口
+├── configs/                 # 学校路径、资源、runtime；不存 API token
+├── secrets/eodhd.env         # 目录 0700、文件 0600，仅下载节点读取
+├── data/bronze/              # 历史标准表和来源 manifest
 ├── inputs/
-│   ├── bronze/              # 历史标准表和来源 manifest
-│   └── snapshots/           # 完整不可变训练快照
+│   ├── download_plan.json   # 匿名额度、候选和缓存计划
+│   ├── snapshots/           # 完整不可变训练快照
+│   └── transformer/         # fold 映射、外置清单与独立训练 runtime
 ├── artifacts/               # run、checkpoint、评价、研究状态、ModelRelease
+├── evidence/                # 部署环境与合成 GPU 验收证据
 ├── logs/                    # Slurm 日志与环境报告
-└── cache/                   # 依赖/可选 HF 缓存，必须可重建
+├── state/                   # 独立的下载调用预算
+└── cache/                   # 依赖与 EODHD 请求缓存
 
 /disk/scratch/s2977852/facdigger/<job-id>/
 └── inputs/                  # 当前作业输入副本，可在节点变更后重新生成
@@ -99,7 +105,7 @@ GPU 选择以本项目基准为准：H200 MIG 的预算是切片资源，不能�
 
 学校建议把频繁 I/O 放到本地 scratch，并提示共享盘和 scratch 均不能作为唯一重要数据副本。备份采用“集群保留可恢复工作集，校外原数据机器或其他已确认的持久存储保存独立副本”，避免把全部大文件塞入 18 GiB AFS。打包环境可减少大量小文件访问，见[GPU 集群使用建议](https://computing.help.inf.ed.ac.uk/cluster-tips)。
 
-容量门禁应基于实际文件体积：输入解包体积、可能保留的压缩包、运行环境、checkpoint 临时写入与最新完整副本，再加余量。三 fold 快照不能假设与单 fold 大小相同。当前 Git clone 和本人 ICF home 中均未发现可用的项目历史行情、训练快照或模型权重，所以尚不能给出真实数据总容量与训练耗时。
+容量门禁应基于实际文件体积：输入解包体积、可能保留的压缩包、运行环境、checkpoint 临时写入与最新完整副本，再加余量。三 fold 快照不能假设与单 fold 大小相同。初次调查没有发现可用的历史行情、快照或模型权重；目前历史下载仍在进行，真实数据总容量与训练耗时待后续测量。
 
 训练资产迁移规则：
 
@@ -213,7 +219,7 @@ R 与 A/B 的资产和环境准备可以并行，C 依赖 R 的相关能力完�
 
 包装每次预记整个 allocation 剩余预算，正常退出后按实际耗时退还差额，硬杀保守计费，重启不清零。默认限制 10 次尝试、14 天累计预算、连续两次无进展；10 次四小时只提供约 40 小时，应根据基准明确调整次数。硬杀留下的 scratch 临时目录须确认作业结束后再清理；checkpoint 始终保留在持久路径。不要删除锁文件或计数文件规避冲突与限制。
 
-这些是已实现的入口，但本轮没有执行 ICF 部署或提交新的作业。Apptainer、不同 GPU profile 与原生 Windows 文件锁仍按各自目标环境另行验收。
+这些入口的实际部署进展见第 10 节。Apptainer、不同 GPU profile 与原生 Windows 文件锁仍按各自目标环境另行验收。
 
 **9. 验收清单与必要回归**
 
@@ -248,10 +254,66 @@ R 与 A/B 的资产和环境准备可以并行，C 依赖 R 的相关能力完�
 [ICF 操作说明第 2a 节](../configs/deployment/icf/README.md)。通用健康审计与学校资源配置
 分离，不修改既有 Rank IC acceptance、实验哈希或 checkpoint 选择。
 
-本轮完整覆盖率测试 471 项通过、覆盖率 82%；Ruff、离线锁检查和构建通过。新增 CPU 请求
-4 CPU / 32G / 4h 已被 ICF `sbatch --test-only` 接受，未实际运行数据作业。
-测试范围与限制详见[修复复盘第 59 项](项目关键问题与修复复盘.md)。
+上述代码交付时完整覆盖率测试 471 项通过、覆盖率 82%；Ruff、离线锁检查和构建通过。
+当时仅完成 CPU 请求 dry-run；范围与限制见[修复复盘第 59 项](项目关键问题与修复复盘.md)。
 
-仍未验证：项目 torch 2.13.0 在学校 GPU 的完整模型/replay、真实数据容量与 100-update 基准、selection/probe/保存恢复的实际耗时、Slurm 抢占与预警链、Lustre 跨节点锁、项目 Apptainer 镜像、生产固定版本的真实候选回放、模型晋级及正式 Alpha。已有共享 PyTorch 的小型 GPU 运算不能替代锁定环境验收；真实退市收益及点时行业/市值限制继续有效。
+**2026-09-27 实际部署**
 
-下一步按 A/B 准备稳定输入和环境，再完成 C 的短作业恢复演练；D 的性能数据决定时限、checkpoint 间隔和资源配置。真实数据缺失不阻止本轮通用工程交付，但不能据 CPU 合成结果启动未经验收的完整矩阵或得出研究结论。
+固定 `/home/s2977852/facdigger/code` 于 `e41857008194b1770e5545b07e17d3b0ff919c24`，
+使用独立 `.venv` 和 uv 0.11.28，`uv sync --frozen --extra data --extra model --extra eodhd
+--extra dev` 完成，离线 lock 检查通过。Python 3.12.3、torch 2.13.0+cu130、polars 1.43.0、
+transformers 4.57.6；包清单和 lock 摘要保存在 `evidence/`。配置生成器只重定位路径。
+私有凭据格式/权限检查通过，并已经供数据作业读取；训练作业不携带凭据。
+
+| 作业 | 实际状态/证据 | 结论范围 |
+|---|---|---|
+| `3662139`，CPU plan | COMPLETED，4 分 35 秒；`inputs/download_plan.json` | 18,952 个历史候选，56,856 次历史请求；账户日限 100,000，已用 2，保留 10,000 后最少请求数可覆盖 |
+| `3662140`，GPU 环境 | COMPLETED，4 分 31 秒；`logs/env-3662140.out` | 锁定依赖、CUDA FP16 前后向通过；H200 MIG 可见 16 GiB、SM 9.0 |
+| `3662142`，GPU 恢复 | COMPLETED，7 分 16 秒；`evidence/gpu-acceptance-3662142/acceptance.json` | 合成数据上的五个阶段恢复及两种引擎的真实 POSIX USR1 暂停恢复，共七项通过 |
+| `3662150` → `3662151`，Slurm 预警/恢复 | 两个诊断作业均 COMPLETED，分别 4 分 48 秒、23 秒；`evidence/slurm-signal-20260927/report.json` | 自动时限预警经 srun 到达 CUDA 预训练，引擎暂停；新作业从同一断点恢复至 15 个成功更新，并与连续训练严格一致 |
+| `3662147`，CPU ingest | 已启动；4 CPU / 32G / 24h | 全量价格、分红、拆股接口已实际返回并缓存，最终质量门禁与资源峰值尚待完成 |
+| `3662149`，CPU prepare | 依赖 `afterok:3662147`；4 CPU / 64G / 24h | 仅在采集及原质量门禁成功后构建三 fold；上游失败取消，不启动模型训练 |
+
+GPU 恢复验收直接复用既有测试 fixture 和引擎，只将诊断配置设为 CUDA/FP16；
+监督 train/selection、预训练 local/market/probe 的中断恢复，与连续训练严格比较权重、
+optimizer、scheduler、scaler、RNG、history 和 best 状态，仅排除原测试中的耗时字段，
+没有放宽数值容差。删除 best 导出后
+可由 last 恢复。七项测试均有成功 optimizer update，但小型合成数据结果不能作为完整
+512 context、正式日期范围、样本池或训练健康的验收。
+
+Slurm 演练使用 `--time=00:10:00 --signal=USR1@300`，由 Python 父进程启动 srun，
+未向训练进程自行发送信号。第一个成功更新后等待调度器预警；暂停步骤的 `75:0` 是预期
+结果，诊断父进程核实 `time_limit_warning` 与已提交断点后才返回 0，允许后续诊断作业开始。
+新作业重新启动 Python、读取 Lustre 断点并严格比对。两个作业都在 saxa；这项证据不覆盖
+跨节点、调度器抢占、自动 requeue 或完整 `job.py` allocation 计数链。
+原始诊断脚本保存在 `evidence/gpu_acceptance.py`、`evidence/slurm_signal_check.py`，
+与对应 Slurm 脚本、报告和日志一起保留，避免只记录通过结论。
+
+首次导入及首次训练出现 Lustre `ptlrpc_set_wait` / `osc_io_fsync_end` 等待；首个监督
+恢复用例约 221 秒，后续阶段用例约 6–8 秒。不能将差额全部归因于单次 checkpoint。
+环境检查时限由 5 分钟改为 15 分钟，正式 checkpoint 间隔仍须按真实模型测量。
+数据作业持锁时，头节点竞争同一 Lustre `.data.lock` 被拒绝；这验证了头节点与 saxa
+之间的互斥，不等于跨 GPU 节点迁移或存储故障恢复全部通过。
+
+下载限速包括免费账户查询和付费历史请求，因此 56,856 次历史请求在 300 HTTP/min 下
+至少约 6.3 小时，实际还需网络/缓存/聚合时间；4 小时初值不足，已单独调整学校 env。
+有效缓存可继续使用；额度或时限失败仍需检查原因后手动重提。用于依赖提交的更新脚本
+安装于 `tools/submit_data.sh`，运行中的代码 checkout 保持固定；其内容与仓库脚本一致。
+该轮学校脚本回归 21 项通过，Ruff、Bash 语法和 diff 检查通过。
+
+在 ICF 头节点可查看这次数据链；下列命令只读状态，不会重新请求行情：
+
+```bash
+sacct -j 3662147,3662149 --format=JobID,State,ExitCode,Elapsed,MaxRSS
+tail -n 30 /home/s2977852/facdigger/logs/facdigger-ingest-3662147.out
+```
+
+采集完成检查 `data/bronze/eodhd_us_historical_liquid/eodhd_ingestion_manifest.json` 的
+quality、standardization 和表文件哈希；准备完成检查 `inputs/transformer/preparation.json`、
+`folds.json`、外置文件清单及 `runtime.yaml`。缓存数量或 Slurm 提交成功均不代表这两项验收通过。
+
+仍待完成：全量采集质量及三 fold 快照、真实数据 ≥100-update 基准和全生命周期耗时、
+Slurm 抢占/自动 requeue、跨 GPU 节点恢复与 scratch、项目 Apptainer 镜像、生产固定版本
+的真实候选回放、模型晋级及正式 Alpha。真实退市收益及点时行业/市值限制继续有效，
+`research_ready=false` 不因下载或 GPU 验收而改写。下一步先检查数据链结果，再在最大
+fold 测量资源，按原协议进行单 fold 演练；完整矩阵及 holdout 不提前启动。

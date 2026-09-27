@@ -111,7 +111,8 @@ def test_cpu_plan_loads_credential_only_in_job_and_removes_it_on_failure(tmp_pat
     assert "EODHD_API_TOKEN" not in os.environ
 
 
-def test_submission_has_no_gpu_or_credentials_and_defaults_to_plan(tmp_path):
+@pytest.mark.parametrize("dependency", ["", "12345", "bad:12345"])
+def test_submission_has_no_gpu_or_credentials_and_defaults_to_plan(tmp_path, dependency):
     fake = tmp_path / "bin"
     fake.mkdir()
     sbatch = fake / "sbatch"
@@ -126,7 +127,7 @@ def test_submission_has_no_gpu_or_credentials_and_defaults_to_plan(tmp_path):
     text = text.replace(
         'FD_PYTHON="$FD_CODE_ROOT/.venv/bin/python"', f'FD_PYTHON="{sys.executable}"'
     )
-    config.write_text(text)
+    config.write_text(text.replace('FD_AFTEROK_JOB_ID=""', f'FD_AFTEROK_JOB_ID="{dependency}"'))
     setup.configure(tmp_path, REPOSITORY)
     env = {
         **os.environ,
@@ -139,11 +140,22 @@ def test_submission_has_no_gpu_or_credentials_and_defaults_to_plan(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    if dependency == "bad:12345":
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert "positive numeric Slurm job ID" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
     submitted = json.loads(result.stdout)
     assert submitted["env"]["FD_DATA_MODE"] == "plan"
     assert "--test-only" in submitted["args"]
     assert "--no-requeue" in submitted["args"]
     assert not any(arg.startswith("--gres") for arg in submitted["args"])
     assert "must-not-export" not in result.stdout and "also-private" not in result.stdout
+    if dependency:
+        assert f"--dependency=afterok:{dependency}" in submitted["args"]
+        assert "--kill-on-invalid-dep=yes" in submitted["args"]
+    else:
+        assert not any(arg.startswith("--dependency") for arg in submitted["args"])

@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
-#SBATCH --time=00:05:00
+#SBATCH --time=00:15:00
 set -euo pipefail
 : "${FD_CODE_ROOT:?Set a fixed Lustre clone}" "${FD_PYTHON:?Set its locked Python}"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"

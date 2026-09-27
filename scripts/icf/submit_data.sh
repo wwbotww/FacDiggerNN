@@ -17,6 +17,14 @@ if [[ $# == 2 ]]; then
   [[ "$2" == --test-only ]]
   FD_SUBMIT_OPTIONS+=(--test-only)
 fi
+if [[ -n "${FD_AFTEROK_JOB_ID:-}" ]]; then
+  if [[ ! "$FD_AFTEROK_JOB_ID" =~ ^[1-9][0-9]*$ ]]; then
+    echo 'FD_AFTEROK_JOB_ID must be a positive numeric Slurm job ID' >&2
+    exit 2
+  fi
+  # A failed download must neither start preparation nor leave it pending forever.
+  FD_SUBMIT_OPTIONS+=(--dependency="afterok:$FD_AFTEROK_JOB_ID" --kill-on-invalid-dep=yes)
+fi
 # Send deployment values only. The API token is loaded on the compute node,
 # never embedded in Slurm's saved job environment or submission command.
 FD_EXPORTS=()
