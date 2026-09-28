@@ -100,10 +100,10 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
     source_paths = semantic_config.pop("sources")
     semantic_config.pop("output_root")
     identity = {
-        # v4 adds the immutable target-free finance pretraining index.  Bumping
-        # the identity prevents an existing v3 directory from being mistaken
-        # for a snapshot that contains the new artifact.
-        "schema_version": 4,
+        # Finance v5 retains market sessions with no eligible securities. A new
+        # content identity prevents reusing an immutable v4 compressed calendar.
+        # Price/volume snapshots and their existing identities stay unchanged.
+        "schema_version": 5 if config.features.name == "finance_transformer" else 4,
         "config": semantic_config,
         "input_file_hashes": input_hashes,
     }

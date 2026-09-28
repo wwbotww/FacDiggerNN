@@ -11,6 +11,8 @@ from facdigger.data.config import (
 )
 from facdigger.data.contracts import DataContractError
 
+MARKET_CALENDAR_POLICY = "all_feature_sessions"
+
 
 def _eligible_feature_panel(
     features: pl.DataFrame,
@@ -85,7 +87,7 @@ def build_market_context_features(
     features: pl.DataFrame,
     universe: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Build one six-channel market state row per trading date."""
+    """Keep every feature session; unavailable market states have false masks."""
 
     eligible = _eligible_feature_panel(features, universe).filter(pl.col("eligible"))
     if eligible.is_empty():
@@ -118,7 +120,9 @@ def build_market_context_features(
         )
     )
     market = (
-        daily_location.join(dispersion, on="trade_date", how="left", validate="1:1")
+        features.select("trade_date").unique()
+        .join(daily_location, on="trade_date", how="left", validate="1:1")
+        .join(dispersion, on="trade_date", how="left", validate="1:1")
         .sort("trade_date")
         .with_columns(
             pl.col("market_return_median")

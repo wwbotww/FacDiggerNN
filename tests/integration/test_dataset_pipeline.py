@@ -25,6 +25,8 @@ from facdigger.data.inference_snapshots import (
 from facdigger.data.provenance import build_standardization_contract
 from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
 from facdigger.datasets.splits import assign_chronological_splits
+from facdigger.datasets.window import MarketFeatureStore
+from facdigger.experiments.manifest import sha256_json
 from facdigger.features.cross_sectional import (
     append_cross_sectional_ranks,
     build_market_context_features,
@@ -167,6 +169,44 @@ def test_cross_sectional_features_rank_only_eligible_rows_and_build_market_state
     assert row["market_breadth"] == pytest.approx(1.0)
     assert row["market_return_dispersion"] >= 0
     assert row["observed_market_vol20"] is True
+
+
+@pytest.mark.parametrize("empty_sessions", [list(range(10)), [25]], ids=["warmup", "gap"])
+def test_market_context_preserves_sessions_without_eligible_securities(empty_sessions) -> None:
+    bars, universe = synthetic_frames(60)
+    calendar = sessions(60)
+    empty_dates = [calendar[index] for index in empty_sessions]
+    universe = universe.with_columns(
+        (~pl.col("trade_date").is_in(empty_dates)).alias("eligible")
+    )
+    raw = build_price_volume_features(validate_bars(bars), validate_universe(universe))
+    market = build_market_context_features(raw, universe)
+    channels = [column for column in market.columns if column.startswith("market_")]
+
+    assert market["trade_date"].to_list() == calendar
+    missing = market.filter(pl.col("trade_date").is_in(empty_dates))
+    assert missing.select(channels).null_count().row(0) == (len(empty_dates),) * len(channels)
+    assert not missing.select([f"observed_{channel}" for channel in channels]).to_numpy().any()
+    # Twenty actual sessions are needed after the gap; it cannot be compressed away.
+    last_empty = max(empty_sessions)
+    assert market["market_vol20"][last_empty + 19] is None
+    assert market["observed_market_vol20"][last_empty + 20] is True
+    window = MarketFeatureStore(features=market, channels=channels).window(
+        calendar[31], context_length=32
+    )
+    assert window.values.shape == (32, len(channels))
+    assert not window.observed_mask[empty_sessions].any()
+    assert not window.values[empty_sessions].any()
+
+    # Future membership must not change today's context or rolling statistics.
+    cutoff = calendar[44]
+    future_changed = universe.with_columns(
+        (pl.col("eligible") & (pl.col("trade_date") <= cutoff)).alias("eligible")
+    )
+    changed = build_market_context_features(raw, future_changed)
+    assert market.filter(pl.col("trade_date") <= cutoff).equals(
+        changed.filter(pl.col("trade_date") <= cutoff)
+    )
 
 
 def test_forward_label_matches_execution_definition_and_cross_sectional_benchmark() -> None:
@@ -377,15 +417,19 @@ def test_snapshot_build_is_content_addressed_and_idempotent(tmp_path) -> None:
     assert moved_manifest["dataset_id"] == first_manifest["dataset_id"]
 
 
+@pytest.mark.parametrize("warmup_sessions", [0, 10])
 def test_finance_transformer_snapshot_contains_full_context_and_multi_horizon_targets(
-    tmp_path,
+    tmp_path, warmup_sessions,
 ) -> None:
     bars, universe = synthetic_frames(90)
+    calendar = sessions(90)
+    universe = universe.with_columns(
+        (pl.col("trade_date") >= calendar[warmup_sessions]).alias("eligible")
+    )
     bars_path = tmp_path / "bars.parquet"
     universe_path = tmp_path / "universe.parquet"
     bars.write_parquet(bars_path)
     universe.write_parquet(universe_path)
-    calendar = sessions(90)
     channels = [
         "r_close",
         "r_gap",
@@ -422,11 +466,33 @@ def test_finance_transformer_snapshot_contains_full_context_and_multi_horizon_ta
         }
     )
 
+    legacy_identity = {
+        "schema_version": 4,
+        "config": config.model_dump(mode="json", exclude={"sources", "output_root"}),
+        "input_file_hashes": {
+            "bars": sha256_file(bars_path), "universe": sha256_file(universe_path),
+            "corporate_actions": None, "delistings": None, "source_manifest": None,
+        },
+    }
+    legacy_id = sha256_json(legacy_identity)
+    legacy_path = config.output_root / legacy_id
+    legacy_path.mkdir(parents=True)
+    legacy_manifest = json.dumps({**legacy_identity, "dataset_id": legacy_id})
+    (legacy_path / "manifest.json").write_text(legacy_manifest)
     snapshot, manifest = build_dataset_snapshot(config)
 
+    assert manifest["schema_version"] == 5
+    assert snapshot != legacy_path
+    assert (legacy_path / "manifest.json").read_text() == legacy_manifest
+    assert build_dataset_snapshot(config) == (snapshot, manifest)
     assert manifest["artifacts"]["market_features"] == "market_features.parquet"
     features = pl.read_parquet(snapshot / "features.parquet")
     market = pl.read_parquet(snapshot / "market_features.parquet")
+    assert market["trade_date"].to_list() == calendar
+    market_window = MarketFeatureStore(
+        features=market, channels=config.features.market_channels,
+    ).window(calendar[19], context_length=20)
+    assert not market_window.observed_mask[:warmup_sessions].any()
     sample_index = pl.read_parquet(snapshot / "sample_index.parquet")
     pretraining_index = pl.read_parquet(snapshot / "pretraining_index.parquet")
     scaler = json.loads((snapshot / "scaler.json").read_text(encoding="utf-8"))

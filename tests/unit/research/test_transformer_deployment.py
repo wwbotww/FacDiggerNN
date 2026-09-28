@@ -39,7 +39,10 @@ def _config(tmp_path):
 @pytest.mark.parametrize(
     "damage", [None, "protocol", "identity", "files", "missing_fold", "mixed_sources"]
 )
-def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(tmp_path, monkeypatch, damage):
+@pytest.mark.parametrize("schema_version", [4, 5])
+def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(
+    tmp_path, monkeypatch, damage, schema_version,
+):
     config = _config(tmp_path)
     base = load_dataset_build_config(config.base_dataset_config)
     locations = {}
@@ -48,7 +51,10 @@ def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(tmp_path, monke
         protocol["split"] = fold.model_dump(mode="json", exclude={"fold_id"})
         if damage == "protocol" and fold.fold_id == "wf1":
             protocol["split"]["embargo_sessions"] += 1
-        identity = {"schema_version": 4, "config": protocol, "input_file_hashes": {"fixture": "a"}}
+        identity = {
+            "schema_version": schema_version, "config": protocol,
+            "input_file_hashes": {"fixture": "a"},
+        }
         if damage == "mixed_sources" and fold.fold_id == "wf2":
             identity["input_file_hashes"] = {"fixture": "another revision"}
         dataset_id = sha256_json(identity)

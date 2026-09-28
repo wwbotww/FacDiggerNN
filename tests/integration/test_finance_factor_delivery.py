@@ -23,6 +23,7 @@ from facdigger.data.market_calendar import regular_session_frame
 from facdigger.data.provenance import build_standardization_contract
 from facdigger.data.session_store import bootstrap_production_store
 from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
+from facdigger.experiments.manifest import sha256_json
 from facdigger.inference.delivery import DeliveryConfig
 from facdigger.inference.factor_batch import load_factor_batch, publish_evaluation_factor_batch
 from facdigger.inference.history import (
@@ -159,6 +160,36 @@ def finance_delivery(tmp_path, monkeypatch, request):
         }
     )
     return run, dataset, release_dir, release, inference_config
+
+
+def test_finance_market_calendar_cache_changes_preserve_legacy_snapshot_reads(finance_delivery):
+    _, _, release_dir, release, config = finance_delivery
+    snapshot, manifest = build_inference_snapshot(config, release_dir)
+    assert manifest["market_calendar_policy"] == "all_feature_sessions"
+    legacy_manifest = dict(manifest)
+    del legacy_manifest["market_calendar_policy"]
+    legacy_identity = {
+        key: legacy_manifest[key]
+        for key in ("contract", "config", "feature_contract", "input_file_hashes")
+    }
+    legacy_manifest["snapshot_id"] = sha256_json(legacy_identity)
+    legacy = snapshot.with_name(legacy_manifest["snapshot_id"])
+    snapshot.rename(legacy)
+    legacy_text = json.dumps(legacy_manifest)
+    (legacy / "manifest.json").write_text(legacy_text)
+    # Existing releases and snapshots still validate without inventing a marker.
+    loaded, _ = load_inference_snapshot(legacy, release)
+    assert loaded == legacy_manifest
+    rebuilt, rebuilt_manifest = build_inference_snapshot(config, release_dir)
+    assert rebuilt == snapshot and rebuilt != legacy
+    assert rebuilt_manifest["market_calendar_policy"] == "all_feature_sessions"
+    assert (legacy / "manifest.json").read_text() == legacy_text
+    assert rebuilt_manifest["artifact_hashes"] == manifest["artifact_hashes"]
+    load_inference_snapshot(rebuilt, release)
+    rebuilt_manifest["market_calendar_policy"] = "compressed"
+    (rebuilt / "manifest.json").write_text(json.dumps(rebuilt_manifest))
+    with pytest.raises(DataContractError, match="market calendar policy"):
+        load_inference_snapshot(rebuilt, release)
 
 
 @pytest.mark.parametrize("finance_delivery", ["scratch", "finance_pretrained"], indirect=True)

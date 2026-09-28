@@ -19,6 +19,7 @@ from facdigger.data.paths import artifact_path
 from facdigger.data.snapshots import sha256_file
 from facdigger.datasets.index import build_inference_index
 from facdigger.experiments.manifest import sha256_json
+from facdigger.features.cross_sectional import MARKET_CALENDAR_POLICY
 from facdigger.features.pipeline import (
     apply_feature_scaler,
     build_raw_feature_tables,
@@ -91,6 +92,13 @@ def _validate_snapshot_files(
         key: manifest.get(key)
         for key in ("contract", "config", "feature_contract", "input_file_hashes")
     }
+    if "market_calendar_policy" in manifest:
+        if (
+            release.feature_contract.feature_set != "finance_transformer"
+            or manifest["market_calendar_policy"] != MARKET_CALENDAR_POLICY
+        ):
+            raise DataContractError("inference snapshot market calendar policy is unsupported")
+        identity["market_calendar_policy"] = manifest["market_calendar_policy"]
     snapshot_id = sha256_json(identity)
     if manifest.get("snapshot_id") != snapshot_id or snapshot_dir.name != snapshot_id:
         raise DataContractError("inference snapshot semantic identity does not match")
@@ -396,6 +404,10 @@ def build_inference_snapshot(
         "feature_contract": {"release_id": release.release_id, **feature_contract},
         "input_file_hashes": _source_hashes(config),
     }
+    if release.feature_contract.feature_set == "finance_transformer":
+        # Old immutable snapshots remain readable, but a fresh build must not
+        # hit a cache whose market calendar omitted empty-universe sessions.
+        identity["market_calendar_policy"] = MARKET_CALENDAR_POLICY
     snapshot_id = sha256_json(identity)
     base_output_root = config.output_root.resolve()
     output_root = (
