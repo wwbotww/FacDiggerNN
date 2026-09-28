@@ -24,7 +24,8 @@ uv run facdigger doctor
 4. 配置、CLI、Parquet schema、manifest、checkpoint 或研究协议变化，应同步对应文档并
    说明兼容策略。
 5. 影响 point-in-time、数据契约、snapshot、checkpoint、holdout 或长期架构的关键修复，
-   需要在 `docs/项目关键问题与修复复盘.md` 记录证据、验证和仍存限制。
+   需要在 `docs/复盘/` 的对应主题文件记录证据、验证和仍存限制，并更新
+   `docs/项目关键问题与修复复盘.md` 索引。
 
 正式采集、模型下载、长时间训练和 final holdout 解封会消耗额度、算力或研究自由度，除非
 任务明确要求，否则不要执行。

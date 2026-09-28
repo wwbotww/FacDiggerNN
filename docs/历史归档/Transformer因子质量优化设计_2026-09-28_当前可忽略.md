@@ -1,3 +1,11 @@
+> 历史归档，当前开发可忽略。归档来源：提交 `1bdde0c`，整理日期：2026-09-28。
+>
+> 保留最初优化取舍、完整消融设计及阶段实施记录。未启用的实验不是当前必跑任务；现行精简协议及验收统一见 [实验设计文档](../实验设计文档.md)。
+>
+> 下文保留当时措辞和测试数字，仅用于追溯；执行前查阅现行文档与代码。
+
+---
+
 # Transformer 因子质量优化设计
 
 > **状态：工程实现完成，实验结论以具体 run 为准。** 输入/标签、模型、监督 embedding replay、
@@ -673,7 +681,7 @@ configs/research/
 local embedding，再对目标日期执行一次 Set Transformer。release 自动选择
 `inference/backends.py` 的模型实现；Finance 无标签窗口不伪造 target 或 split。原始特征构建与
 冻结 scaler 应用也共用 `features/pipeline.py`。具体接口及计算/交付横截面边界见
-[开发文档 §11](开发文档.md#111-modelrelease-与-factorbatch)。
+[开发文档的 Release/评分/交付边界](../开发文档.md#7-release评分交付的内部边界)。
 
 ## 16. 实施状态
 

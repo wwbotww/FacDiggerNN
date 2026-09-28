@@ -1,122 +1,69 @@
 # FacDiggerNN 文档中心
 
-本页是仓库文档的统一入口。代码、严格配置和测试是可执行行为的最终依据；下列“现行文档”
-用于解释当前实现。`历史归档/` 只保存设计演进和特定日期证据，不参与当前决策。
+这里按读者任务导航，不重复维护运行状态。代码、严格配置和测试是可执行行为的最终依据；
+发现冲突时应查明并同步修正，不能以旧计划放宽现行门禁。
 
-## 第一次使用
+## 阅读顺序与职责
 
-建议按这个顺序阅读：
+| 文档 | 唯一职责 |
+|---|---|
+| [项目 README](../README.md) | 定位、安装入口、能力和结论边界 |
+| [开发文档](开发文档.md) | 模块职责、内部契约、数据流、扩展位置 |
+| [实验设计文档](实验设计文档.md) | 当前 Finance Transformer 配对协议、质量与资源验收 |
+| [训练运行与恢复](训练运行与恢复.md) | 跨平台数据准备、迁移、命令、进度和恢复 |
+| [Windows RTX 指南](RTX2070_Windows训练指南.md) | WSL2、驱动和 RTX 2070S 的平台差异 |
+| [ICF 操作说明](../configs/deployment/icf/README.md) | 学校 Slurm、存储、凭据和作业包装 |
+| [HeyBoss 因子联调交接](HeyBoss因子联调交接.md) | 唯一外部 FactorBatch 契约、缺分语义、跨仓验收 |
+| [每日生产运维](每日生产运维.md) | Docker、发布窗口、质量门禁、FD-04 和受审计恢复 |
+| [826 运行交接](826每日生产运行交接.md) | 固定部署资产、十只目标、末次有日期的验收结果 |
+| [关键问题与修复复盘](项目关键问题与修复复盘.md) | 按主题检索真实案例、设计取舍和面试素材 |
+| [贡献指南](../CONTRIBUTING.md) / [安全规则](../SECURITY.md) / [Agent 规则](../AGENTS.md) | 开发流程、秘密处理与每次任务约束 |
 
-1. [`README.md`](../README.md)：项目定位、当前能力、最短运行主线和已知限制；
-2. [`开发文档.md`](开发文档.md)：架构、数据契约、模块、CLI、产物、扩展和排错；
-3. [`实验设计文档.md`](实验设计文档.md)：研究问题、E0—E3 对照、切分、统计和结论边界；
-4. [`Transformer因子质量优化设计.md`](Transformer因子质量优化设计.md)：当前金融原生
-   Transformer 精简实验的结构、训练、资源预算和验收方案；
-5. [`RTX2070_Windows训练指南.md`](RTX2070_Windows训练指南.md)：目标 GPU 机器的安装、迁移和资源门禁。
-   独立训练部署及跨环境恢复设计见[训练可靠性与独立部署方案](训练可靠性与独立部署方案.md)；
-   学校 ICF 的资源、Slurm 配置及演练顺序见[学校 GPU 训练环境适配方案](学校GPU训练环境适配方案.md)。两者区分已实现能力与学校待验收项目，提交命令见 [ICF 操作说明](../configs/deployment/icf/README.md)。
-6. [`HeyBoss因子联调交接.md`](HeyBoss因子联调交接.md)：现行 importer 契约、离线验收及生产边界。
-   缺分保护设计、回归要求及剩余生产验收见[局部缺分持仓保护交接](HeyBoss局部缺分持仓保护交接.md)。
-   当前 826 生产位置、身份依据与运行证据见[826 每日生产运行交接](826每日生产运行交接.md)。
+新使用者先读 README → 开发文档 → 实验设计，再按训练或交付分支继续。
+只部署已训练模型的读者可直接读 HeyBoss 交接 → 每日生产运维 → 对应 release 的运行记录。
 
-## 现行文档职责
+## 配置入口
 
-| 文档 | 回答的问题 | 权威范围 |
-|---|---|---|
-| [`README.md`](../README.md) | 这是什么、当前能做什么、怎样开始 | 项目入口 |
-| [`开发文档.md`](开发文档.md) | 代码怎样组织、数据怎样流动、怎样扩展 | 工程说明 |
-| [`实验设计文档.md`](实验设计文档.md) | 比较什么、怎样防泄漏、何时可下结论 | 实验协议说明 |
-| [`Transformer因子质量优化设计.md`](Transformer因子质量优化设计.md) | 当前怎样提高 Transformer 单模型因子质量 | 已实现协议与待运行实验 |
-| [`RTX2070_Windows训练指南.md`](RTX2070_Windows训练指南.md) | 怎样在 WSL2/RTX 2070 Super 上运行 | 平台操作 |
-| [`训练可靠性与独立部署方案.md`](训练可靠性与独立部署方案.md) | 怎样独立部署训练、可靠续跑，并兼容旧配置、产物与现有生产 | 已实现通用接口、恢复契约与兼容性验收 |
-| [`学校GPU训练环境适配方案.md`](学校GPU训练环境适配方案.md) | 学校 DICE/ICF 的实测资源、Slurm/路径配置与执行顺序 | 环境调查与学校部署方案 |
-| [`HeyBoss因子联调交接.md`](HeyBoss因子联调交接.md) | HeyBoss 怎样校验、导入和跑通因子链路 | 跨项目交接 |
-| [`HeyBoss局部缺分持仓保护交接.md`](HeyBoss局部缺分持仓保护交接.md) | 局部缺分怎样不误清仓，哪些验收尚未完成 | 已实施设计、回归与生产验收边界 |
-| [`826每日生产运行交接.md`](826每日生产运行交接.md) | 当前 826 部署在哪里、交付谁、实测结果和怎样运维 | 本机生产运行交接 |
-| [`826每日生产回补阻断修复方案.md`](826每日生产回补阻断修复方案.md) | 09-23 回补阻断的真实证据、修复边界与验收矩阵 | 已确认实施的专项修复 |
-| [`项目关键问题与修复复盘.md`](项目关键问题与修复复盘.md) | 真实问题如何定位、权衡、修复和验证 | 持续维护的复盘档案 |
-| [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 如何改代码、测试和评审 | 贡献流程 |
-| [`SECURITY.md`](../SECURITY.md) | 如何处理 token、外部数据和研究完整性 | 安全规则 |
-| [`AGENTS.md`](../AGENTS.md) | coding agent 每次任务必须遵守什么 | Agent 仓库规则 |
+| 目的 | 配置 |
+|---|---|
+| 小型 API smoke / 活动股票 pilot | [free](../configs/data/eodhd_free.yaml) / [pilot](../configs/data/eodhd_all_world_pilot.yaml) |
+| 历史动态流动性数据 | [采集](../configs/data/eodhd_historical_liquid.yaml) |
+| 当前 Finance 数据与 9 阶段矩阵 | [dataset](../configs/datasets/eodhd_historical_liquid_transformer.yaml) / [research](../configs/research/finance_transformer_streamlined.yaml) |
+| 通用训练控制 | [runtime](../configs/runtime/reliable.example.yaml) |
+| 旧 E0–E3/M6，可选而非默认 | [旧 dataset](../configs/datasets/eodhd_historical_liquid.yaml) / [M6](../configs/research/m6_eodhd_engineering.yaml) |
+| 无标签推理和交付身份 | [inference dataset](../configs/datasets/eodhd_historical_liquid_inference.yaml) / [delivery](../configs/inference/heyboss_delivery.example.yaml) |
+| 固定模型历史回放 | [historical replay](../configs/inference/e3_historical_replay.example.yaml)，文件名沿用 E3，接口不限 E3 |
+| 每日服务 | [production](../configs/production/eodhd_daily.example.yaml) |
 
-当说明与实现冲突时，不要静默兼容：先以 `src/`、`configs/` 和 `tests/` 查明当前行为，再同步
-修正文档。README 不承载逐里程碑开发日记；关键 bug 和设计问题进入复盘，特定时点审计进入
-历史归档。
+模板不是已经部署的配置；`*.local.yaml`、数据、结果和秘密不进入 Git。
 
-## 当前状态摘要
+## 历史归档：当前开发可忽略
 
-- 工程链路已覆盖标准化、快照、E0—E3、金融原生 Transformer、统一评价、训练快照回放、
-  信号和 walk-forward；
-- 跨项目生产侧已具备不可变 ModelRelease、冻结 scaler 的 target-free inference snapshot
-  和单日 FactorBatch；固定 release 的 target-free 全历史回放可按年生成 backtest-only
-  FactorBatch 并断点续跑。FacDigger 每日 EODHD 修订、指定日期推理、30 分钟重试、截止门禁及
-  保留策略由 Docker 常驻服务统一编排，不依赖宿主 `launchd`。E1—E3 与金融原生 Transformer
-  共用 release/runtime/FactorBatch；HeyBoss 导入器已按排序语义解耦模型名称，实际交易联调
-  仍须按[联调交接](HeyBoss因子联调交接.md)核对身份、价格、日期与消费模式；
-- 交付 profile 将目标集合与身份有效期分开；完整计算池不因交付子集/缺 ISIN 被裁剪。
-  release/predict 与历史 plan/run/verify 支持本机路径重定位，联调可显式允许 dirty 来源而不
-  放宽产物绑定；生产配置的计算池最低数量位于 `inference`，必须提供 `factor_batch.delivery`；
-- 每日生产允许小范围不可评分行，固定采集前的覆盖基准，分别检查计算池、交付池及 Finance
-  市场输入；异常缺失重新 fresh 采集，到截止跳过 D 而不停服务。质量报告与心跳分离，未放宽
-  五列/身份/有限分数门禁。HeyBoss 的 SKIP/保持数量/预算保护及两侧 XNYS 日历统一代码已完成，
-  826 release 与原 validation 预测交付已通过离线历史验收；2026-09-20 已完成真实采集、
-  Docker 无标签推理及 D=2026-09-18 十只交付，HeyBoss 只读 parser 校验通过。实际接纳、
-  联合提前量和连续五日仍待验收，不能宣称无人值守交易链路已完成；当前目录与证据见
-  [826 生产运行交接](826每日生产运行交接.md)；
-- 监督阶段以完整日横截面排序相关性为目标；E1—E3 通过 CPU 整日组装、GPU
-  physical microbatch 和两遍回放计算精确整日梯度，LightGBM 使用按完整日分组的
-  LambdaRank；
-- 当前 E1—E3 监督 checkpoint 是 schema v3，objective 是
-  `cross_sectional_rank_correlation_surrogate_v2_full_date`；旧 v1 chunked artifacts 不能恢复或混用；
-- 金融原生 Transformer checkpoint 是 schema v4，主矩阵固定 3 次 Train-only 预训练和
-  6 个 scratch/pretrained 配对监督 cell；RTX 2070S 的 100-update CUDA/FP16、显存、RAM 和
-  14 天资源门禁尚待运行，runner 会强制绑定报告的配置哈希和最大 fold dataset ID；
-- M6 决策要求单侧 HAC 显著性、非重叠样本稳健性和 Holm 多重比较控制；
-- final holdout 在冻结参数后重新建立截至 validation 末日的训练快照并重新训练；
-- 全历史 EODHD bronze 曾在项目机器上完成重建和质量门禁，但真实数据不随 Git 分发；
-- 真实退市收益、点时行业和点时流通市值仍缺失，因此当前 M6 是 engineering 模式。
-- 新一轮 engineering validation 的 `research_id` 是
-  `m6_eodhd_engineering_full_date_v2`，final holdout 仍锁定；RTX 2070 Super / 16 GB
-  的旧配置尚待真实 CUDA 单 cell 与完整矩阵验收；当前精简主线使用独立配置，不再默认运行
-  36-cell M6。
+这些材料保留完整方案或时点证据，不再维护成第二份操作手册。文件名与顶部均标记历史用途。
 
-具体机器是否具备数据、来源证明、快照和 checkpoint，必须检查本地目录及 manifest，不能根据
-文档中的历史完成记录推断。
+| 归档 | 保留原因 |
+|---|---|
+| [早期实施计划](历史归档/早期实施计划_当前可忽略.md) | 原始里程碑与取舍 |
+| [早期 PatchTST 原始设计](历史归档/早期PatchTST原始设计_当前可忽略.md) | 最初实现参考 |
+| [2026-07-24 数据质量审计](历史归档/数据质量审计快照_2026-07-24_当前可忽略.md) | 修复前后真实证据 |
+| [E0–E3 与 M6 完整实验协议](历史归档/E0-E3与M6实验协议_2026-09-28_当前可忽略.md) | 旧矩阵、统计决策、final refit/holdout 的完整说明 |
+| [Transformer 优化设计](历史归档/Transformer因子质量优化设计_2026-09-28_当前可忽略.md) | 原始优化理由、暂缓消融和实施过程 |
+| [训练可靠性改造方案](历史归档/训练可靠性改造方案_2026-09-25_当前可忽略.md) | 改造前根因、设计与 CPU 故障验收 |
+| [ICF 环境调查与验收](历史归档/ICF环境调查与验收记录_2026-09-28_当前可忽略.md) | 节点实测、作业编号、数据准备及基准进度 |
+| [HeyBoss 联调与验收](历史归档/HeyBoss联调与验收记录_2026-09-16_当前可忽略.md) | 旧契约差异、缺分改造与历史联合证据 |
+| [826 回补阻断修复方案](历史归档/826回补阻断修复方案_2026-09-23_当前可忽略.md) | 专项根因与验收矩阵 |
+| [826 部署与验收记录](历史归档/826部署与验收记录_2026-09-24_当前可忽略.md) | 首次交付、FD-04、后续修复及完整时序 |
 
-## 配置地图
+复盘案例不是待办列表；已解决问题的历史描述不应覆盖当前代码行为。
+归档中的外部绝对路径、作业号和产物哈希只定位原环境证据，不保证新 clone 存在这些文件。
 
-```text
-configs/
-├── base.yaml                         # 环境/Checkpoint 诊断，不是训练配置
-├── data/
-│   ├── eodhd_free.yaml               # 两股票 API smoke
-│   ├── eodhd_all_world_pilot.yaml    # 当前 active 100 股票资源 pilot
-│   ├── eodhd_historical_liquid.yaml  # 历史动态 top-1000 主数据路径
-│   └── eodhd_daily_production.yaml   # daily bulk 修订（禁缓存）
-├── datasets/
-│   ├── us_equities_daily_v1.yaml     # provider-neutral 标准表范例
-│   ├── eodhd_free_smoke.yaml         # 短窗口管线 smoke
-│   ├── eodhd_all_world_pilot.yaml    # 100 股票工程 snapshot
-│   ├── eodhd_historical_liquid.yaml  # 历史动态旧主 snapshot
-│   └── eodhd_historical_liquid_transformer.yaml # 14+6 路新主 snapshot
-├── experiments/                      # E0—E3 与 finance Transformer 配置
-├── inference/
-│   ├── e3_historical_replay.example.yaml  # 固定 release 的 backtest-only 全历史回放
-│   └── heyboss_delivery.example.yaml     # 目标范围与有明确有效期/依据的身份映射
-├── production/
-│   └── eodhd_daily.example.yaml      # Docker 生产模板；本地副本固定 release ID
-└── research/
-    ├── finance_transformer_streamlined.yaml # 当前 9 阶段精简主线
-    └── m6_eodhd_engineering.yaml     # 旧完整矩阵；保留但不默认运行
-```
+## 后续维护规则
 
-## 历史归档（当前开发可忽略）
-
-以下文件保留是为了追溯，不应继续被更新成混合的“半历史、半现行”说明：
-
-- [`早期实施计划_当前可忽略.md`](历史归档/早期实施计划_当前可忽略.md)：从空仓库起步的原始实施计划；
-- [`早期PatchTST原始设计_当前可忽略.md`](历史归档/早期PatchTST原始设计_当前可忽略.md)：早期模型设计与阶段性同步；
-- [`数据质量审计快照_2026-07-24_当前可忽略.md`](历史归档/数据质量审计快照_2026-07-24_当前可忽略.md)：特定日期的修复前后审计证据。
-
-文件名和顶部提示都明确标记“当前可忽略”。若历史文档与现行文档冲突，以现行代码、配置、
-测试和上表所列现行文档为准。
+1. 改接口更新对应职责文档，不向所有 README 复制同一说明。
+2. 配置是参数默认值的依据；文档解释动机、使用方法与边界。参数变化同步实验协议。
+3. “已实现”“已在某环境验证”“研究有效”“已部署”分开写；验证必须附日期与范围。
+4. 持续运维步骤写运维指南，某次发布和失败记录写有日期的交接/复盘。
+5. 关键修复在[复盘索引](项目关键问题与修复复盘.md)登记并更新相应主题文件；
+   保存根因、验证、残余限制，不仅记录通过数字。
+6. 历史文件只补充明确勘误或导航，不把旧方案改写成今天已执行的事实。
+7. 移动/合并文档时检查路径、章节链接及命令；不删除不可替代的审计证据或生成资产。

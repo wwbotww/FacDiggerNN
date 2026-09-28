@@ -1,11 +1,15 @@
 # ICF 独立训练部署
 
-本目录只配置学校资源；通用恢复在 `facdigger.training`，其他服务器直接使用同一 CLI。
-资源调查与验收门禁见[学校方案](../../../docs/学校GPU训练环境适配方案.md)，
-断点与兼容性见[通用方案](../../../docs/训练可靠性与独立部署方案.md)。
-以下为操作步骤；实际作业、已验证范围与待验收项见[学校方案第 10 节](../../../docs/学校GPU训练环境适配方案.md)。
+本页只维护学校 Slurm、存储、凭据和启动包装。通用接口与恢复语义见
+[训练运行与恢复](../../../docs/训练运行与恢复.md)，实验参数见
+[实验设计](../../../docs/实验设计文档.md)。不要把站点账户/队列写进核心训练器。
 
-**1. 准备独立环境和稳定资产**
+环境调查、作业编号与时点结果统一归档到
+[截至 2026-09-28 的 ICF 记录](../../../docs/历史归档/ICF环境调查与验收记录_2026-09-28_当前可忽略.md)。
+该记录包含合成 CUDA/信号演练、真实数据准备及市场日历修复后的基准进度，
+**不表示完整矩阵已经完成，也不是当前实时作业状态**。升级或换节点须重新核验相应范围。
+
+## 1. 准备独立环境和稳定资产
 
 固定已审阅提交的完整 clone 到 `/home/$USER/facdigger/code`，保留 `.git`、配置和
 `uv.lock`；输出、配置、encoder、基准报告一旦绑定 run 就保持固定绝对路径。
@@ -35,45 +39,18 @@ cp configs/deployment/icf/budget.example.yaml "/home/$USER/facdigger/configs/bud
 硬杀可能留下临时目录；确认对应作业结束后单独清理，不能凭 PID 删除训练锁。
 Lustre 和 scratch 均需外部独立备份。
 
-**2. 准备快照输入**
+## 2. 准备快照输入
 
-单模型携带完整 snapshot 即可，不需要 bronze 或数据 API。迁移前生成外置清单：
+按[通用迁移步骤](../../../docs/训练运行与恢复.md#2-选择数据准备方式)生成外置清单并验证全文件。
+单模型完整 snapshot 无需 bronze/token；矩阵需要 wf1/wf2/wf3 的全部快照及对应 runtime。
+没有 fold 映射仍需 bronze，不能把“代码已安装”当成训练输入已齐备。
 
-```bash
-.venv/bin/facdigger train snapshot-checksums \
-  --dataset /path/to/source/snapshot \
-  --output /path/to/source/snapshot.checksums.json
-```
+runtime 指向持久输入，复制到 scratch 时包装生成本 allocation 的 dataset_overrides，
+不把旧节点 scratch 保存成下次唯一来源。首次保持 FD_STAGING_ROOT 为空，验证从 Lustre
+直接读取；启用 staging 后必须逐文件验证，硬杀残留只在确认对应作业结束后清理。
+已绑定 output/run/encoder/admission 路径保持稳定，不能借 staging 改实验哈希。
 
-清单和快照一起传输；在 runtime 的 `dataset_overrides` 中以真实 dataset ID 配置
-`{path, checksums}`，验证目标副本。学校单模型 staging 还会对本次复制做全文件比对；
-若使用已有迁移清单，先验证持久输入，再将其作为 staging 来源，不能重建清单掩盖损坏。
-
-矩阵只带快照时，必须准备三份对应 fold 的完整快照，并在 runtime 写入：
-
-```yaml
-checkpoint_interval_seconds: 600
-max_walltime_seconds: null
-shutdown_margin_seconds: 300
-handle_signals: true
-dataset_overrides: {}
-fold_snapshots:
-  wf1:
-    path: /home/USER/facdigger/inputs/snapshots/WF1_DATASET_ID
-    checksums: /home/USER/facdigger/inputs/wf1.checksums.json
-  wf2:
-    path: /home/USER/facdigger/inputs/snapshots/WF2_DATASET_ID
-    checksums: /home/USER/facdigger/inputs/wf2.checksums.json
-  wf3:
-    path: /home/USER/facdigger/inputs/snapshots/WF3_DATASET_ID
-    checksums: /home/USER/facdigger/inputs/wf3.checksums.json
-```
-
-替换 USER 和 ID。每次提交保留同一份指向持久输入的 runtime；包装生成本 allocation
-的实际映射，不把旧节点 scratch 路径保存为下一次唯一来源。不提供 `fold_snapshots`
-时，新矩阵仍需要 bronze；第一次从 scratch 启动矩阵必须显式提供这三份输入。
-
-**2a. 在学校重新下载 EODHD 并用 CPU 预构建三个 fold**
+## 2a. 在学校重新下载 EODHD 并用 CPU 预构建三个 fold
 
 如果不迁移旧 bronze，使用独立 CPU 作业。先固定代码提交，在 Lustre 生成三份可审阅配置：
 
@@ -141,13 +118,10 @@ CPU 准备还不表示 GPU 环境、订阅权限或正式研究 readiness 已通
 不重新下载、不改研究 YAML 或旧快照；完成后改用新目录的 runtime/fold 映射并重新 benchmark。
 旧 v4 仍可校验和迁移，但重复验证旧准备目录不会自动升级。详情见[市场日历复盘](../../../docs/项目关键问题与修复复盘.md)。
 
-长下载使用独立的 `data-ingest.env` 和 `data-prepare.env`，避免等待期间改写同一个配置。
-2026-09-27 的预检得到 18,952 个候选、56,856 次历史请求；每次数据请求前还要查询账户，
-300 HTTP/min 下仅限速就至少约 6.3 小时，另有网络、缓存写盘和映射耗时。该次下载申请
-4 CPU / 32G / 24h。不要沿用示例的 4h 直接估算能完成。
-随后该作业在 7 小时 17 分完成，MaxRSS 约 32 GiB，接近申请上限；同等范围再次全量重建时，
-建议将 ingest 的 `FD_MEMORY` 设为 64G。三 fold 准备实测约 7 分钟、峰值 27.27 GiB。
-这些是本次输入与节点上的观测，不能按磁盘压缩体积推断 RAM，也不替代模型基准。
+长下载使用独立的 `data-ingest.env` 和 `data-prepare.env`，避免排队期间改写同一配置。
+模板 4 CPU / 32G / 4h 只是起点。2026-09-27 全量下载实测超过 7 小时且接近 32 GiB，
+同范围重建建议申请 ingest 64G 并核实 QoS 时限；不缩减数据来伪装通过。
+CPU prepare 可单独配置资源。原始候选/请求量、作业 MaxRSS 与耗时见归档，不在操作指南滚动追加。
 
 可在 `data-prepare.env` 显式设置 `FD_AFTEROK_JOB_ID` 为已经提交的 ingest 作业 ID，然后用
 原提交命令排队。只接受正整数，Slurm 只有在上游退出 0 后才启动准备；上游失败则取消
@@ -155,7 +129,7 @@ CPU 准备还不表示 GPU 环境、订阅权限或正式研究 readiness 已通
 已提交作业读取的代码、YAML 和源文件保持固定；失败后核对日志、额度和缓存，再人工提交
 新的 ingest，并将 prepare 依赖改成新的 ID。不能删除锁或降低来源质量门禁来继续。
 
-**3. 验证目标环境并测量预算**
+## 3. 验证目标环境并测量预算
 
 ```bash
 set -a
@@ -168,8 +142,7 @@ sbatch --chdir="$FD_CODE_ROOT" --output="$FD_LOG_ROOT/env-%j.out" --export=ALL \
 环境脚本申请单个 H200 MIG，检查包导入、分配设备数、实际容量及小型 FP16 前反向。
 它记录实际版本，并不替代锁文件检查，也不证明完整模型/replay 已通过。
 资源变更需同步 `check_environment.sbatch` 的请求或通过 sbatch 参数覆盖。
-当前环境检查申请 15 分钟：2026-09-27 锁定环境首次检查用了 4 分 31 秒，观察到 Lustre
-RPC 等待，原 5 分钟时限余量过小。环境导入和 checkpoint I/O 都要计入实际作业预算；
+环境检查申请 15 分钟，考虑首次导入与共享存储延迟，不沿用余量不足的旧 5 分钟假设。环境导入和 checkpoint I/O 都要计入实际作业预算；
 这项学校时限调整不修改通用训练器或实验配置。
 
 在同规格 GPU allocation 内用 `srun` 执行下面基准；不要在头节点运行模型。
@@ -192,7 +165,7 @@ srun "$FD_PYTHON" -m facdigger train finance-benchmark \
 300 秒退出余量及 600 秒 checkpoint 间隔只是起点；按最长完整 update 与写盘耗时调整。
 `FD_MIN_OUTPUT_FREE_BYTES` 默认 2 GiB 是最低检查值，必须按实测 checkpoint/临时副本提高。
 
-**4. 先手动续跑，再启用受限自动续跑**
+## 4. 先手动续跑，再启用受限自动续跑
 
 ```bash
 bash scripts/icf/submit.sh "/home/$USER/facdigger/configs/resources.env" --test-only
@@ -220,7 +193,7 @@ bash scripts/icf/submit.sh "/home/$USER/facdigger/configs/resources.env"
 再显式调整配置；不删除 `allocation_state.json` 清零。
 `--requeue` 只是允许调度器重排，主动续跑由包装显式执行 `scontrol requeue`，不另发新作业。
 
-**5. 审计、回滚及生产交接**
+## 5. 审计、回滚及生产交接
 
 `FD_RUN_DIR/manifest.json` 是训练状态，matrix 另有 `matrix.json`/`folds.json`；
 `checkpoints/last.pt` 是恢复权威，最佳导出用于候选模型。
@@ -242,3 +215,13 @@ JobID 不作为研究身份，多个作业可继续同一个 `FD_RUN_DIR`。
 不能读取新的 epoch 内恢复 contract。不要回滚代码后继续读新 last.pt，也不要改历史哈希。
 最佳 checkpoint 和 ModelRelease/FactorBatch 格式保持兼容，但真实候选仍须在生产固定
 版本的隔离副本中执行 release 校验及离线回放。训练结束不自动晋级，不写生产目录。
+
+## 6. 有日期的验收边界
+
+截至 2026-09-28 已记录：锁定环境的合成 CUDA/FP16 与同节点 srun USR1 暂停恢复演练通过；
+完整历史采集及 schema v5 的三 fold CPU 准备完成。修复后的最大 fold benchmark 作业
+3663800 在最后一次记录时仍在运行，正式九阶段矩阵尚未启动；不能从记录推断现在的结果。
+
+尚需按目标部署核验：真实完整模型资源报告、加载/probe/selection/保存/恢复/最终评价时限、
+实际抢占/自动 requeue、跨节点锁与恢复，以及完整矩阵的质量。合成演练不替代这些项目。
+逐项证据、失败原因和输入身份见[ICF 归档](../../../docs/历史归档/ICF环境调查与验收记录_2026-09-28_当前可忽略.md)。

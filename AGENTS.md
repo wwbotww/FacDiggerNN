@@ -13,8 +13,9 @@ FacDiggerNN 是面向美股日频数据的 point-in-time 机器学习因子研�
 `src/facdigger/cli.py`。总体数据流是：
 
 ```text
-provider -> 标准 Parquet + provenance 契约 -> 内容寻址快照 -> E0–E3 训练
-         -> 统一评价 -> checkpoint 回放/信号 -> walk-forward 研究
+provider -> 标准 Parquet + provenance 契约 -> 内容寻址快照
+         -> Finance Transformer（当前）/ E0–E3（保留）-> 统一评价 / walk-forward
+         -> ModelRelease -> 无标签推理 -> FactorBatch
 ```
 
 本项目最重要的设计取向是：可复现、可审计、防止未来信息泄漏。数据或协议不可信时应明确
@@ -26,8 +27,9 @@ provider -> 标准 Parquet + provenance 契约 -> 内容寻址快照 -> E0–E3 
   `data/providers/<provider>/`。
 - `features/`、`labels/`、`datasets/`：特征、标签、切分、索引、窗口和采样。
 - `models/`：模型结构、基线、PatchTST 迁移与预训练能力。
-- `training/`：E0–E3 配置、训练编排与 checkpoint；E1–E3 支持 resume。共享逻辑优先
-  复用 `training/common.py`。
+- `training/`：Finance Transformer 与 E0–E3 配置、编排和 checkpoint；Finance 支持显式
+  runtime 与 update 边界恢复，E1–E3 保留各自 resume 契约。共享逻辑优先复用
+  `training/common.py` 和已有领域实现。
 - `evaluation/`：预测契约、中性化、指标、覆盖门禁、报告和比较。
 - `inference/`：checkpoint 回放和不读取标签的信号生成。
 - `research/`：walk-forward、统计、冻结和 holdout 编排；复用训练器，不复制训练逻辑。
