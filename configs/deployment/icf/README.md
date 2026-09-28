@@ -135,10 +135,19 @@ TTL 到期、`refresh=true` 或更改日期会重新消耗额度。映射/拼接
 同一份 runtime 可用于本地或其他服务器 CLI；搬运快照后显式更新路径并保留原外置清单。
 CPU 准备还不表示 GPU 环境、订阅权限或正式研究 readiness 已通过。
 
+2026-09-28 的市场日历修复需要重新构建金融快照（schema v5）。若已有 complete 的 v4
+准备，保留原目录，复制 prepare env，并把 `FD_PREPARE_OUTPUT` 改为新的绝对路径，例如
+`/home/$USER/facdigger/inputs/transformer-calendar-complete`。复用已验收的 bronze，
+不重新下载、不改研究 YAML 或旧快照；完成后改用新目录的 runtime/fold 映射并重新 benchmark。
+旧 v4 仍可校验和迁移，但重复验证旧准备目录不会自动升级。详情见[市场日历复盘](../../../docs/项目关键问题与修复复盘.md)。
+
 长下载使用独立的 `data-ingest.env` 和 `data-prepare.env`，避免等待期间改写同一个配置。
 2026-09-27 的预检得到 18,952 个候选、56,856 次历史请求；每次数据请求前还要查询账户，
 300 HTTP/min 下仅限速就至少约 6.3 小时，另有网络、缓存写盘和映射耗时。该次下载申请
-4 CPU / 32G / 24h；这不是已通过的全量峰值或耗时基准。不要沿用示例的 4h 直接估算能完成。
+4 CPU / 32G / 24h。不要沿用示例的 4h 直接估算能完成。
+随后该作业在 7 小时 17 分完成，MaxRSS 约 32 GiB，接近申请上限；同等范围再次全量重建时，
+建议将 ingest 的 `FD_MEMORY` 设为 64G。三 fold 准备实测约 7 分钟、峰值 27.27 GiB。
+这些是本次输入与节点上的观测，不能按磁盘压缩体积推断 RAM，也不替代模型基准。
 
 可在 `data-prepare.env` 显式设置 `FD_AFTEROK_JOB_ID` 为已经提交的 ingest 作业 ID，然后用
 原提交命令排队。只接受正整数，Slurm 只有在上游退出 0 后才启动准备；上游失败则取消

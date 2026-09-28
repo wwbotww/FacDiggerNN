@@ -1,9 +1,9 @@
 **FacDiggerNN 学校 GPU 训练环境适配方案**
 
-调查日期：2026-09-25；部署更新：2026-09-27。原调查基线：`70390e3`；当前学校运行基线：`e418570`。
+调查日期：2026-09-25；部署更新：2026-09-28。原调查基线：`70390e3`；当前学校运行基线：`72de8fa`。
 适用环境：爱丁堡大学 Informatics DICE / ICF，当前账户 `s2977852`。
 
-本文记录实际环境检查、学校部署配置和执行方案。**2026-09-27 已在 ICF 安装独立锁定环境，CUDA/FP16 合成恢复通过，真实历史下载已启动；真实数据基准和正式矩阵尚未运行。** 实际作业与验收边界见第 10 节，操作见 [ICF 部署说明](../configs/deployment/icf/README.md)。
+本文记录实际环境检查、学校部署配置和执行方案。**ICF 独立锁定环境、CUDA/FP16 合成恢复、Slurm 预警恢复及全量数据/三 fold 准备已完成；2026-09-28 开始最大 fold 的真实 GPU 基准，正式矩阵尚未启动。** 实际作业与验收边界见第 10 节，操作见 [ICF 部署说明](../configs/deployment/icf/README.md)。
 
 方案分为两份独立文档：[训练可靠性与独立部署方案](训练可靠性与独立部署方案.md)定义适用于本地及其他服务器的恢复、限时、资源接口和兼容性要求；本文只定义 ICF 如何配置和使用这些能力。学校部署不成为项目的默认运行方式。
 
@@ -105,7 +105,7 @@ GPU 选择以本项目基准为准：H200 MIG 的预算是切片资源，不能�
 
 学校建议把频繁 I/O 放到本地 scratch，并提示共享盘和 scratch 均不能作为唯一重要数据副本。备份采用“集群保留可恢复工作集，校外原数据机器或其他已确认的持久存储保存独立副本”，避免把全部大文件塞入 18 GiB AFS。打包环境可减少大量小文件访问，见[GPU 集群使用建议](https://computing.help.inf.ed.ac.uk/cluster-tips)。
 
-容量门禁应基于实际文件体积：输入解包体积、可能保留的压缩包、运行环境、checkpoint 临时写入与最新完整副本，再加余量。三 fold 快照不能假设与单 fold 大小相同。初次调查没有发现可用的历史行情、快照或模型权重；目前历史下载仍在进行，真实数据总容量与训练耗时待后续测量。
+容量门禁应基于实际文件体积：输入解包体积、可能保留的压缩包、运行环境、checkpoint 临时写入与最新完整副本，再加余量。三 fold 快照不能假设与单 fold 大小相同。9 月 28 日全量准备完成，三份快照合计约 6.87 GiB，最大 fold 约 2.32 GiB；文件体积不等于加载后的 RAM 或训练显存需求。
 
 训练资产迁移规则：
 
@@ -271,8 +271,8 @@ transformers 4.57.6；包清单和 lock 摘要保存在 `evidence/`。配置生�
 | `3662140`，GPU 环境 | COMPLETED，4 分 31 秒；`logs/env-3662140.out` | 锁定依赖、CUDA FP16 前后向通过；H200 MIG 可见 16 GiB、SM 9.0 |
 | `3662142`，GPU 恢复 | COMPLETED，7 分 16 秒；`evidence/gpu-acceptance-3662142/acceptance.json` | 合成数据上的五个阶段恢复及两种引擎的真实 POSIX USR1 暂停恢复，共七项通过 |
 | `3662150` → `3662151`，Slurm 预警/恢复 | 两个诊断作业均 COMPLETED，分别 4 分 48 秒、23 秒；`evidence/slurm-signal-20260927/report.json` | 自动时限预警经 srun 到达 CUDA 预训练，引擎暂停；新作业从同一断点恢复至 15 个成功更新，并与连续训练严格一致 |
-| `3662147`，CPU ingest | 已启动；4 CPU / 32G / 24h | 全量价格、分红、拆股接口已实际返回并缓存，最终质量门禁与资源峰值尚待完成 |
-| `3662149`，CPU prepare | 依赖 `afterok:3662147`；4 CPU / 64G / 24h | 仅在采集及原质量门禁成功后构建三 fold；上游失败取消，不启动模型训练 |
+| `3662147`，CPU ingest | COMPLETED，7 小时 17 分 25 秒；4 CPU / 32G | 全量价格、分红、拆股下载与原质量门禁通过；MaxRSS 33,552,804 KiB，约 32 GiB |
+| `3662149`，CPU prepare | COMPLETED，7 分 03 秒；4 CPU / 64G | 成功依赖自动衔接，三个 fold 全部生成；MaxRSS 28,599,464 KiB，约 27.27 GiB |
 
 GPU 恢复验收直接复用既有测试 fixture 和引擎，只将诊断配置设为 CUDA/FP16；
 监督 train/selection、预训练 local/market/probe 的中断恢复，与连续训练严格比较权重、
@@ -312,8 +312,78 @@ tail -n 30 /home/s2977852/facdigger/logs/facdigger-ingest-3662147.out
 quality、standardization 和表文件哈希；准备完成检查 `inputs/transformer/preparation.json`、
 `folds.json`、外置文件清单及 `runtime.yaml`。缓存数量或 Slurm 提交成功均不代表这两项验收通过。
 
-仍待完成：全量采集质量及三 fold 快照、真实数据 ≥100-update 基准和全生命周期耗时、
+**2026-09-28 数据验收与基准启动**
+
+采集覆盖 2010–2025 年、18,952 个候选证券；标准行情保留 21,602,739 行、11,839 个证券，
+4,024 个市场交易日均有覆盖。隔离 1,184 个异常身份，占 9.0916%，低于既有 10% 上限；
+质量与标准化状态均为 passed。研究来源仍为 engineering：退市收益估算、点时行业与
+流通市值缺失等限制没有消失。三 fold 的 `preparation.json` 为 complete，来源哈希一致，
+各自 11 个清单文件均存在，manifest 哈希匹配；启动基准前再次执行完整逐文件校验。
+
+下载 MaxRSS 已接近申请的 32G，后续全量重建建议单独把 ingest 的 `FD_MEMORY` 提高到
+64G；这不修改训练 host budget、模型或采样协议。快照准备使用 64G，已有足够观测余量。
+
+首个真实基准作业 `3663789` 使用 H200 `1g.18gb` / 4 CPU / 32G / 4h、最大 `wf3`，
+dataset ID 为 `17b035501ad8e052eabd4f641cce64e52e871b4a72e4b63eb209aecb4a3990fa`。
+原 512 context、监督 microbatch 16、4 日期累积、预训练 batch 32、模型与 epoch 预算保持
+不变；监督及 local 预训练各测 100 个成功更新，market 预训练测 20 次。
+预算仍是实际显存的 85%、15 GiB host RSS、14 天矩阵计算时间，申请 32G 不改变验收上限。
+脚本、环境和阶段状态保存在 `evidence/benchmark*`，日志为 `logs/benchmark-3663789.out`。
+只有实际报告通过才算 update 准入，不能用提交成功代替；作业不自动衔接正式矩阵。
+
+该作业完整逐文件校验通过，环境与校验准备耗时约 315 秒；随后在构造预训练窗口时，因
+RNOW 证券末端不足五个未来特征行而退出，未进行 optimizer update。Slurm 总耗时
+8 分 16 秒，报告没有生成。诊断与通用修复见[复盘第 60 项](项目关键问题与修复复盘.md)：
+保留市场日历定义和全部样本，仅以既有 false observed mask 表示证券末端的真实缺失。
+该问题与学校资源配置分开处理；不改快照，不删除退市前的样本，也不放宽日期检查。
+
+修复提交 `83e9683569ba27c2cec14e2afb461bd100751b9e` 已在完整 484 项回归通过后固定到
+学校 checkout；锁文件和独立 venv 不变。重测作业 `3663796` 使用同一份部署脚本、
+最大 fold、实验配置、资源申请及准入预算，8 分 42 秒后失败；预训练数据集构造已经通过，
+随后在读取市场历史时发现窗口短于 512 个 session。CPU 诊断 `3663797` 完成，确认市场
+特征遗漏了入池预热期的 251 个交易日；源行情完整，不需重下载。两次失败均未产生准入报告。
+
+这是第二项通用修复，见[复盘第 61 项](项目关键问题与修复复盘.md)：市场聚合保留全部交易日，
+没有 eligible 股票的日期使用 null/false mask。金融训练快照改用新内容身份，旧快照保留；
+不修改模型、样本池、标签、上下文、epoch、质量门槛或 GPU 数值容差。训练和推理仍共享同一
+特征实现，现有每日生产服务继续固定原代码与 release，本次没有部署到生产。
+
+学校侧单独创建 `configs/data-prepare-calendar.env`，仅将准备目录设为
+`inputs/transformer-calendar-complete`，保留 4 CPU / 64G / 24h，取消旧下载依赖；直接复用
+已验收 bronze。旧 `inputs/transformer` 和所有旧内容寻址目录继续保留。重建完成后再固定新
+fold 映射和 runtime，不能只在旧的 complete 准备目录重跑并误以为得到新特征。
+重测包装还会核对三 fold 的配置和来源哈希、标签、索引、local 特征及 scaler，确认仅增加
+251 行不可观测市场日期，既有市场行完全相同。任何非预期差异都会在模型更新前阻止执行。
+
+通用修复提交 `72de8fa9211d07c0df53092eebd84d53541d83ff` 在 494 项全量回归（82% 覆盖率）、
+Ruff 和离线 lock 检查通过后推送，并在持有学校数据/基准锁时更新独立 checkout。学校配置
+与本文另行提交，依赖环境、实验 YAML 和预算未变。CPU 重建作业 `3663799` 已 COMPLETED（7 分 30 秒），
+MaxRSS 29,289,468 KiB，约 27.93 GiB；三个 fold 均生成 schema v5、完整 4,024 日市场特征。
+逐文件清单对比确认仅 `market_features.parquet`、`audit.json`、`manifest.json` 改变，其他
+八个文件的哈希全部不变；新增三份合计仍约 6.87 GiB，旧版另行保留。当前最大 fold 为
+`3eb091ebcb41446b7388da94f3f86e29d629326c76f99527985aa50f2dbf7101`。
+GPU 基准 `3663800` 已通过 `afterok:3663799` 自动启动，仍固定 H200 `1g.18gb` / 4 CPU /
+32G / 4h、原实验配置及 15 GiB host / 85% 显存 / 14 天预算。上游失败即取消下游，不自动
+反复重试。环境与完整输入校验耗时约 291 秒；三 fold 新增日期全为 null/false mask，原市场
+行逐值完全一致，输入比较已通过，当前基准进程正在运行。
+部署记录为 `evidence/deployment-calendar-20260928.json`，脚本为
+`evidence/benchmark_job_calendar_20260928.py` 与 `benchmark_calendar_20260928.sbatch`。
+新基准环境、状态和 `input_comparison.json` 位于 `evidence/benchmark-3663800/`，仍须等待
+实际 100-update 报告；输入通过不能替代模型成功更新、吞吐或内存准入。
+只读 GPU 观察确认真正的 `finance-benchmark` 子进程已占用 CUDA 显存，和环境检查父进程
+分别记录在 `process_observation.json`；运行至约 10 分钟仍无新的错误。该观察不提供
+optimizer 成功计数，最终是否 admitted 必须读取实际 benchmark JSON。
+
+查看这一轮状态，不会重复提交任务：
+
+```bash
+sacct -j 3663799,3663800 --format=JobID,State,ExitCode,Elapsed,MaxRSS
+cat /home/s2977852/facdigger/evidence/benchmark-3663800/state.json
+tail -n 30 /home/s2977852/facdigger/logs/benchmark-3663800.out
+```
+
+仍待完成：真实数据 ≥100-update 基准和全生命周期耗时、
 Slurm 抢占/自动 requeue、跨 GPU 节点恢复与 scratch、项目 Apptainer 镜像、生产固定版本
 的真实候选回放、模型晋级及正式 Alpha。真实退市收益及点时行业/市值限制继续有效，
-`research_ready=false` 不因下载或 GPU 验收而改写。下一步先检查数据链结果，再在最大
-fold 测量资源，按原协议进行单 fold 演练；完整矩阵及 holdout 不提前启动。
+`research_ready=false` 不因下载或 GPU 验收而改写。下一步完成当前最大 fold 基准，
+再测完整阶段和真实数据的保存/恢复，按原协议进行单 fold 演练；完整矩阵及 holdout 不提前启动。
