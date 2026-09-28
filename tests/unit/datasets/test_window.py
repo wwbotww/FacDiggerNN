@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 
 from facdigger.data.contracts import DataContractError
+from facdigger.datasets.index import build_finance_pretraining_index
 from facdigger.datasets.sampler import (
     DateGroupedBatchSampler,
     DateSecurityBalancedBatchSampler,
@@ -69,6 +70,85 @@ def test_finance_pretraining_dataset_is_target_free_and_returns_future_windows()
     history, future = dataset.market_pair(dates[4])
     np.testing.assert_array_equal(history.values[:, 0], [12.0, 13.0, 14.0])
     np.testing.assert_array_equal(future.values[:, 0], [15.0, 16.0, 17.0])
+
+
+def _ending_security_fixture(available_future):
+    dates = [date(2024, 1, 2) + timedelta(days=index) for index in (0, 1, 2, 3, 6, 7, 8, 9)]
+    features = pl.DataFrame(
+        [
+            {"security_id": security, "trade_date": day, "x": float(index), "observed_x": True}
+            for security, count in (("A", 5 + available_future), ("B", 8))
+            for index, day in enumerate(dates[:count])
+        ]
+    )
+    universe = features.select("security_id", "trade_date").with_columns(
+        pl.col("security_id").alias("symbol"),
+        pl.lit(True).alias("eligible"),
+        pl.lit(None, dtype=pl.String).alias("industry_code"),
+        pl.lit(None, dtype=pl.Float64).alias("float_market_cap"),
+    )
+    index = build_finance_pretraining_index(
+        features, universe, context_length=3, future_horizon=3, train_end=dates[-1]
+    ).filter(pl.col("asof_date") == dates[4])
+    market = pl.DataFrame(
+        {"trade_date": dates, "m": [10.0 + i for i in range(8)], "observed_m": [True] * 8}
+    )
+    return features, market, index
+
+
+def _ending_security_dataset(features, market, index):
+    return FinancePretrainingWindowDataset(
+        features=features,
+        market_features=market,
+        pretraining_index=index,
+        channels=["x"],
+        market_channels=["m"],
+        context_length=3,
+        future_horizon=3,
+        future_local_channels=1,
+    )
+
+
+@pytest.mark.parametrize("available_future", [0, 1, 2, 3])
+def test_pretraining_keeps_ending_security_and_masks_absent_future_tail(available_future):
+    features, market, index = _ending_security_fixture(available_future)
+    original_index = index.clone()
+    dataset = _ending_security_dataset(features, market, index)
+    assert len(dataset) == 2
+    assert index.equals(original_index)
+    sample = dataset[0]
+    np.testing.assert_array_equal(sample["values"][:, 0], [2.0, 3.0, 4.0])
+    np.testing.assert_array_equal(
+        sample["future_values"][:, 0],
+        list(range(5, 5 + available_future)) + [0] * (3 - available_future),
+    )
+    np.testing.assert_array_equal(
+        sample["future_observed_mask"][:, 0],
+        [True] * available_future + [False] * (3 - available_future),
+    )
+    np.testing.assert_array_equal(dataset[1]["future_values"][:, 0], [5.0, 6.0, 7.0])
+    _, future = dataset.market_pair(index["asof_date"][0])
+    np.testing.assert_array_equal(future.values[:, 0], [15.0, 16.0, 17.0])
+    assert sample["future_values"].dtype == np.float32
+    assert sample["future_observed_mask"].dtype == np.bool_
+
+
+@pytest.mark.parametrize("column", ["future_start", "future_end"])
+def test_pretraining_rejects_future_bounds_outside_declared_market_sessions(column):
+    features, market, index = _ending_security_fixture(3)
+    invalid = index.with_columns((pl.col(column) + pl.duration(days=1)).alias(column))
+    with pytest.raises(DataContractError, match="future bounds"):
+        _ending_security_dataset(features, market, invalid)
+
+
+def test_pretraining_rejects_interior_grid_hole_instead_of_shifting_future_dates():
+    features, market, index = _ending_security_fixture(3)
+    missing_date = market["trade_date"][6]
+    broken = features.filter(
+        ~((pl.col("security_id") == "A") & (pl.col("trade_date") == missing_date))
+    )
+    with pytest.raises(DataContractError, match="future bounds"):
+        _ending_security_dataset(broken, market, index)
 
 
 def test_date_security_balanced_sampler_uses_every_row_once() -> None:

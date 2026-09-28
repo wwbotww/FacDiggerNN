@@ -138,7 +138,7 @@ class MarketFeatureStore:
             raise DataContractError("market context lookup requires one complete date")
         return self.window(dates[0], context_length=context_length)
 
-    def future_window(self, asof_date: Any, *, future_horizon: int) -> MarketFeatureWindow:
+    def _future_slice(self, asof_date: Any, *, future_horizon: int) -> slice:
         if future_horizon < 1:
             raise ValueError("future_horizon must be positive")
         target = np.datetime64(asof_date, "D")
@@ -151,9 +151,16 @@ class MarketFeatureStore:
             raise DataContractError(
                 f"market context has no {future_horizon}-session future at {asof_date}"
             )
+        return slice(start, stop)
+
+    def future_dates(self, asof_date: Any, *, future_horizon: int) -> np.ndarray:
+        return self.dates[self._future_slice(asof_date, future_horizon=future_horizon)]
+
+    def future_window(self, asof_date: Any, *, future_horizon: int) -> MarketFeatureWindow:
+        selected = self._future_slice(asof_date, future_horizon=future_horizon)
         return MarketFeatureWindow(
-            values=self.values[start:stop],
-            observed_mask=self.observed[start:stop],
+            values=self.values[selected],
+            observed_mask=self.observed[selected],
         )
 
 
@@ -543,23 +550,6 @@ class FinancePretrainingWindowDataset(_IndexedFeatureWindows):
         )
         self.future_horizon = future_horizon
         self.future_local_channels = future_local_channels
-        self._future_starts = np.empty(len(self), dtype=np.int32)
-        for index, row in enumerate(self.sample_rows.iter_rows(named=True)):
-            block = self.feature_store.block_at(int(self._block_indices[index]))
-            location = block.position(row["future_start"])
-            if location is None:
-                raise DataContractError(
-                    f"pretraining sample has no future_start: {row['sample_id']}"
-                )
-            stop = location + future_horizon
-            if stop > len(block.dates) or block.dates[stop - 1] != np.datetime64(
-                row["future_end"], "D"
-            ):
-                raise DataContractError(
-                    f"pretraining future bounds disagree with feature grid: {row['sample_id']}"
-                )
-            self._future_starts[index] = location
-
         if market_store is None:
             if market_features is None:
                 raise ValueError("market_features or market_store is required")
@@ -575,6 +565,31 @@ class FinancePretrainingWindowDataset(_IndexedFeatureWindows):
             )
         self.market_store = market_store
         self.market_channels = tuple(market_channels)
+        future_dates = {
+            asof_date: market_store.future_dates(asof_date, future_horizon=future_horizon)
+            for asof_date in self.unique_asof_dates
+        }
+        self._future_starts = np.empty(len(self), dtype=np.int32)
+        for index, row in enumerate(self.sample_rows.iter_rows(named=True)):
+            expected = future_dates[row["asof_date"]]
+            if expected[0] != np.datetime64(row["future_start"], "D") or (
+                expected[-1] != np.datetime64(row["future_end"], "D")
+            ):
+                raise DataContractError(
+                    f"pretraining future bounds disagree with market calendar: {row['sample_id']}"
+                )
+            block = self.feature_store.block_at(int(self._block_indices[index]))
+            location = int(np.searchsorted(block.dates, expected[0]))
+            available = min(future_horizon, len(block.dates) - location)
+            # A security may end before the market window (e.g. delisting).
+            # Only an absent tail is masked; internal grid holes remain errors.
+            if not np.array_equal(
+                block.dates[location : location + available], expected[:available]
+            ):
+                raise DataContractError(
+                    f"pretraining future bounds disagree with feature grid: {row['sample_id']}"
+                )
+            self._future_starts[index] = location
 
     @property
     def unique_asof_dates(self) -> list[Any]:
@@ -592,12 +607,17 @@ class FinancePretrainingWindowDataset(_IndexedFeatureWindows):
         stop = start + self.context_length
         future_start = int(self._future_starts[index])
         future_stop = future_start + self.future_horizon
+        future_values = block.values[future_start:future_stop, : self.future_local_channels]
+        future_observed = block.observed[future_start:future_stop, : self.future_local_channels]
+        missing = self.future_horizon - len(future_values)
+        if missing:
+            padding = ((0, missing), (0, 0))
+            future_values = np.pad(future_values, padding, constant_values=0)
+            future_observed = np.pad(future_observed, padding, constant_values=False)
         return {
             "values": block.values[start:stop],
             "observed_mask": block.observed[start:stop],
-            "future_values": block.values[future_start:future_stop, : self.future_local_channels],
-            "future_observed_mask": block.observed[
-                future_start:future_stop, : self.future_local_channels
-            ],
+            "future_values": future_values,
+            "future_observed_mask": future_observed,
             "sample_index": index,
         }

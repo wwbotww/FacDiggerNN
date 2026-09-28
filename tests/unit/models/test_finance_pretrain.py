@@ -1,12 +1,33 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from facdigger.models.finance_patch_transformer import FinancePatchTransformer
 from facdigger.models.finance_pretrain import (
     FinanceNativePretrainer,
     contiguous_patch_element_mask,
+    future_summary_targets,
 )
+
+
+@pytest.mark.parametrize("observed_days", [0, 1, 3, 5])
+def test_future_summary_excludes_missing_tail_from_values_and_normalization(observed_days):
+    values = torch.arange(1, 6, dtype=torch.float32).reshape(1, 5, 1)
+    observed = torch.arange(5).reshape(1, 5, 1) < observed_days
+    padded = values.masked_fill(~observed, 0)
+    target, valid = future_summary_targets(padded, observed)
+    altered, same_valid = future_summary_targets(values.masked_fill(~observed, 1000), observed)
+    torch.testing.assert_close(target, altered, rtol=0, atol=0)
+    assert torch.equal(valid, same_valid)
+    if observed_days:
+        prefix = values[:, :observed_days]
+        expected, expected_valid = future_summary_targets(prefix, torch.ones_like(prefix).bool())
+        torch.testing.assert_close(target, expected, rtol=0, atol=0)
+        assert torch.equal(valid, expected_valid)
+    else:
+        assert not valid.any()
+        assert torch.equal(target, torch.zeros_like(target))
 
 
 def _pretrainer() -> FinanceNativePretrainer:
