@@ -44,4 +44,24 @@ jobs:
         run: uv run --frozen ruff check .
 
       - name: Test
-        run: uv run --frozen pytest
+        run: uv run --frozen pytest --junitxml="$RUNNER_TEMP/pytest-results.xml"
+
+      - name: Report test failures
+        if: failure()
+        shell: python
+        run: |
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "pytest-results.xml"
+          if report.exists():
+              for case in ET.parse(report).iter("testcase"):
+                  for tag in ("failure", "error"):
+                      failure = case.find(tag)
+                      if failure is None:
+                          continue
+                      message = f"{case.get('classname')}.{case.get('name')}\n{failure.text}"
+                      message = message[:12000].replace("%", "%25")
+                      message = message.replace("\r", "%0D").replace("\n", "%0A")
+                      print(f"::error title=pytest failure::{message}")
