@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from facdigger.training.finance_transformer_config import (
     FinanceTransformerExperimentConfig,
     load_finance_transformer_config,
 )
+from facdigger.training.progress import TrainingProgress, append_progress
 from facdigger.training.resources import (
     TrainingResourceBudget,
     effective_resource_limits,
@@ -419,6 +421,7 @@ def run_transformer_comparison(
     run_dir: str | Path | None = None,
     runtime: TrainingRuntimeConfig | None = None,
     resource_budget: TrainingResourceBudget | None = None,
+    control: TrainingControl | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     if (
         resume_run is not None
@@ -431,7 +434,10 @@ def run_transformer_comparison(
         if (resume_run or run_dir)
         else (config.output_root.resolve() / f"{config.research_id}-{uuid.uuid4().hex[:12]}")
     )
-    with run_lock(root / ".research.lock"), TrainingControl(runtime) as control:
+    with (
+        run_lock(root / ".research.lock"),
+        nullcontext(control) if control is not None else TrainingControl(runtime) as control,
+    ):
         existing = root / "manifest.json"
         if existing.is_file():
             manifest = json.loads(existing.read_text(encoding="utf-8"))
@@ -508,6 +514,11 @@ def _run_transformer_comparison(
         }
     )
     _write_json(run_dir / "manifest.json", manifest)
+    observation = TrainingProgress(
+        lambda event: append_progress(
+            run_dir / "progress.jsonl", event, attempt=len(manifest["attempts"])
+        )
+    )
     try:
         folds_path = run_dir / "folds.json"
         if not folds_path.is_file():
@@ -573,7 +584,8 @@ def _run_transformer_comparison(
                     control=control,
                     trainer=run_finance_transformer,
                 )
-        result = _paired_result(fold_plans, matrix, config)
+        with observation.phase("comparison"):
+            result = _paired_result(fold_plans, matrix, config)
         _write_json(run_dir / "comparison.json", result)
         manifest.update(
             {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,38 @@ import yaml
 from pydantic import Field
 
 from facdigger.data.config import StrictModel
+
+
+def process_peak_rss_bytes() -> int | None:
+    """Process lifetime high-water RSS; unavailable platforms remain unknown."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - native Windows
+        return None
+    peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+def process_memory() -> dict[str, int | None]:
+    rss = None
+    if sys.platform == "linux":
+        try:
+            rss = int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            pass
+    result = {"host_rss_bytes": rss, "host_peak_rss_bytes": process_peak_rss_bytes()}
+    # Observation must not import torch, initialize CUDA, reset peaks or consume RNG.
+    torch = sys.modules.get("torch")
+    cuda = torch is not None and torch.cuda.is_initialized()
+    result.update(
+        {
+            "cuda_allocated_bytes": torch.cuda.memory_allocated() if cuda else None,
+            "cuda_reserved_bytes": torch.cuda.memory_reserved() if cuda else None,
+            "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated() if cuda else None,
+            "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved() if cuda else None,
+        }
+    )
+    return result
 
 
 class TrainingResourceBudget(StrictModel):

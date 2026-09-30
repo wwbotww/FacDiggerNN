@@ -97,6 +97,7 @@ def predict_finance_transformer(
     precision: str,
     num_workers: int,
     check_stop: Callable[[], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> np.ndarray:
     loader, sampler = _full_date_loader(
         dataset,
@@ -111,7 +112,7 @@ def predict_finance_transformer(
     predictions = np.empty(len(dataset), dtype=np.float64)
     model.eval()
     with torch.no_grad():
-        for full_date_batch in loader:
+        for date_index, full_date_batch in enumerate(loader, start=1):
             if check_stop is not None:
                 check_stop()
             local_chunks: list[torch.Tensor] = []
@@ -134,4 +135,6 @@ def predict_finance_transformer(
                 ]
             indices = full_date_batch["sample_index"].numpy()
             predictions[indices] = scores.detach().float().cpu().numpy()
+            if progress_callback is not None:
+                progress_callback(date_index, len(loader))
     return predictions

@@ -35,6 +35,7 @@ from facdigger.training.e1_engine import (
 from facdigger.training.finance_transformer_config import (
     FinanceTransformerExperimentConfig,
 )
+from facdigger.training.progress import TrainingProgress
 from facdigger.training.ranking import (
     TARGET_TRANSFORM,
     average_ranks,
@@ -296,6 +297,7 @@ def evaluate_finance_transformer_selection(
     subperiods: int,
     stability_penalty: float,
     check_stop: Callable[[], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     scores = predict_finance_transformer(
         model,
@@ -305,6 +307,7 @@ def evaluate_finance_transformer_selection(
         precision=precision,
         num_workers=num_workers,
         check_stop=check_stop,
+        progress_callback=progress_callback,
     )
     targets = dataset.sample_rows["target"].to_numpy()
     daily = _daily_rank_ics(
@@ -465,139 +468,143 @@ def train_finance_transformer(
 ) -> tuple[FinancePatchTransformer, dict[str, Any]]:
     started_at = time.perf_counter()
     control = control or TrainingControl()
+    observation = TrainingProgress(progress_callback)
     if control.enabled and config.training.num_workers:
         raise ValueError("mid-epoch recovery requires num_workers=0")
-    seed_everything(config.seed)
-    device = select_device(config.training.device)
-    amp_enabled = device == "cuda" and config.training.precision == "fp16"
-    model = build_finance_transformer_model(config, context_length=train_dataset.context_length)
-    initialization_audit: dict[str, Any] = {"method": config.initialization}
-    if config.initialization == "finance_pretrained" and resume_from is None:
-        assert config.pretrained_checkpoint is not None
-        initialization_audit.update(
-            load_finance_pretrained_encoders(
-                model,
-                config.pretrained_checkpoint,
-                expected_dataset_id=dataset_id,
-                expected_context_length=train_dataset.context_length,
-                expected_channels=config.channels,
-                expected_market_channels=config.market_channels,
+    with observation.phase("engine_setup"):
+        seed_everything(config.seed)
+        device = select_device(config.training.device)
+        amp_enabled = device == "cuda" and config.training.precision == "fp16"
+        model = build_finance_transformer_model(config, context_length=train_dataset.context_length)
+        initialization_audit: dict[str, Any] = {"method": config.initialization}
+        if config.initialization == "finance_pretrained" and resume_from is None:
+            assert config.pretrained_checkpoint is not None
+            initialization_audit.update(
+                load_finance_pretrained_encoders(
+                    model,
+                    config.pretrained_checkpoint,
+                    expected_dataset_id=dataset_id,
+                    expected_context_length=train_dataset.context_length,
+                    expected_channels=config.channels,
+                    expected_market_channels=config.market_channels,
+                )
             )
+        model = model.to(device)
+        groups = _optimizer_parameter_groups(
+            model,
+            encoder_learning_rate=config.training.encoder_learning_rate,
+            head_learning_rate=config.training.head_learning_rate,
+            weight_decay=config.training.weight_decay,
         )
-    model = model.to(device)
-    groups = _optimizer_parameter_groups(
-        model,
-        encoder_learning_rate=config.training.encoder_learning_rate,
-        head_learning_rate=config.training.head_learning_rate,
-        weight_decay=config.training.weight_decay,
-    )
-    optimizer = torch.optim.AdamW(
-        groups,
-        betas=(config.training.adam_beta1, config.training.adam_beta2),
-    )
-    train_loader, train_sampler = _full_date_loader(
-        train_dataset,
-        shuffle=True,
-        seed=config.seed,
-        num_workers=config.training.num_workers,
-        minimum_group_size=config.training.objective.minimum_cross_section_size,
-    )
-    updates_per_epoch = math.ceil(len(train_loader) / config.training.dates_per_optimizer_step)
-    total_update_budget = updates_per_epoch * config.training.max_epochs
-    warmup_steps = math.ceil(total_update_budget * config.training.warmup_fraction)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: _warmup_cosine_lambda(
-            step,
-            total_steps=total_update_budget,
-            warmup_steps=warmup_steps,
-            minimum_ratio=config.training.minimum_learning_rate_ratio,
-        ),
-    )
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    target_rank_lookup = torch.stack(
-        [
-            torch.from_numpy(
-                cross_sectional_rank_targets(
-                    train_dataset.sample_rows[f"target_{horizon}"].to_numpy(),
-                    train_dataset.asof_dates,
-                    minimum_cross_section_size=(
-                        config.training.objective.minimum_cross_section_size
-                    ),
+        optimizer = torch.optim.AdamW(
+            groups,
+            betas=(config.training.adam_beta1, config.training.adam_beta2),
+        )
+        train_loader, train_sampler = _full_date_loader(
+            train_dataset,
+            shuffle=True,
+            seed=config.seed,
+            num_workers=config.training.num_workers,
+            minimum_group_size=config.training.objective.minimum_cross_section_size,
+        )
+        updates_per_epoch = math.ceil(len(train_loader) / config.training.dates_per_optimizer_step)
+        total_update_budget = updates_per_epoch * config.training.max_epochs
+        warmup_steps = math.ceil(total_update_budget * config.training.warmup_fraction)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: _warmup_cosine_lambda(
+                step,
+                total_steps=total_update_budget,
+                warmup_steps=warmup_steps,
+                minimum_ratio=config.training.minimum_learning_rate_ratio,
+            ),
+        )
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+        target_rank_lookup = torch.stack(
+            [
+                torch.from_numpy(
+                    cross_sectional_rank_targets(
+                        train_dataset.sample_rows[f"target_{horizon}"].to_numpy(),
+                        train_dataset.asof_dates,
+                        minimum_cross_section_size=(
+                            config.training.objective.minimum_cross_section_size
+                        ),
+                    )
                 )
-            )
-            for horizon in config.horizons
-        ],
-        dim=1,
-    )
-    config_payload = config.model_dump(mode="json")
-    protocol_hash = sha256_json(config_payload)
-    start_epoch = 1
-    global_step = 0
-    best_selection_score = float("-inf")
-    best_selection_audit: dict[str, Any] = {}
-    best_epoch = 0
-    stale_epochs = 0
-    history: list[dict[str, Any]] = []
-    resumed_from_epoch: int | None = None
-    progress: dict[str, Any] = {}
-    best_payload: dict[str, Any] | None = None
-    last_checkpoint = checkpoint_dir / "last.pt"
-    best_checkpoint = checkpoint_dir / "best.pt"
+                for horizon in config.horizons
+            ],
+            dim=1,
+        )
+        config_payload = config.model_dump(mode="json")
+        protocol_hash = sha256_json(config_payload)
+        start_epoch = 1
+        global_step = 0
+        best_selection_score = float("-inf")
+        best_selection_audit: dict[str, Any] = {}
+        best_epoch = 0
+        stale_epochs = 0
+        history: list[dict[str, Any]] = []
+        resumed_from_epoch: int | None = None
+        progress: dict[str, Any] = {}
+        best_payload: dict[str, Any] | None = None
+        last_checkpoint = checkpoint_dir / "last.pt"
+        best_checkpoint = checkpoint_dir / "best.pt"
     if resume_from is not None:
-        checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
-        if checkpoint.get("contract") not in {
-            FINANCE_TRANSFORMER_CHECKPOINT,
-            FINANCE_TRANSFORMER_RESUME,
-        }:
-            raise ValueError("resume checkpoint is not a finance Transformer checkpoint")
-        if checkpoint["dataset_id"] != dataset_id:
-            raise ValueError("resume checkpoint dataset_id does not match")
-        if checkpoint["protocol_hash"] != protocol_hash:
-            raise ValueError("resume checkpoint training protocol does not match")
-        initialization_audit = dict(checkpoint["initialization"])
-        model.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        scheduler.load_state_dict(checkpoint["scheduler_state"])
-        scaler.load_state_dict(checkpoint["scaler_state"])
-        start_epoch = int(checkpoint["epoch"]) + 1
-        global_step = int(checkpoint["global_step"])
-        best_selection_score = float(checkpoint["best_selection_score"])
-        best_selection_audit = dict(checkpoint["best_selection_audit"])
-        best_epoch = int(checkpoint["best_epoch"])
-        stale_epochs = int(checkpoint["stale_epochs"])
-        history = list(checkpoint["history"])
-        train_sampler.load_state_dict(checkpoint["sampler_state"])
-        _restore_rng_state(checkpoint["rng_state"])
-        resumed_from_epoch = int(checkpoint["epoch"])
-        if checkpoint["contract"] == FINANCE_TRANSFORMER_RESUME:
-            progress = checkpoint["progress"]
-            if progress["phase"] not in {"train", "selection", "epoch_complete"}:
-                raise ValueError("unknown supervised resume phase")
-            if progress["phase"] != "epoch_complete":
-                if config.training.num_workers:
-                    raise ValueError("mid-epoch recovery requires num_workers=0")
-                start_epoch = int(checkpoint["epoch"])
-            best_payload = checkpoint["best_checkpoint"]
-        elif best_epoch:
-            best_payload = torch.load(best_checkpoint, map_location="cpu", weights_only=False)
-        if best_epoch:
-            if (
-                best_payload is None
-                or best_payload.get("epoch") != best_epoch
-                or (
-                    best_payload.get("dataset_id") != dataset_id
-                    or best_payload.get("protocol_hash") != protocol_hash
-                    or best_payload.get("best_selection_score") != best_selection_score
-                )
+        with observation.phase("checkpoint_restore", checkpoint_bytes=resume_from.stat().st_size):
+            checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
+            if checkpoint.get("contract") not in {
+                FINANCE_TRANSFORMER_CHECKPOINT,
+                FINANCE_TRANSFORMER_RESUME,
+            }:
+                raise ValueError("resume checkpoint is not a finance Transformer checkpoint")
+            if checkpoint["dataset_id"] != dataset_id:
+                raise ValueError("resume checkpoint dataset_id does not match")
+            if checkpoint["protocol_hash"] != protocol_hash:
+                raise ValueError("resume checkpoint training protocol does not match")
+            initialization_audit = dict(checkpoint["initialization"])
+            model.load_state_dict(checkpoint["model_state"])
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            scheduler.load_state_dict(checkpoint["scheduler_state"])
+            scaler.load_state_dict(checkpoint["scaler_state"])
+            start_epoch = int(checkpoint["epoch"]) + 1
+            global_step = int(checkpoint["global_step"])
+            best_selection_score = float(checkpoint["best_selection_score"])
+            best_selection_audit = dict(checkpoint["best_selection_audit"])
+            best_epoch = int(checkpoint["best_epoch"])
+            stale_epochs = int(checkpoint["stale_epochs"])
+            history = list(checkpoint["history"])
+            train_sampler.load_state_dict(checkpoint["sampler_state"])
+            _restore_rng_state(checkpoint["rng_state"])
+            resumed_from_epoch = int(checkpoint["epoch"])
+            if checkpoint["contract"] == FINANCE_TRANSFORMER_RESUME:
+                progress = checkpoint["progress"]
+                if progress["phase"] not in {"train", "selection", "epoch_complete"}:
+                    raise ValueError("unknown supervised resume phase")
+                if progress["phase"] != "epoch_complete":
+                    if config.training.num_workers:
+                        raise ValueError("mid-epoch recovery requires num_workers=0")
+                    start_epoch = int(checkpoint["epoch"])
+                best_payload = checkpoint["best_checkpoint"]
+            elif best_epoch:
+                best_payload = torch.load(best_checkpoint, map_location="cpu", weights_only=False)
+            if best_epoch:
+                if (
+                    best_payload is None
+                    or best_payload.get("epoch") != best_epoch
+                    or (
+                        best_payload.get("dataset_id") != dataset_id
+                        or best_payload.get("protocol_hash") != protocol_hash
+                        or best_payload.get("best_selection_score") != best_selection_score
+                    )
+                ):
+                    raise ValueError("best checkpoint differs from resume selection state")
+                with observation.phase("best_export", epoch=best_epoch):
+                    save_checkpoint(best_checkpoint, best_payload)
+            if progress.get("finished") or (
+                int(checkpoint["epoch"]) >= config.training.minimum_epochs
+                and stale_epochs >= config.training.patience
             ):
-                raise ValueError("best checkpoint differs from resume selection state")
-            save_checkpoint(best_checkpoint, best_payload)
-        if progress.get("finished") or (
-            int(checkpoint["epoch"]) >= config.training.minimum_epochs
-            and stale_epochs >= config.training.patience
-        ):
-            start_epoch = config.training.max_epochs + 1
+                start_epoch = config.training.max_epochs + 1
 
     epoch = int(checkpoint["epoch"]) if resume_from else 1
     phase = progress.get("phase", "train")
@@ -640,28 +647,32 @@ def train_finance_transformer(
 
     def persist(*, force: bool = False) -> None:
         if force or control.checkpoint_due():
-            state = payload()
-            state.update(
-                {
-                    "contract": FINANCE_TRANSFORMER_RESUME,
-                    "best_checkpoint": best_payload,
-                    "progress": {
-                        "phase": phase,
-                        "cursor": cursor,
-                        "finished": finished,
-                        "date_audits": date_audits,
-                        "gradient_norms": gradient_norms,
-                        "clipped_steps": clipped_steps,
-                        "amp_skipped_optimizer_steps": amp_skipped_optimizer_steps,
-                    },
-                }
-            )
-            save_checkpoint(last_checkpoint, state)
-            control.saved()
+            saved_at = time.perf_counter()
+            with observation.phase("checkpoint_save", epoch=epoch, training_phase=phase):
+                state = payload()
+                state.update(
+                    {
+                        "contract": FINANCE_TRANSFORMER_RESUME,
+                        "best_checkpoint": best_payload,
+                        "progress": {
+                            "phase": phase,
+                            "cursor": cursor,
+                            "finished": finished,
+                            "date_audits": date_audits,
+                            "gradient_norms": gradient_norms,
+                            "clipped_steps": clipped_steps,
+                            "amp_skipped_optimizer_steps": amp_skipped_optimizer_steps,
+                        },
+                    }
+                )
+                save_checkpoint(last_checkpoint, state)
+                control.saved()
             if progress_callback is not None:
                 progress_callback(
                     {
                         "event": "checkpoint_saved",
+                        "checkpoint_bytes": last_checkpoint.stat().st_size,
+                        "save_seconds": time.perf_counter() - saved_at,
                         "epoch": epoch,
                         "phase": phase,
                         "cursor": cursor,
@@ -698,90 +709,110 @@ def train_finance_transformer(
             amp_skipped_optimizer_steps = 0
         progress = {}
         phase = "train"
-        for date_index, batch in enumerate(
-            remaining_loader(train_loader, train_sampler, cursor), start=cursor + 1
-        ):
-            dates_in_step = _dates_in_current_optimizer_step(
-                date_index,
-                total_dates=len(train_loader),
-                configured_dates=config.training.dates_per_optimizer_step,
-            )
-            date_audits.append(
-                backward_complete_date_with_embedding_replay(
-                    model,
-                    train_dataset,
-                    batch,
-                    device=device,
-                    target_rank_lookup=target_rank_lookup,
-                    horizon_weights=config.training.objective.horizon_weights,
-                    epsilon=config.training.objective.epsilon,
-                    scale_regularization=(config.training.objective.scale_regularization),
+        with observation.phase("train", epoch=epoch, initial_cursor=cursor) as report_progress:
+            update_started = time.perf_counter()
+            max_update_seconds = 0.0
+            for date_index, batch in enumerate(
+                remaining_loader(train_loader, train_sampler, cursor), start=cursor + 1
+            ):
+                dates_in_step = _dates_in_current_optimizer_step(
+                    date_index,
+                    total_dates=len(train_loader),
+                    configured_dates=config.training.dates_per_optimizer_step,
+                )
+                date_audits.append(
+                    backward_complete_date_with_embedding_replay(
+                        model,
+                        train_dataset,
+                        batch,
+                        device=device,
+                        target_rank_lookup=target_rank_lookup,
+                        horizon_weights=config.training.objective.horizon_weights,
+                        epsilon=config.training.objective.epsilon,
+                        scale_regularization=(config.training.objective.scale_regularization),
+                        amp_enabled=amp_enabled,
+                        scaler=scaler,
+                        physical_microbatch_size=config.training.batch_size,
+                        dates_in_optimizer_step=dates_in_step,
+                        relative_tolerance=config.training.replay_relative_tolerance,
+                        absolute_tolerance=config.training.replay_absolute_tolerance,
+                    )
+                )
+                should_step = (
+                    date_index % config.training.dates_per_optimizer_step == 0
+                    or date_index == len(train_loader)
+                )
+                if not should_step:
+                    continue
+                gradient_norm, optimizer_updated = _step_optimizer(
+                    optimizer,
+                    scaler,
+                    model.parameters(),
+                    max_grad_norm=config.training.max_grad_norm,
                     amp_enabled=amp_enabled,
-                    scaler=scaler,
-                    physical_microbatch_size=config.training.batch_size,
-                    dates_in_optimizer_step=dates_in_step,
-                    relative_tolerance=config.training.replay_relative_tolerance,
-                    absolute_tolerance=config.training.replay_absolute_tolerance,
+                    experiment_name="finance_patch_transformer",
                 )
-            )
-            should_step = (
-                date_index % config.training.dates_per_optimizer_step == 0
-                or date_index == len(train_loader)
-            )
-            if not should_step:
-                continue
-            gradient_norm, optimizer_updated = _step_optimizer(
-                optimizer,
-                scaler,
-                model.parameters(),
-                max_grad_norm=config.training.max_grad_norm,
-                amp_enabled=amp_enabled,
-                experiment_name="finance_patch_transformer",
-            )
-            cursor = date_index
-            if not optimizer_updated:
-                amp_skipped_optimizer_steps += 1
-                persist()
-                continue
-            if gradient_norm is None:
-                raise RuntimeError("optimizer update has no finite gradient norm")
-            gradient_norms.append(gradient_norm)
-            clipped_steps += int(gradient_norm > config.training.max_grad_norm)
-            global_step += 1
-            scheduler.step()
-            if progress_callback is not None and (global_step == 1 or global_step % 25 == 0):
-                progress_callback(
-                    {
-                        "event": "optimizer_progress",
-                        "epoch": epoch,
-                        "date": date_index,
-                        "dates_in_epoch": len(train_loader),
-                        "global_step": global_step,
-                        "optimizer_update_budget": total_update_budget,
-                        "elapsed_seconds": time.perf_counter() - started_at,
-                        "latest_loss": date_audits[-1]["loss"],
-                        "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                    }
-                )
+                cursor = date_index
+                max_update_seconds = max(max_update_seconds, time.perf_counter() - update_started)
+                if not optimizer_updated:
+                    amp_skipped_optimizer_steps += 1
+                    report_progress(
+                        completed=cursor,
+                        total=len(train_loader),
+                        global_step=global_step,
+                        max_update_seconds=max_update_seconds,
+                    )
+                    persist()
+                    update_started = time.perf_counter()
+                    continue
+                if gradient_norm is None:
+                    raise RuntimeError("optimizer update has no finite gradient norm")
+                gradient_norms.append(gradient_norm)
+                clipped_steps += int(gradient_norm > config.training.max_grad_norm)
+                global_step += 1
+                scheduler.step()
+                if progress_callback is not None and (global_step == 1 or global_step % 25 == 0):
+                    progress_callback(
+                        {
+                            "event": "optimizer_progress",
+                            "epoch": epoch,
+                            "date": date_index,
+                            "dates_in_epoch": len(train_loader),
+                            "global_step": global_step,
+                            "optimizer_update_budget": total_update_budget,
+                            "elapsed_seconds": time.perf_counter() - started_at,
+                            "latest_loss": date_audits[-1]["loss"],
+                            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                        }
+                    )
 
-            persist()
+                report_progress(
+                    completed=cursor,
+                    total=len(train_loader),
+                    global_step=global_step,
+                    max_update_seconds=max_update_seconds,
+                )
+                persist()
+                update_started = time.perf_counter()
 
         phase = "selection"
         persist(force=control.enabled)
-        selection = evaluate_finance_transformer_selection(
-            model,
-            valid_dataset,
-            batch_size=config.training.batch_size,
-            device=device,
-            precision=config.training.precision,
-            num_workers=config.training.num_workers,
-            check_stop=lambda: control.raise_if_stopping(last_checkpoint),
-            minimum_cross_section_size=(config.training.objective.minimum_cross_section_size),
-            minimum_dates=config.training.objective.minimum_selection_dates,
-            minimum_coverage=config.training.objective.minimum_selection_coverage,
-            subperiods=config.training.objective.selection_subperiods,
-            stability_penalty=(config.training.objective.selection_stability_penalty),
-        )
+        with observation.phase("selection", epoch=epoch) as report_progress:
+            selection = evaluate_finance_transformer_selection(
+                model,
+                valid_dataset,
+                batch_size=config.training.batch_size,
+                device=device,
+                precision=config.training.precision,
+                num_workers=config.training.num_workers,
+                check_stop=lambda: control.raise_if_stopping(last_checkpoint),
+                progress_callback=lambda done, total: report_progress(completed=done, total=total),
+                minimum_cross_section_size=(config.training.objective.minimum_cross_section_size),
+                minimum_dates=config.training.objective.minimum_selection_dates,
+                minimum_coverage=config.training.objective.minimum_selection_coverage,
+                subperiods=config.training.objective.selection_subperiods,
+                stability_penalty=(config.training.objective.selection_stability_penalty),
+            )
         control.raise_if_stopping(last_checkpoint)
         selection_score = float(selection["selection_score"])
         improved = selection_score > best_selection_score + 1e-12
@@ -845,7 +876,8 @@ def train_finance_transformer(
         )
         persist(force=True)
         if improved:
-            save_checkpoint(best_checkpoint, best_payload)
+            with observation.phase("best_export", epoch=best_epoch):
+                save_checkpoint(best_checkpoint, best_payload)
         if progress_callback is not None:
             progress_callback(
                 {
@@ -867,8 +899,9 @@ def train_finance_transformer(
 
     if not best_checkpoint.is_file():
         raise RuntimeError("finance Transformer training did not produce best.pt")
-    best = torch.load(best_checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(best["model_state"])
+    with observation.phase("best_load"):
+        best = torch.load(best_checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(best["model_state"])
     return model, {
         "device": device,
         "amp_enabled": amp_enabled,
