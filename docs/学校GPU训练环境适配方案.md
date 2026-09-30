@@ -1,9 +1,9 @@
 **FacDiggerNN 学校 GPU 训练环境适配方案**
 
-调查日期：2026-09-25；部署更新：2026-09-28。原调查基线：`70390e3`；当前学校运行基线：`72de8fa`。
+调查日期：2026-09-25；结果复核：2026-09-30。原调查基线：`70390e3`；当前学校运行基线：`72de8fa`。
 适用环境：爱丁堡大学 Informatics DICE / ICF，当前账户 `s2977852`。
 
-本文记录实际环境检查、学校部署配置和执行方案。**ICF 独立锁定环境、CUDA/FP16 合成恢复、Slurm 预警恢复及全量数据/三 fold 准备已完成；2026-09-28 开始最大 fold 的真实 GPU 基准，正式矩阵尚未启动。** 实际作业与验收边界见第 10 节，操作见 [ICF 部署说明](../configs/deployment/icf/README.md)。
+本文记录实际环境检查、学校部署配置和执行方案。**ICF 独立锁定环境、CUDA/FP16 合成恢复、Slurm 预警恢复、全量数据/三 fold 准备及最大 fold 的真实 GPU 更新基准已通过；完整训练生命周期仍待验收，正式矩阵尚未启动。** 实际作业与验收边界见第 10 节，操作见 [ICF 部署说明](../configs/deployment/icf/README.md)。
 
 方案分为两份独立文档：[训练可靠性与独立部署方案](训练可靠性与独立部署方案.md)定义适用于本地及其他服务器的恢复、限时、资源接口和兼容性要求；本文只定义 ICF 如何配置和使用这些能力。学校部署不成为项目的默认运行方式。
 
@@ -365,14 +365,14 @@ MaxRSS 29,289,468 KiB，约 27.93 GiB；三个 fold 均生成 schema v5、完整
 GPU 基准 `3663800` 已通过 `afterok:3663799` 自动启动，仍固定 H200 `1g.18gb` / 4 CPU /
 32G / 4h、原实验配置及 15 GiB host / 85% 显存 / 14 天预算。上游失败即取消下游，不自动
 反复重试。环境与完整输入校验耗时约 291 秒；三 fold 新增日期全为 null/false mask，原市场
-行逐值完全一致，输入比较已通过，当前基准进程正在运行。
+行逐值完全一致，输入比较已通过；最终基准结果见下文 9 月 30 日复核记录。
 部署记录为 `evidence/deployment-calendar-20260928.json`，脚本为
 `evidence/benchmark_job_calendar_20260928.py` 与 `benchmark_calendar_20260928.sbatch`。
-新基准环境、状态和 `input_comparison.json` 位于 `evidence/benchmark-3663800/`，仍须等待
-实际 100-update 报告；输入通过不能替代模型成功更新、吞吐或内存准入。
+新基准环境、状态和 `input_comparison.json` 位于 `evidence/benchmark-3663800/`，最终
+报告为 `artifacts/benchmarks/finance-transformer-icf.json`。
 只读 GPU 观察确认真正的 `finance-benchmark` 子进程已占用 CUDA 显存，和环境检查父进程
 分别记录在 `process_observation.json`；运行至约 10 分钟仍无新的错误。该观察不提供
-optimizer 成功计数，最终是否 admitted 必须读取实际 benchmark JSON。
+optimizer 成功计数；最终成功更新和 admitted 已由实际 benchmark JSON 确认。
 
 查看这一轮状态，不会重复提交任务：
 
@@ -382,8 +382,56 @@ cat /home/s2977852/facdigger/evidence/benchmark-3663800/state.json
 tail -n 30 /home/s2977852/facdigger/logs/benchmark-3663800.out
 ```
 
-仍待完成：真实数据 ≥100-update 基准和全生命周期耗时、
-Slurm 抢占/自动 requeue、跨 GPU 节点恢复与 scratch、项目 Apptainer 镜像、生产固定版本
-的真实候选回放、模型晋级及正式 Alpha。真实退市收益及点时行业/市值限制继续有效，
-`research_ready=false` 不因下载或 GPU 验收而改写。下一步完成当前最大 fold 基准，
-再测完整阶段和真实数据的保存/恢复，按原协议进行单 fold 演练；完整矩阵及 holdout 不提前启动。
+**2026-09-30 结果复核与分析**
+
+`3663800` 于 2026-09-28 13:55:53（Europe/London）完成，Slurm 为 COMPLETED / 0:0，
+总耗时 33 分钟；包装状态为 admitted，报告的 CUDA FP16、内存与计算时间门禁全部通过。
+本次复核重新计算两份实验配置哈希，核对预算、最大 fold ID、manifest 哈希、报告路径以及
+学校干净 checkout 的提交，全部匹配；当前本人 Slurm 队列为空，没有后续训练自动启动。
+
+| 测量项 | 真实结果 | 解释 |
+|---|---|---|
+| 监督更新 | 成功 100 次，AMP 跳过 0 次；400 个完整日期、388,169 行 | 保留 512 context、原模型、16 microbatch 和 4 日期累积；不代表完整 epoch 已训练完 |
+| 监督速度 | 均值 14.083 秒/update，P95 19.041 秒 | 去掉前 10 次 warmup；每个 cell 按满 10 epoch 投影约 22.611 小时 |
+| 预训练更新 | local 成功 100 次、3,200 行；market 成功 20 次 | local 去掉前 10 次 warmup；没有执行 probe 选模 |
+| 预训练速度 | local 0.203 秒/update，market 1.136 秒/update | 一个 epoch 约 4.745 小时，满 3 epoch 约 14.234 小时，不含 probe |
+| CUDA reserved 峰值 | 监督 0.646 GiB，预训练 1.223 GiB | 均低于实际 16 GiB 显存的 85% 上限，即 13.6 GiB |
+| benchmark 进程 RSS 峰值 | 7.969 GiB | 低于配置的 15 GiB 进程门槛 |
+| Slurm 步骤 MaxRSS | 16,414,224 KiB，即 15.654 GiB | 与单进程报告口径不同；暂保留本次 32G 作业内存申请，不按 7.969 GiB 缩配 |
+| 九阶段计算投影 | 原始 178.369 小时，加 10% 后 196.206 小时，即 8.175 天 | 6 个监督 cell + 3 次预训练，均套用最大 fold；低于 14 天计算预算 |
+
+更新计算量中，监督约 135.666 小时，占原始投影约 76%；预训练约 42.703 小时。
+当前测量的显存容量有余量，不能仅据此判断 GPU 利用率或直接增大 batch；若后续优化吞吐，
+先区分完整日期 replay、数据组批、CPU 与 GPU 计算的耗时，并保持冻结协议。
+
+8.175 天不是完整实验的交付时限。报告明确记录
+`job_time_admission=requires_loading_probe_selection_checkpoint_measurement`：没有实测完整
+probe、监督 selection、最终评价、checkpoint 保存/恢复，以及重复加载的总成本。
+预训练计时从 loader 交出 batch 后开始，market 组批在计时外；固定 10% 附加量不能替代
+这些测量。排队和抢占导致的等待也不包含在其中。4.745 小时的预训练 epoch 已长于默认
+4 小时 allocation，epoch 内恢复仍是必需能力。
+
+正式提交配置也尚未就绪：`configs/resources.env` 的 dataset/run 路径仍含 `REPLACE_WITH_*`，
+runtime 仍指向示例，资源仍为示例 2 CPU / 20G / 4h；不能直接当作已经验收的正式配置。
+若以一个 `transformer-run` 管理整套矩阵，默认 `FD_MAX_ATTEMPTS=10` 配合 4h 最多覆盖
+40 小时；按当前投影，4h 分段约需 50 段，
+重复加载和退出余量还会增加段数。9 月 30 日复查 Teaching 的单作业上限仍为 48 小时，
+但不能据此假设作业不会被抢占。
+
+建议按以下顺序继续，通用可靠性验收与学校配置分别处理：
+
+1. 通用可靠性：用真实最大 fold、原模型/数据协议做可保存进度的训练演练，测量加载、
+   单个完整 update、保存、恢复、selection/probe、最终输出的耗时和内存；验证同一 run 的
+   中断重入及进度推进。已有合成 CUDA/USR1 结果继续保留，不冒充这项完整规模验收。
+2. 学校配置：先沿用已测的 H200 `1g.18gb` / 4 CPU / 32G，填入新 v5 snapshot、独立 run 和
+   `inputs/transformer-calendar-complete/runtime.yaml`。按演练结果确定作业时限、退出余量、
+   checkpoint 间隔和总尝试上限；8–12 小时可作为后续时限候选，需先通过调度预检和演练。
+   保持手动续跑，实际抢占、自动 requeue 和跨节点验证通过后再开启自动续跑。
+3. 正式实验：完成生命周期验收后按冻结的三 fold / 九阶段协议运行，收集 Rank IC、预训练
+   相对 scratch 的配对改进、覆盖率及训练健康报告，再进行候选模型的生产固定版本离线回放。
+
+本次 benchmark 只产出资源报告，不保存可交付的训练 checkpoint，也没有验证因子收益或
+预训练的统计优势。真实退市收益及点时行业/市值缺失仍使来源 `research_ready=false`；
+资源准入不改变这一结论。Apptainer 镜像属于可选打包验证，当前 venv 路径不依赖它；
+模型晋级、生产切换与 holdout 解锁仍不提前执行。本轮仅复核结果和更新文档，未新提交作业、
+调整实验配置或变更每日生产部署。
