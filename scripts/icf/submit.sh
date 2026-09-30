@@ -13,6 +13,8 @@ set +a
 [[ -x "$FD_PYTHON" ]]
 [[ -f "$FD_CONFIG" && -f "$FD_RUNTIME" ]]
 [[ "$FD_RUN_DIR" != *REPLACE_WITH* ]]
+FD_SIGNAL_SECONDS=$("$FD_PYTHON" "$FD_CODE_ROOT/scripts/icf/job.py" --signal-seconds "$FD_RUNTIME")
+export FD_SIGNAL_SECONDS
 mkdir -p "$FD_LOG_ROOT"
 FD_SUBMIT_OPTIONS=()
 if [[ $# == 2 ]]; then
@@ -22,7 +24,7 @@ fi
 sbatch "${FD_SUBMIT_OPTIONS[@]}" \
   --partition="$FD_PARTITION" --account="$FD_ACCOUNT" --qos="$FD_QOS" \
   --gres="$FD_GRES" --ntasks=1 --cpus-per-task="$FD_CPUS" \
-  --mem="$FD_MEMORY" --time="$FD_TIME" --requeue --signal=USR1@300 \
+  --mem="$FD_MEMORY" --time="$FD_TIME" --requeue --signal="USR1@$FD_SIGNAL_SECONDS" \
   --chdir="$FD_CODE_ROOT" --job-name=facdigger-train \
   --output="$FD_LOG_ROOT/%x-%j.out" --export=ALL \
   "$FD_CODE_ROOT/scripts/icf/train.sbatch"

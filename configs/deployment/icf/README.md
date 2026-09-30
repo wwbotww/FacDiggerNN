@@ -201,8 +201,15 @@ bash scripts/icf/submit.sh "/home/$USER/facdigger/configs/resources.env"
 
 `--test-only` 只验证调度请求。首次真实演练使用合成或已批准的验证数据、短预算和
 `FD_AUTO_REQUEUE=0`；确认暂停后再次提交**同一** env、配置和 `FD_RUN_DIR`。
-训练命令通过 `srun` 接收 `USR1`，运行预算在 staging 后读取 `squeue %L` 剩余时长，
-扣除配置的退出余量；无法获得有限剩余时间或不足余量则失败，不盲目启动。
+提交器从 runtime 的 `shutdown_margin_seconds` 向上取整生成 `USR1` 提前量，并导出
+`FD_SIGNAL_SECONDS` 供作业核验；不要手填该变量或绕过提交器设置不同预警。修改 runtime
+余量后重新提交，已排队作业发现预警与 runtime 不一致时会失败。
+
+通过 `srun` 进入 `job.py --run-step` 学校适配入口，再调用原通用训练/研究实现。包装在
+staging 后记录有限截止时间；step 完成依赖导入和配置读取后，重新读取 `squeue %L`，
+取调度器剩余时间与原截止时间剩余量的较小值，建立共享控制器后才继续训练。
+较短的 runtime 预算不会因启动或进入下一个矩阵阶段而重置。无法获得有限剩余时间、
+启动已耗尽预算或不足退出余量均明确失败。
 
 | 结果 | 包装行为 |
 |---|---|
@@ -215,8 +222,13 @@ bash scripts/icf/submit.sh "/home/$USER/facdigger/configs/resources.env"
 只有真实信号链、锁和跨节点恢复验收通过后，才设 `FD_AUTO_REQUEUE=1`。
 `FD_MAX_ATTEMPTS=10`、`FD_MAX_TOTAL_SECONDS=1209600`、`FD_MAX_NO_PROGRESS=2`
 均持久化执行；10 次四小时作业最多约 40 小时，完整矩阵需要按基准明确提高次数上限。
-每次先预记整个 allocation 剩余时长，正常退出再按实际耗时退还差额，硬杀则保守计费。
-同一进度连续两次未推进会停止，不无限重复过长 probe。达到限制需检查原因和预算，
+每次在断点检查及环境加载前预记尝试和整个 allocation 剩余时长。正常退出和可捕获的
+初始化失败按实际耗时结算；硬杀留下的未结算尝试在重入时按顺序核对，保守保留整段预算。
+读取断点期间被杀也会计数；首次 checkpoint 尚未产生不能无限重新初始化。
+同一已提交进度连续两次未推进会停止，不把 probe/market 阶段名变化当作推进。
+负责核对并阻断的后续 allocation 也会登记并结算自身的检查开销，但不启动训练。
+所有结果、计数和 scratch 清理先于主动 requeue，避免重排队杀掉旧 batch 后遗失结算。
+达到限制需检查原因和预算，
 再显式调整配置；不删除 `allocation_state.json` 清零。
 `--requeue` 只是允许调度器重排，主动续跑由包装显式执行 `scontrol requeue`，不另发新作业。
 
@@ -224,9 +236,19 @@ bash scripts/icf/submit.sh "/home/$USER/facdigger/configs/resources.env"
 
 `FD_RUN_DIR/manifest.json` 是训练状态，matrix 另有 `matrix.json`/`folds.json`；
 `checkpoints/last.pt` 是恢复权威，最佳导出用于候选模型。
-`allocations/<job-id>-<attempt>/` 保存环境、实际 runtime 和 staging 清单；
+`allocations/<job-id>-<attempt>/` 保存环境和 staging 清单，以及：
+
+- `runtime.json`、`step.json`：启动前预算、截止时间和本次固定输入；
+- `step_runtime.json`、`step_started.json`：扣除启动时间后的实际 runtime 与启动耗时；
+- `result.json`：退出/中断/阻断结果、错误阶段、预算结算和前后已提交进度。
+
 `allocation_state.json` 保存受限重试计数，Slurm 日志在 `FD_LOG_ROOT`。
 JobID 不作为研究身份，多个作业可继续同一个 `FD_RUN_DIR`。
+
+单模型/子 run 的 `progress.jsonl` 提供阶段耗时、进度、保存大小及当前/峰值内存；
+矩阵根目录另记录 comparison。监控按 attempt 区分重启，按 `checkpoint_saved` 查看提交
+时间；不能把中途进度当成可恢复断点，也不能累加所有嵌套阶段的耗时。
+指标口径及仍需的真实 GPU 验收见[通用方案第 12 节](../../../docs/训练可靠性与独立部署方案.md)。
 
 完整矩阵结束后，生成独立健康报告，输出放在研究 run 外：
 
