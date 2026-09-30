@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,22 +39,12 @@ from facdigger.training.resources import (
     TrainingResourceBudget,
     cgroup_memory_limit,
     effective_resource_limits,
+    process_peak_rss_bytes,
     training_hardware,
 )
 
 RTX_2070S_RESERVED_MEMORY_LIMIT_BYTES = int(7.2 * 1024**3)
 HOST_MEMORY_LIMIT_BYTES = 13 * 1024**3
-
-
-def _process_peak_rss_bytes() -> int | None:
-    """Return the current process high-water RSS on Unix/WSL."""
-
-    try:
-        import resource
-    except ImportError:  # pragma: no cover - native Windows is not the target runtime
-        return None
-    peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    return peak if sys.platform == "darwin" else peak * 1024
 
 
 def run_finance_training_benchmark(
@@ -154,7 +143,7 @@ def run_finance_training_benchmark(
     )
     projected_hours = raw_hours * 1.1
     projected_days = projected_hours / 24.0
-    host_peak_rss_bytes = _process_peak_rss_bytes()
+    host_peak_rss_bytes = process_peak_rss_bytes()
     cuda_peak_reserved_bytes = max(
         int(supervised["cuda_peak_reserved_bytes"] or 0),
         int(pretraining["cuda_peak_reserved_bytes"] or 0),

@@ -43,6 +43,18 @@ def test_pause_resume_and_completed_reentry_keep_run_identity(
     assert completed["run_id"] == manifest["run_id"]
     assert completed["config_hash"] == manifest["config_hash"]
     assert len(completed["attempts"]) == 2
+    events = [json.loads(line) for line in (run / "progress.jsonl").read_text().splitlines()]
+    completed_phases = {event["phase"] for event in events if event["event"] == "phase_completed"}
+    assert {
+        "input_validation",
+        "data_loading",
+        "checkpoint_restore",
+        "final_prediction",
+        "final_evaluation",
+        "artifact_write",
+    } <= completed_phases
+    assert {event["attempt"] for event in events} == {1, 2}
+    progress_bytes = (run / "progress.jsonl").read_bytes()
     monkeypatch.setattr(
         "facdigger.training.finance_transformer.train_finance_transformer",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retrain")),
@@ -50,6 +62,7 @@ def test_pause_resume_and_completed_reentry_keep_run_identity(
     again = runner.invoke(app, args)
     assert again.exit_code == 0, again.output
     assert (run / "manifest.json").read_bytes() == completed_bytes
+    assert (run / "progress.jsonl").read_bytes() == progress_bytes
 
 
 def test_final_prediction_interruption_does_not_repeat_training(

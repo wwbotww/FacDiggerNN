@@ -256,3 +256,30 @@ def test_skipped_amp_update_consumes_cursor_but_not_scheduler_step(tmp_path, mon
     assert checkpoint["progress"]["amp_skipped_optimizer_steps"] == 1
     resumed, _ = _run("supervised", path, resume=path / "last.pt")
     _equal(full.state_dict(), resumed.state_dict())
+
+
+@pytest.mark.parametrize("kind", ["supervised", "pretrain"])
+def test_phase_observation_preserves_training_and_reports_committed_saves(tmp_path, kind):
+    baseline = tmp_path / "baseline"
+    observed = tmp_path / "observed"
+    _run(kind, baseline)
+    events = []
+    _run(kind, observed, callback=events.append)
+    phases = {event["phase"] for event in events if event["event"] == "phase_completed"}
+    assert {"engine_setup", "checkpoint_save", "best_export"} <= phases
+    assert (
+        {"train", "selection"} if kind == "supervised" else {"local", "market", "probe"}
+    ) <= phases
+    saves = [event for event in events if event["event"] == "checkpoint_saved"]
+    assert saves and all(event["checkpoint_bytes"] > 0 for event in saves)
+    assert all(event["save_seconds"] >= 0 for event in saves)
+    _equal(
+        torch.load(baseline / "last.pt", weights_only=False),
+        torch.load(observed / "last.pt", weights_only=False),
+    )
+    restored = []
+    _run(kind, observed, resume=observed / "last.pt", callback=restored.append)
+    assert any(
+        event["event"] == "phase_completed" and event["phase"] == "checkpoint_restore"
+        for event in restored
+    )

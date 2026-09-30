@@ -17,6 +17,7 @@ from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
 from facdigger.environment import collect_environment
 from facdigger.experiments.manifest import collect_git_state, sha256_json
+from facdigger.training.progress import TrainingProgress, append_progress
 from facdigger.training.runtime import (
     TrainingControl,
     TrainingPaused,
@@ -106,12 +107,19 @@ def training_run(
                     raise FileNotFoundError("existing run has weights but no committed last.pt")
         elif resume is not None or (root / "checkpoints").exists():
             raise FileNotFoundError("checkpoint has no bound run manifest")
-        dataset = resolve_dataset(
-            Path(dataset_dir),
-            control.config,
-            dataset_id=str(previous["dataset_id"]) if previous else None,
-            manifest_hash=previous["dataset_manifest_hash"] if previous else None,
+        attempt = len(previous.get("attempts", [])) + 1 if previous else 1
+        observation = TrainingProgress(
+            None
+            if previous and previous.get("status") == "complete"
+            else lambda event: append_progress(root / "progress.jsonl", event, attempt=attempt)
         )
+        with observation.phase("input_validation"):
+            dataset = resolve_dataset(
+                Path(dataset_dir),
+                control.config,
+                dataset_id=str(previous["dataset_id"]) if previous else None,
+                manifest_hash=previous["dataset_manifest_hash"] if previous else None,
+            )
         dataset_manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
         if previous is not None and previous.get("status") == "complete":
             verify_completed_artifacts(root, previous)

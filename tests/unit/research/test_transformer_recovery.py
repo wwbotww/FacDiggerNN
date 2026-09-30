@@ -111,3 +111,24 @@ def test_legacy_ambiguous_runs_never_choose_latest(tmp_path):
             control=TrainingControl(),
             trainer=lambda *a, **k: pytest.fail("must reject"),
         )
+
+
+def test_external_control_is_not_restarted_for_the_matrix(tmp_path, monkeypatch):
+    from facdigger.research import transformer_runner
+    from facdigger.training.runtime import TrainingControl, TrainingRuntimeConfig
+
+    control = TrainingControl(TrainingRuntimeConfig(max_walltime_seconds=200))
+    calls = []
+
+    def run(config, **kwargs):
+        calls.append(kwargs["control"])
+        return tmp_path / "run", {}
+
+    monkeypatch.setattr(transformer_runner, "_run_transformer_comparison", run)
+    transformer_runner.run_transformer_comparison(
+        object(),
+        repository_root=tmp_path,
+        run_dir=tmp_path / "run",
+        control=control,
+    )
+    assert calls == [control]
