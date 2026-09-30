@@ -465,8 +465,9 @@ runtime 仍指向示例，资源仍为示例 2 CPU / 20G / 4h；不能直接当�
 
 **11.2 配置候选与总预算**
 
-下表是待演练配置，不是已部署值；先用相同设备/环境测量完整生命周期，再做
-`sbatch --test-only`。12 小时低于分区上限，不表示不会排队或抢占。
+下表针对后续九阶段矩阵的候选配置；单模型现场验收实际使用的独立配置见 11.5。
+先用相同设备/环境测量完整生命周期，再做 `sbatch --test-only`。12 小时低于分区上限，
+不表示不会排队或抢占。
 
 | 字段或资产 | 候选值 | 依据与条件 |
 |---|---|---|
@@ -538,7 +539,78 @@ scratch 清理全部完成后才请求 requeue，避免新一轮先启动而旧�
 矩阵、锁冲突、阶段名伪推进、慢启动/启动耗尽预算及提交器预警生成。它们证明本地行为，
 不替代学校 Slurm、GPU、Lustre 和跨节点验收。
 
-仍待完成：固定新部署代码/环境并核验；真实最大 fold 完整阶段测量；实际预警、抢占、
-requeue、跨节点恢复及至少 24 小时观察；配额/空间阈值和正式 12h/尝试次数配置。
+上述代码提交时仍待现场完成：固定新部署代码/环境并核验；真实最大 fold 完整阶段测量；
+实际预警、抢占、requeue、跨节点恢复及至少 24 小时观察；配额/空间阈值和正式 12h/尝试次数配置。
 源码/环境及生命周期证据的学校启动预检仍待进一步落实，不把当前 `admitted` 报告解释为
-全部放行。本次未更新学校服务器 checkout，未提交新作业或修改生产部署。
+全部放行。上述代码实施时未更新学校服务器 checkout 或提交作业；后续现场验证见 11.5。
+
+**11.5 固定版本与真实验证（2026-09-30 起）**
+
+学校训练 checkout 已固定为干净的 detached commit
+`e1657541e3f69a530c83e691664c9c7e88c152b8`，包含通用观测提交 `d58c3f1` 和学校包装提交
+`e165754`。固定前核对无活动作业，未更换 venv 或升级依赖；`uv.lock` 的 SHA-256 仍为
+`292de5a1c7e6ca2f0d26f0dc7f778b975fe6f2b2a8ab51a1b13d906491cb9a5e`。Python 为 3.12.3，
+已安装发行包清单与旧部署一致。torch 的发行包 metadata 为 `2.13.0`，CUDA 构建版本需与
+计算节点运行报告一起理解，不能因其不带 `+cu130` 就判定依赖漂移。
+
+部署记录位于学校 `/home/s2977852/facdigger/evidence/validation-e165754/deployment.json`，
+绑定提交、锁文件、全部已安装包、原预训练配置、wf3 快照及原 GPU benchmark。沿用最大 fold
+`3eb091ebcb41446b7388da94f3f86e29d629326c76f99527985aa50f2dbf7101` 和原外置全文件清单；
+单模型 runtime 显式设置 `dataset_overrides`，训练入口逐文件核验持久输入。没有重建或缩小
+数据，原 context 512、batch 32、三 epoch 上限及固定 probe 协议均保留。
+
+本轮独立输出为 `/home/s2977852/facdigger/artifacts/lifecycle-e165754/wf3-pretrain`，
+学校配置放在 `/home/s2977852/facdigger/configs/validation-e165754/`。短演练只改变 runtime
+时限、checkpoint 间隔和调度次数；后续延长 allocation 仍认领同一个 run，不删除计数或断点。
+资源继续使用 H200 `1g.18gb` × 1、4 CPU、32G，首轮直接读取 Lustre。
+
+已完成的现场检查：
+
+| 检查 | 作业及结果 | 证明范围 |
+|---|---|---|
+| 全量数据、完整包装、真实 USR1 | `3666709` 在 360 次成功更新后提交 `paused`，step/batch 退出 75；`no_progress=0`，正常结算 887 秒 | 对训练 step 显式执行 `scancel --signal=USR1`；证明信号到安全边界、断点及包装结算，不冒充自然时限预警或抢占 |
+| 新版本 CUDA/FP16 连续与恢复对照 | `3666710`，七项通过，Slurm `COMPLETED / 0:0`，用时 1 分 32 秒 | 复用原小型 fixture，在 train/selection/local/market/probe 和两类训练器 USR1 路径比较 model、optimizer、scheduler、scaler、RNG、history、best；tensor 的 `rtol=atol=0`，不是最大 fold 的整套连续对照 |
+| 初始化连续中断后的有限停止 | 独立 CPU 作业 `3666722`、`3666723` 在环境初始化登记后由 `scancel --signal=KILL --full` 取消，留下未结算 attempt；`3666724` 按预期阻断 | 三次尝试后 `no_progress=2`，没有启动训练、没有初始 checkpoint；前两次预算保守保留，累计 1200 秒；不占第二个 GPU，不与模型进程的内核 SIGKILL 混淆 |
+| 手动续跑及真实自动 requeue | `3666726` 从 360 步续跑至 1382 步，因 `walltime_budget` 退出 75；同一 JobID 的 `Restarts=1`，第 3 次 allocation 再从 1382 步恢复并保存新进度 | `result.json` 和预算先落盘再 requeue；调度等待约两分钟，尝试数不清零，同一 run 保持单写者；现场记录为 `requeue_acceptance.json` |
+| 计算节点直接 SIGKILL 后恢复 | `3666740` 的训练 PID 和包装 PID 经 UID、命令、作业号及 run 路径核验后直接被内核 SIGKILL；`3666742` 认领原 run，从 1733 步恢复并继续更新 | 被杀时 manifest 仍为 running，旧 attempt 未结算；新作业将其标为 interrupted，保留 1799 秒预记预算，`no_progress=0`。详见 `kernel_kill_delivery.json`、`kernel_kill_observation.json` 与恢复后的断点核验 |
+
+对应记录分别为 `evidence/validation-e165754/manual_acceptance.json`、
+`evidence/gpu-acceptance-3666710/acceptance.json` 和
+`evidence/validation-e165754/no_progress_acceptance.json`（均相对于学校部署根目录）。
+Slurm 将预期暂停显示为 `FAILED / 75:0`，初始化阻断显示为 `FAILED / 1:0`；必须结合
+验收目的、manifest 和 allocation result 判断，不能仅按 Slurm 状态字符串定性。
+
+现场另确认：对 `3666726` 执行 `scancel --signal=KILL --full` 时，Slurm 仍让训练 step
+先收到 SIGTERM 并额外保存至 1683 步。因此 `hard_kill_*` 文件只记录这次取消及未结算包装，
+不能充当模型无收尾死亡的证据；后续 `kernel_kill_*` 才覆盖直接 SIGKILL。真正被杀前日志
+已经观察到 1800 步，但完整 checkpoint 只有 1733 步。恢复重放第 1800 步的损失与旧日志
+完全一致，记录在 `replayed_update.json`；这是一个真实数据抽查点，不是整套大模型状态对照。
+
+随后 CPU 作业 `3666755` 在学校计算节点就地读取两份 checkpoint，验证通过并以 `0:0`
+完成：恢复后已持久化到 4377 步，输入 ID、协议哈希及 checkpoint 契约保持一致，模型参数
+确实更新；188 个模型张量和 378 个优化器张量全部有限，AMP 跳步数为 0。读取与哈希使用
+同一个文件描述符，保证训练原子替换文件时检查的是同一代已提交状态；全程未初始化 CUDA，
+模型载荷保留在学校。完整结果为 `evidence/validation-e165754/checkpoint_validation.json`，
+该新断点约 21.04 MB，保存用时 1.68 秒。
+
+首个真实 attempt 已测得：训练 step 启动 131.06 秒，已从 1200 秒 runtime 上限扣除；
+完整输入校验 26.18 秒、数据加载 66.30 秒、模型初始化 4.83 秒。空优化器断点约 8.25 MB，
+有优化器状态的断点约 20.63 MB，四次保存耗时为 59.28、48.99、1.62、52.10 秒，尚无 best
+副本及 epoch 末 audit。首次完整更新最大 48.28 秒；这些数据支持继续使用 300 秒余量测量，
+不能把最快保存或 steady-state 更新均值视为最坏边界。训练进程峰值 RSS 约 6.59 GiB，
+继续保留 32G 请求，完整 probe 与 epoch 末峰值仍未测完。
+
+长验证作业 `3666742` 使用 `configs/validation-e165754/long-after-kernel.env`（相对于学校
+部署根目录）：每段 12h，checkpoint 600s、退出余量及 USR1 提前量 300s，允许已验收的
+自动 requeue；总尝试上限 8 次、累计预算 172800 秒（48h）、连续无进展上限 2 次。
+这些计数包含此前四次演练，不删除历史重新计数；当前为第 5 次 allocation。未结算作业
+按整段剩余时间预记，故 `charged_seconds` 含当前预留，并非已实际运行的时长。保留
+20 GiB 输出可用空间门槛；最大 checkpoint、best 副本和完整阶段所需空间仍须实测。
+该配置只验收一个完整预训练 run，后续九阶段矩阵的预算继续按 11.2 单独评估。
+
+截至本次记录，长作业仍在第一个 epoch 的 local 阶段。现场证据与作业结果在本节持续更新；
+只有完整阶段结束后才能确认 probe 时长、epoch 末内存及 checkpoint 峰值。完整单模型、
+监督 selection/最终输出、至少 24 小时观察、自然时限预警、实际调度抢占、跨节点 GPU 恢复、
+真实写盘期间突杀及独立故障域备份仍待验收；九阶段矩阵和 holdout 均未启动，生产未修改。
+学校源码/环境绑定目前由部署记录及提交前核验保证，通用训练入口仍仅留档，不强制拒绝全部
+环境漂移。运行期间保持 checkout、venv 和已绑定实验配置不变。
