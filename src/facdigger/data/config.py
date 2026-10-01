@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 DEFAULT_CHANNELS = [
     "r_close",
@@ -114,6 +114,32 @@ class SplitConfig(StrictModel):
         return self
 
 
+class FinanceSelectionConfig(StrictModel):
+    """Frozen inner selection shared by every Finance training entry point."""
+
+    supervised_selection_fraction: float = Field(default=0.15, gt=0, lt=0.5)
+    probe_fit_dates: int = Field(default=60, ge=2, strict=True)
+    probe_selection_dates: int = Field(default=20, ge=2, strict=True)
+    future_horizon: Literal[5] = 5
+
+    def validate_expectations(self, **expectations: object) -> None:
+        """Experiment declarations are assertions, never another plan source."""
+        from facdigger.data.contracts import DataContractError
+
+        actual = self.model_dump(mode="json")
+        unknown = sorted(set(expectations) - set(actual))
+        if unknown:
+            raise DataContractError(f"Unknown Finance selection expectations: {unknown}")
+        mismatched = sorted(
+            field for field, expected in expectations.items() if actual[field] != expected
+        )
+        if mismatched:
+            raise DataContractError(
+                f"Finance selection experiment differs from snapshot plan: {mismatched}; "
+                "align configurations and rebuild the snapshot"
+            )
+
+
 class DatasetBuildConfig(StrictModel):
     dataset_name: str = "us_equities_daily_v1"
     sources: ParquetSourceConfig
@@ -121,6 +147,34 @@ class DatasetBuildConfig(StrictModel):
     features: FeatureSetConfig = Field(default_factory=FeatureSetConfig)
     label: LabelConfig = Field(default_factory=LabelConfig)
     split: SplitConfig
+    finance_selection: FinanceSelectionConfig | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_existing_fields(self, handler: Any) -> dict[str, Any]:
+        # Full config dumps also enter older M6 protocol hashes. Omit only the
+        # absent new field, preserving every existing explicit None elsewhere.
+        payload = handler(self)
+        if self.finance_selection is None:
+            payload.pop("finance_selection", None)
+        return payload
+
+    @model_validator(mode="after")
+    def validate_finance_selection(self) -> DatasetBuildConfig:
+        if self.finance_selection is not None and (
+            self.features.name != "finance_transformer"
+            or self.label.horizon != 5
+            or self.label.all_horizons != [1, 5, 20]
+        ):
+            raise ValueError("finance_selection requires Finance features and 1/5/20 labels")
+        return self
+
+
+def semantic_dataset_config(config: DatasetBuildConfig) -> dict[str, Any]:
+    """Preserve existing identities when no Finance selection plan is enabled."""
+    semantic = config.model_dump(mode="json", exclude={"sources", "output_root"})
+    if semantic.get("finance_selection") is None:
+        semantic.pop("finance_selection", None)
+    return semantic
 
 
 class InferenceSnapshotConfig(StrictModel):

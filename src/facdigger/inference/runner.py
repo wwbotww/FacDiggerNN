@@ -16,6 +16,7 @@ import polars as pl
 from facdigger.data.contracts import DataContractError
 from facdigger.data.paths import artifact_path
 from facdigger.data.snapshots import sha256_file
+from facdigger.datasets.index import align_labelled_samples
 from facdigger.environment import collect_environment
 from facdigger.evaluation.contracts import prediction_coverage
 from facdigger.evaluation.metrics import evaluate_predictions
@@ -43,6 +44,7 @@ from facdigger.models.baselines import (
 from facdigger.training.common import (
     apply_source_readiness_gate,
     build_prediction_frame,
+    load_snapshot_inference_rows,
     load_source_provenance,
     load_training_snapshot,
 )
@@ -161,16 +163,40 @@ def _predict_factor_model(
         context_length=int(dataset_manifest["config"]["features"]["context_length"]),
         device=device_preference,
     )
-    # Research eligibility and split selection remain outside the label-free scorer.
-    score_index = rows.select(
-        "sample_id", "security_id", "symbol", "asof_date", "feature_start", "feature_end"
-    ).with_columns(pl.lit(True).alias("eligible"))
+    # Historical runs retain their recorded sample-index computation. New Finance
+    # runs score every eligible token on these dates before projecting to labels.
+    protocol = manifest.get("data_protocol")
+    if manifest["model_type"] == "finance_patch_transformer" and "data_protocol" in manifest:
+        if (
+            not isinstance(protocol, dict)
+            or protocol.get("computational_universe") != "target_free_inference_index"
+        ):
+            raise DataContractError("unknown Finance replay computational universe")
+        score_index = load_snapshot_inference_rows(
+            dataset_path, dataset_manifest,
+            asof_dates=rows["asof_date"].unique().sort().to_list(),
+        )
+    else:
+        score_index = rows.select(
+            "sample_id", "security_id", "symbol", "asof_date", "feature_start", "feature_end"
+        ).with_columns(pl.lit(True).alias("eligible"))
+    aligned = align_labelled_samples(score_index, rows)
     scores = backend.predict(dataset_path, dataset_manifest, score_index)
+    audit = backend.audit
+    if manifest["model_type"] == "finance_patch_transformer":
+        if audit.get("checkpoint_contract") != "finance_patch_transformer_checkpoint":
+            raise DataContractError("unknown Finance replay checkpoint contract")
+        manifest_has_protocol = "data_protocol" in manifest
+        checkpoint_has_protocol = "checkpoint_data_protocol" in audit
+        if manifest_has_protocol != checkpoint_has_protocol or (
+            manifest_has_protocol and protocol != audit["checkpoint_data_protocol"]
+        ):
+            raise DataContractError("Finance replay manifest/checkpoint data protocols differ")
     if not scores.select("security_id", "asof_date").equals(
-        rows.select("security_id", "asof_date")
+        score_index.select("security_id", "asof_date")
     ):
-        raise DataContractError("replayed model score keys differ from source sample index")
-    return scores["score"].to_numpy(), rows, backend.audit
+        raise DataContractError("replayed model score keys differ from computational index")
+    return scores["score"].to_numpy()[aligned["_computational_row"].to_numpy()], rows, audit
 
 
 def _verify_replay(

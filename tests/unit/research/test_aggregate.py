@@ -190,3 +190,75 @@ def test_positive_but_noisy_e3_mean_does_not_unlock_holdout(tmp_path) -> None:
     assert any(
         "not significant" in reason for reason in result["decisions"]["overall_e3"]["reasons"]
     )
+
+
+@pytest.mark.parametrize(
+    ("positive_count", "fraction", "active_folds", "required_count"),
+    [
+        (6, {"numerator": 2, "denominator": 3}, None, 6),
+        (5, {"numerator": 2, "denominator": 3}, None, 6),
+        (6, {"numerator": 7, "denominator": 10}, None, 7),
+        (2, {"numerator": 2, "denominator": 3}, ["fold-0"], 2),
+        (1, {"numerator": 2, "denominator": 3}, ["fold-0"], 2),
+    ],
+)
+def test_exact_positive_cell_counts_control_both_attribution_and_overall(
+    tmp_path, positive_count, fraction, active_folds, required_count
+) -> None:
+    payload = _config(tmp_path).model_dump(mode="json")
+    payload["decisions"]["minimum_positive_cell_ratio"] = fraction
+    config = M6ResearchConfig.model_validate(payload)
+    cells = _matrix(tmp_path)
+    if active_folds is not None:
+        cells = [cell for cell in cells if cell["fold_id"] in active_folds]
+    keys = sorted({(cell["seed"], cell["fold_id"]) for cell in cells})
+    positive_keys = set(keys[:positive_count])
+    for cell in cells:
+        if cell["model_key"] not in {"e1", "e3"}:
+            continue
+        path = Path(cell["run_dir"]) / "metrics.json"
+        metrics = json.loads(path.read_text())
+        delta = 0.02 if (cell["seed"], cell["fold_id"]) in positive_keys else -0.001
+        value = 0.005 + delta * (1 if cell["model_key"] == "e1" else 2)
+        for row, factor in zip(
+            metrics["metrics"]["raw"]["daily_ic"], [0.7, 1.1, 0.9, 1.3, 0.8, 1.2], strict=True
+        ):
+            row.update({"ic": value * factor, "rank_ic": value * factor})
+        path.write_text(json.dumps(metrics))
+
+    result = aggregate_research_runs(cells, config, evaluation_split="valid", fold_ids=active_folds)
+    attribution = result["decisions"]["architecture_e1_vs_e0"]
+    overall = result["decisions"]["overall_e3"]
+    expected = positive_count >= required_count
+
+    assert attribution["positive_cell_count"] == positive_count
+    assert attribution["required_positive_cell_count"] == required_count
+    assert overall["e3_vs_e1_positive_cell_count"] == positive_count
+    assert overall["required_positive_cell_count"] == required_count
+    assert attribution["minimum_positive_cell_fraction"] == fraction
+    assert (not any("cell ratio" in reason for reason in attribution["reasons"])) == expected
+    assert (not any("enough fold/seed" in reason for reason in overall["reasons"])) == expected
+
+
+def test_exact_ratio_boundary_does_not_override_failed_hac_significance(tmp_path) -> None:
+    from facdigger.research.aggregate import _paired_decision
+    from facdigger.research.statistics import panel_mean_inference
+
+    config = _config(tmp_path)
+    result = _paired_decision(
+        config,
+        {
+            "cell_count": 9,
+            "positive_cell_count": 6,
+            "positive_cell_ratio": 6 / 9,
+            "daily_seed_averaged_inference": panel_mean_inference(
+                [[0.01, 0.02, 0.03, 0.02, 0.01, 0.03]] * 3,
+                hac_lags=1, stride=2, offset=0,
+            ),
+        },
+        significance={"rejected": False},
+        source_gate_failed=False,
+    )
+
+    assert result["status"] == "no_go"
+    assert result["reasons"] == ["paired one-sided HAC test does not pass Holm correction"]

@@ -5,9 +5,13 @@ from datetime import date, timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 import torch
 
-from facdigger.datasets.window import FinanceTransformerWindowDataset
+from facdigger.datasets.window import (
+    FinanceTransformerInferenceWindowDataset,
+    FinanceTransformerWindowDataset,
+)
 from facdigger.models.finance_patch_transformer import FinancePatchTransformer
 from facdigger.training.finance_transformer_engine import (
     _multi_horizon_loss,
@@ -123,16 +127,30 @@ def _batch(dataset: FinanceTransformerWindowDataset) -> dict[str, torch.Tensor]:
     }
 
 
-def test_embedding_replay_matches_single_graph_parameter_gradients() -> None:
-    dataset = _dataset()
+@pytest.mark.parametrize("unlabelled", [0, 2])
+def test_embedding_replay_matches_single_graph_parameter_gradients(unlabelled: int) -> None:
+    torch.manual_seed(42)
+    source = _dataset()
+    dataset = FinanceTransformerInferenceWindowDataset(
+        feature_store=source.feature_store, market_store=source.market_store,
+        inference_index=source.sample_rows.drop(
+            "split", "target", "target_1", "target_5", "target_20"
+        ),
+        channels=source.channels, market_channels=list(source.market_channels),
+        context_length=source.context_length, primary_horizon=source.primary_horizon,
+    )
+    labelled_count = len(dataset) - unlabelled
+    label_mask = torch.arange(len(dataset)) < labelled_count
+    row_to_label = torch.arange(len(dataset))
+    row_to_label[~label_mask] = -1
     reference = _model().train()
     replayed = copy.deepcopy(reference).train()
     batch = _batch(dataset)
     target_ranks = torch.stack(
         [
-            torch.linspace(-1.0, 1.0, len(dataset)),
-            torch.linspace(-0.9, 0.9, len(dataset)),
-            torch.linspace(-0.8, 0.8, len(dataset)),
+            torch.linspace(-1.0, 1.0, labelled_count),
+            torch.linspace(-0.9, 0.9, labelled_count),
+            torch.linspace(-0.8, 0.8, labelled_count),
         ],
         dim=1,
     )
@@ -152,9 +170,11 @@ def test_embedding_replay_matches_single_graph_parameter_gradients() -> None:
         for start in range(0, len(dataset), 2)
     ]
     market_embedding = reference.encode_market(market_values, market_observed)
-    output = reference.score_date(torch.cat(local_embeddings), market_embedding)
-    loss, _ = _multi_horizon_loss(
-        output.scores,
+    local_all = torch.cat(local_embeddings)
+    local_all.retain_grad()
+    output = reference.score_date(local_all, market_embedding)
+    loss, expected_audit = _multi_horizon_loss(
+        output.scores[label_mask],
         target_ranks,
         horizons=(1, 5, 20),
         horizon_weights={1: 0.2, 5: 0.6, 20: 0.2},
@@ -163,12 +183,16 @@ def test_embedding_replay_matches_single_graph_parameter_gradients() -> None:
     )
     loss.backward()
 
-    backward_complete_date_with_embedding_replay(
+    if unlabelled:
+        assert local_all.grad[~label_mask].abs().max().item() > 0
+
+    audit = backward_complete_date_with_embedding_replay(
         replayed,
         dataset,
         batch,
         device="cpu",
         target_rank_lookup=target_ranks,
+        row_to_label_index=row_to_label,
         horizon_weights={1: 0.2, 5: 0.6, 20: 0.2},
         epsilon=1e-6,
         scale_regularization=0.01,
@@ -180,6 +204,11 @@ def test_embedding_replay_matches_single_graph_parameter_gradients() -> None:
         absolute_tolerance=1e-6,
     )
 
+    assert audit["rows"] == len(dataset)
+    assert audit["labelled_rows"] == labelled_count
+    assert audit["unlabelled_rows"] == unlabelled
+    assert audit["loss"] == pytest.approx(expected_audit["loss"], abs=1e-6)
+    assert audit["scale_penalty"] == pytest.approx(expected_audit["scale_penalty"], abs=1e-6)
     replayed_parameters = dict(replayed.named_parameters())
     for name, parameter in reference.named_parameters():
         replayed_gradient = replayed_parameters[name].grad
@@ -193,3 +222,42 @@ def test_embedding_replay_matches_single_graph_parameter_gradients() -> None:
             atol=1e-4,
             msg=lambda message, name=name: f"{name}: {message}",
         )
+
+
+def test_missing_label_does_not_change_computational_forward(tmp_path) -> None:
+    from facdigger.datasets.index import align_labelled_samples
+    from facdigger.models.finance_scoring import predict_finance_transformer
+    from facdigger.training.common import load_snapshot_inference_rows
+
+    torch.manual_seed(42)
+    source = _dataset()
+    inference = source.sample_rows.drop(
+        "split", "target", "target_1", "target_5", "target_20"
+    ).with_columns(pl.lit(True).alias("eligible"))
+    inference.write_parquet(tmp_path / "inference.parquet")
+    manifest = {"artifacts": {"inference_index": "inference.parquet"}}
+    labels = source.sample_rows
+    missing_one_label = labels.filter(pl.col("security_id") != "S3")
+
+    def windows(labelled):
+        pool = load_snapshot_inference_rows(
+            tmp_path, manifest, asof_dates=labelled["asof_date"].unique().to_list()
+        )
+        return FinanceTransformerInferenceWindowDataset(
+            feature_store=source.feature_store, market_store=source.market_store,
+            inference_index=pool, channels=source.channels,
+            market_channels=list(source.market_channels), context_length=32, primary_horizon=5,
+        )
+
+    full = windows(labels)
+    changed = windows(missing_one_label)
+    assert full.sample_rows.equals(changed.sample_rows)
+    model = _model().eval()
+    kwargs = {"batch_size": 2, "device": "cpu", "precision": "fp32", "num_workers": 0}
+    expected = predict_finance_transformer(model, full, **kwargs)
+    actual = predict_finance_transformer(model, changed, **kwargs)
+    np.testing.assert_array_equal(actual, expected)
+    projection = align_labelled_samples(changed.sample_rows, missing_one_label)
+    np.testing.assert_array_equal(
+        actual[projection["_computational_row"].to_numpy()], np.delete(expected, 3)
+    )

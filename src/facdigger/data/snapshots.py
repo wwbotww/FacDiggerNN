@@ -6,7 +6,7 @@ import hashlib
 import json
 import shutil
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +15,17 @@ import polars as pl
 from facdigger.data.adapters import StandardParquetAdapter
 from facdigger.data.config import (
     DatasetBuildConfig,
+    semantic_dataset_config,
 )
 from facdigger.datasets.index import (
     build_finance_pretraining_index,
     build_inference_index,
     build_sample_index,
 )
-from facdigger.datasets.splits import assign_chronological_splits
+from facdigger.datasets.splits import (
+    assign_chronological_splits,
+    build_finance_selection_indices,
+)
 from facdigger.experiments.manifest import sha256_json
 from facdigger.features.pipeline import (
     apply_feature_scaler,
@@ -96,9 +100,8 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
     adapter = StandardParquetAdapter(config.sources)
     bundle = adapter.load()
     input_hashes = _source_hashes(config)
-    semantic_config = config.model_dump(mode="json")
-    source_paths = semantic_config.pop("sources")
-    semantic_config.pop("output_root")
+    semantic_config = semantic_dataset_config(config)
+    source_paths = config.sources.model_dump(mode="json")
     identity = {
         # Finance v5 retains market sessions with no eligible securities. A new
         # content identity prevents reusing an immutable v4 compressed calendar.
@@ -127,16 +130,6 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
         raw_features, raw_market_features = build_raw_feature_tables(
             bars, universe, feature_set=config.features.name
         )
-        scaler = fit_feature_scaler(
-            raw_features,
-            raw_market_features,
-            channels=config.features.channels,
-            train_end=config.split.train_end,
-            winsor_lower=config.features.winsor_lower,
-            winsor_upper=config.features.winsor_upper,
-        )
-        features, market_features = apply_feature_scaler(raw_features, raw_market_features, scaler)
-        del raw_features, raw_market_features
 
         if config.label.auxiliary_horizons:
             labels = build_multi_horizon_excess_return_labels(
@@ -181,7 +174,7 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
             else ["target"]
         )
         sample_index = build_sample_index(
-            features,
+            raw_features,
             labels,
             universe,
             context_length=config.features.context_length,
@@ -200,6 +193,31 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
         }
         labels.write_parquet(temporary_dir / "labels.parquet")
         del labels
+
+        selection_plan: dict[str, Any] | None = None
+        scaler_fit_end = config.split.train_end
+        if config.finance_selection is not None:
+            assert raw_market_features is not None
+            _, _, selection_plan = build_finance_selection_indices(
+                sample_index,
+                raw_market_features["trade_date"].unique().sort().to_list(),
+                config.finance_selection,
+            )
+            scaler_fit_end = date.fromisoformat(selection_plan["a_end"])
+            (temporary_dir / "finance_selection_plan.json").write_text(
+                json.dumps(selection_plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        scaler = fit_feature_scaler(
+            raw_features,
+            raw_market_features,
+            channels=config.features.channels,
+            train_end=scaler_fit_end,
+            winsor_lower=config.features.winsor_lower,
+            winsor_upper=config.features.winsor_upper,
+        )
+        features, market_features = apply_feature_scaler(raw_features, raw_market_features, scaler)
+        del raw_features, raw_market_features
 
         sample_metadata = _build_sample_metadata(sample_index, universe)
         sample_metadata.write_parquet(temporary_dir / "sample_metadata.parquet")
@@ -229,8 +247,10 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
                 features,
                 universe,
                 context_length=config.features.context_length,
-                future_horizon=5,
-                train_end=config.split.train_end,
+                future_horizon=(
+                    config.finance_selection.future_horizon if config.finance_selection else 5
+                ),
+                train_end=scaler_fit_end,
             )
             pretraining_index_audit = {
                 "rows": pretraining_index.height,
@@ -299,6 +319,9 @@ def build_dataset_snapshot(config: DatasetBuildConfig) -> tuple[Path, dict[str, 
                 ),
             },
         }
+        if selection_plan is not None:
+            manifest["artifacts"]["finance_selection_plan"] = "finance_selection_plan.json"
+            audit["finance_selection"] = selection_plan
         (temporary_dir / "audit.json").write_text(
             json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

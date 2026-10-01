@@ -254,12 +254,13 @@ def _paired_delta(
         )
         fold_positive[fold_id] = sum(fold_cell_means) / len(fold_cell_means) > minimum_effect
     inference = _inference(config, fold_values, null_mean=minimum_effect)
+    positive_cell_count = sum(value > minimum_effect for value in cell_means.values())
     return {
         "left": left,
         "right": right,
         "cell_count": len(cell_means),
-        "positive_cell_ratio": sum(value > minimum_effect for value in cell_means.values())
-        / len(cell_means),
+        "positive_cell_count": positive_cell_count,
+        "positive_cell_ratio": positive_cell_count / len(cell_means),
         "positive_fold_ratio": sum(fold_positive.values()) / len(fold_positive),
         "cell_mean_deltas": cell_means,
         "fold_positive": fold_positive,
@@ -306,7 +307,8 @@ def _paired_decision(
         reasons.append("paired HAC inference is not estimable")
     elif not significance["rejected"]:
         reasons.append("paired one-sided HAC test does not pass Holm correction")
-    if delta["positive_cell_ratio"] < config.decisions.minimum_positive_cell_ratio:
+    minimum_ratio = config.decisions.minimum_positive_cell_ratio
+    if not minimum_ratio.is_satisfied_by(delta["positive_cell_count"], delta["cell_count"]):
         reasons.append("positive fold/seed cell ratio is below the configured threshold")
     non_overlapping_passed = _non_overlapping_passes(
         config,
@@ -324,7 +326,10 @@ def _paired_decision(
         "mean_delta": hac["mean"],
         "minimum_mean_rank_ic_delta": config.decisions.minimum_mean_rank_ic_delta,
         "positive_cell_ratio": delta["positive_cell_ratio"],
-        "minimum_positive_cell_ratio": config.decisions.minimum_positive_cell_ratio,
+        "positive_cell_count": delta["positive_cell_count"],
+        "required_positive_cell_count": minimum_ratio.required_count(delta["cell_count"]),
+        "minimum_positive_cell_ratio": minimum_ratio.numerator / minimum_ratio.denominator,
+        "minimum_positive_cell_fraction": minimum_ratio.model_dump(mode="json"),
         "significance": significance,
         "non_overlapping_passed": non_overlapping_passed,
     }
@@ -433,7 +438,10 @@ def aggregate_research_runs(
         overall_reasons.append(
             "E3 improvement over E1 is not significant in the one-sided HAC test"
         )
-    if overall_delta["positive_cell_ratio"] < config.decisions.minimum_positive_cell_ratio:
+    minimum_ratio = config.decisions.minimum_positive_cell_ratio
+    if not minimum_ratio.is_satisfied_by(
+        overall_delta["positive_cell_count"], overall_delta["cell_count"]
+    ):
         overall_reasons.append("E3 does not beat E1 in enough fold/seed cells")
     if not _non_overlapping_passes(
         config,
@@ -460,6 +468,9 @@ def aggregate_research_runs(
         "e3_vs_e1_mean_delta": delta_hac["mean"],
         "e3_vs_e1_p_value_one_sided": delta_hac["p_value_one_sided"],
         "e3_vs_e1_positive_cell_ratio": overall_delta["positive_cell_ratio"],
+        "e3_vs_e1_positive_cell_count": overall_delta["positive_cell_count"],
+        "required_positive_cell_count": minimum_ratio.required_count(overall_delta["cell_count"]),
+        "minimum_positive_cell_fraction": minimum_ratio.model_dump(mode="json"),
     }
     eligible = decisions["overall_e3"]["passed"]
     holdout_eligibility = {

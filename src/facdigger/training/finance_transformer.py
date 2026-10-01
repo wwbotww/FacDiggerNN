@@ -12,8 +12,9 @@ import polars as pl
 
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
+from facdigger.datasets.index import align_labelled_samples
 from facdigger.datasets.window import (
-    FinanceTransformerWindowDataset,
+    FinanceTransformerInferenceWindowDataset,
     MarketFeatureStore,
     SecurityFeatureStore,
 )
@@ -28,10 +29,11 @@ from facdigger.training.common import (
     build_prediction_frame,
     load_required_market_features,
     load_required_snapshot_features,
+    load_snapshot_inference_rows,
     load_source_provenance,
     load_training_snapshot,
-    split_supervised_training_index,
 )
+from facdigger.training.finance_data import finance_data_protocol, load_finance_selection
 from facdigger.training.finance_transformer_config import (
     FinanceTransformerExperimentConfig,
 )
@@ -67,6 +69,9 @@ def run_finance_transformer(
             repository_root=repository_root,
             model_type="finance_patch_transformer",
             control=session_control,
+            data_protocol_loader=lambda path, manifest: finance_data_protocol(
+                path, manifest, config
+            ),
             resume_from=resume_from,
             run_dir=run_dir,
         ) as run:
@@ -110,20 +115,23 @@ def _run_finance_transformer(
             raise DataContractError("primary horizon differs from the dataset snapshot")
         context_length = int(feature_config["context_length"])
 
-        protocol_index, selection_audit = split_supervised_training_index(
-            frames["sample_index"], selection_fraction=config.selection_fraction
+        protocol_index, _, selection_plan = load_finance_selection(
+            dataset_path, dataset_manifest, sample_index=frames["sample_index"]
         )
-        required_rows = pl.concat(
-            [
-                protocol_index.filter(
-                    pl.col("split").is_in(["train_fit", "inner_selection"])
-                ).select("security_id", "feature_start", "asof_date"),
-                frames["sample_index"]
-                .filter(pl.col("split") == config.evaluation_split)
-                .select("security_id", "feature_start", "asof_date"),
-            ],
-            how="vertical",
-        )
+        selection_audit = selection_plan["supervised"]
+        train_labelled_rows = protocol_index.filter(pl.col("split") == "train_fit")
+        selection_labelled_rows = protocol_index.filter(pl.col("split") == "inner_selection")
+        evaluation_labelled_rows = frames["sample_index"].filter(
+            pl.col("split") == config.evaluation_split
+        ).sort("asof_date", "security_id")
+        full_rows = [
+            load_snapshot_inference_rows(
+                dataset_path, dataset_manifest,
+                asof_dates=rows["asof_date"].unique().sort().to_list(),
+            )
+            for rows in (train_labelled_rows, selection_labelled_rows, evaluation_labelled_rows)
+        ]
+        required_rows = pl.concat(full_rows, how="vertical")
         feature_store = SecurityFeatureStore(
             features=load_required_snapshot_features(dataset_path, dataset_manifest, required_rows),
             channels=config.channels,
@@ -134,22 +142,25 @@ def _run_finance_transformer(
             channels=config.market_channels,
         )
 
-        def dataset(index: pl.DataFrame, split: str) -> FinanceTransformerWindowDataset:
-            return FinanceTransformerWindowDataset(
+        def dataset(index: pl.DataFrame) -> FinanceTransformerInferenceWindowDataset:
+            return FinanceTransformerInferenceWindowDataset(
                 feature_store=feature_store,
                 market_store=market_store,
-                sample_index=index,
+                inference_index=index,
                 channels=config.channels,
                 market_channels=config.market_channels,
                 context_length=context_length,
-                split=split,
-                horizons=config.horizons,
                 primary_horizon=config.primary_horizon,
             )
 
-        train_dataset = dataset(protocol_index, "train_fit")
-        selection_dataset = dataset(protocol_index, "inner_selection")
-        evaluation_dataset = dataset(frames["sample_index"], config.evaluation_split)
+        train_dataset, selection_dataset, evaluation_dataset = map(dataset, full_rows)
+        # Validate all projections before training, including final outer evaluation.
+        for computational, labelled in zip(
+            (train_dataset, selection_dataset, evaluation_dataset),
+            (train_labelled_rows, selection_labelled_rows, evaluation_labelled_rows),
+            strict=True,
+        ):
+            align_labelled_samples(computational.sample_rows, labelled)
     resume_path = run.resume
     run_dir = run.path
     manifest_path = run_dir / "manifest.json"
@@ -177,7 +188,10 @@ def _run_finance_transformer(
     model, training_audit = train_finance_transformer(
         config,
         train_dataset=train_dataset,
+        train_labelled_rows=train_labelled_rows,
         valid_dataset=selection_dataset,
+        valid_labelled_rows=selection_labelled_rows,
+        data_protocol=run.manifest["data_protocol"],
         dataset_id=str(dataset_manifest["dataset_id"]),
         checkpoint_dir=run_dir / "checkpoints",
         resume_from=resume_path,
@@ -199,10 +213,11 @@ def _run_finance_transformer(
             progress_callback=lambda done, total: report_progress(completed=done, total=total),
         )
     with observation.phase("final_evaluation"):
+        aligned = align_labelled_samples(evaluation_dataset.sample_rows, evaluation_labelled_rows)
         predictions, neutralization_audit = build_prediction_frame(
-            evaluation_dataset.sample_rows,
+            evaluation_labelled_rows,
             frames["sample_metadata"],
-            scores,
+            scores[aligned["_computational_row"].to_numpy()],
             model_id=config.experiment_id,
             checkpoint_hash=checkpoint_hash,
             dataset_id=str(dataset_manifest["dataset_id"]),
@@ -248,6 +263,11 @@ def _run_finance_transformer(
                 "model_internal_scaling": None,
             },
             "row_counts": {
+                "train_fit": train_labelled_rows.height,
+                "inner_selection": selection_labelled_rows.height,
+                "evaluation": evaluation_labelled_rows.height,
+            },
+            "computational_row_counts": {
                 "train_fit": len(train_dataset),
                 "inner_selection": len(selection_dataset),
                 "evaluation": len(evaluation_dataset),

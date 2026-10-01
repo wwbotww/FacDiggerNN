@@ -230,3 +230,41 @@ def build_finance_pretraining_index(
     if index.filter(pl.col("future_end") > pl.lit(train_end)).height:
         raise DataContractError("finance pretraining future target crosses Train boundary")
     return index
+
+
+def align_labelled_samples(
+    computational_rows: pl.DataFrame, labelled_rows: pl.DataFrame
+) -> pl.DataFrame:
+    """Map labelled keys to the actual computational row order without dropping rows.
+
+    The returned frame preserves labelled order; ``_computational_row`` indexes
+    the supplied computational frame, which must be the constructed dataset's
+    canonical ``sample_rows`` when mapping model outputs.
+    """
+
+    keys = ["security_id", "asof_date"]
+    identity = ["sample_id", "feature_start", "feature_end"]
+    for name, frame in (("computational", computational_rows), ("labelled", labelled_rows)):
+        missing = sorted(set(keys + identity) - set(frame.columns))
+        if missing:
+            raise DataContractError(f"{name} rows missing alignment columns: {missing}")
+        if frame.is_empty():
+            raise DataContractError(f"{name} rows are empty")
+        if frame.select(keys + identity).null_count().to_numpy().any():
+            raise DataContractError(f"{name} rows contain null alignment identities")
+        if frame.select(keys).is_duplicated().any():
+            raise DataContractError(f"{name} rows contain duplicate security/date keys")
+        if frame["sample_id"].n_unique() != frame.height:
+            raise DataContractError(f"{name} rows contain duplicate sample_id values")
+    if "_computational_row" in labelled_rows.columns or "_labelled_row" in labelled_rows.columns:
+        raise DataContractError("labelled rows already contain reserved alignment columns")
+    lookup = computational_rows.select(keys + identity).with_row_index("_computational_row")
+    aligned = labelled_rows.with_row_index("_labelled_row").join(
+        lookup, on=keys, how="left", validate="1:1", suffix="_computational"
+    ).sort("_labelled_row")
+    if aligned["_computational_row"].null_count():
+        raise DataContractError("labelled sample keys are absent from the computational universe")
+    for column in identity:
+        if aligned.filter(pl.col(column) != pl.col(f"{column}_computational")).height:
+            raise DataContractError(f"labelled/computational {column} identities disagree")
+    return aligned.drop("_labelled_row", *[f"{column}_computational" for column in identity])

@@ -9,12 +9,21 @@ from typing import Any
 
 import yaml
 
-from facdigger.data.config import load_dataset_build_config
+from facdigger.data.config import (
+    DatasetBuildConfig,
+    load_dataset_build_config,
+    semantic_dataset_config,
+)
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import build_dataset_snapshot, sha256_file
 from facdigger.experiments.manifest import sha256_json
-from facdigger.research.transformer_config import TransformerComparisonConfig
+from facdigger.research.transformer_config import (
+    TransformerComparisonConfig,
+    validate_transformer_experiment_paths,
+)
 from facdigger.training.common import load_source_provenance
+from facdigger.training.finance_pretrain_config import load_finance_pretraining_config
+from facdigger.training.finance_transformer_config import load_finance_transformer_config
 from facdigger.training.runtime import (
     DatasetLocation,
     TrainingRuntimeConfig,
@@ -27,6 +36,25 @@ from facdigger.training.runtime import (
 )
 
 
+def _validate_selection_declarations(
+    config: TransformerComparisonConfig, base: DatasetBuildConfig,
+) -> None:
+    if base.features.name != "finance_transformer" or base.finance_selection is None:
+        raise DataContractError("streamlined comparison requires a Finance selection plan")
+    paths = validate_transformer_experiment_paths(config)
+    for name in ("scratch", "pretrained"):
+        experiment = load_finance_transformer_config(paths[name])
+        base.finance_selection.validate_expectations(
+            supervised_selection_fraction=experiment.selection_fraction,
+        )
+    pretraining = load_finance_pretraining_config(paths["pretraining"])
+    base.finance_selection.validate_expectations(
+        probe_fit_dates=pretraining.training.probe.fit_dates,
+        probe_selection_dates=pretraining.training.probe.selection_dates,
+        future_horizon=pretraining.future_horizon,
+    )
+
+
 def _iter_snapshots(
     config: TransformerComparisonConfig,
     locations: dict[str, DatasetLocation],
@@ -34,8 +62,7 @@ def _iter_snapshots(
     allow_build: bool,
 ) -> Iterator[dict[str, Any]]:
     base = load_dataset_build_config(config.base_dataset_config)
-    if base.features.name != "finance_transformer":
-        raise DataContractError("streamlined comparison requires finance_transformer features")
+    _validate_selection_declarations(config, base)
     fold_ids = {fold.fold_id for fold in config.folds}
     if set(locations) - fold_ids or (not allow_build and set(locations) != fold_ids):
         raise DataContractError("prebuilt snapshots must specify exactly the configured folds")
@@ -59,7 +86,7 @@ def _iter_snapshots(
                 TrainingRuntimeConfig(dataset_overrides={dataset_id: location}),
                 dataset_id=dataset_id,
             )
-            expected = fold_config.model_dump(mode="json", exclude={"sources", "output_root"})
+            expected = semantic_dataset_config(fold_config)
             if manifest["config"] != expected:
                 raise DataContractError("prebuilt snapshot does not match fold dataset protocol")
             identity = {
@@ -101,6 +128,7 @@ def prepare_transformer_snapshots(
     """
     runtime = runtime or TrainingRuntimeConfig()
     base = load_dataset_build_config(config.base_dataset_config)
+    _validate_selection_declarations(config, base)
     binding = {
         "research": config.model_dump(mode="json"),
         "dataset": base.model_dump(mode="json"),

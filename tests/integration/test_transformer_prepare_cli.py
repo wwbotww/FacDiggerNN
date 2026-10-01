@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 
 import yaml
 from test_dataset_pipeline import sessions, synthetic_frames
@@ -14,11 +16,11 @@ from facdigger.training.runtime import load_training_runtime
 
 
 def test_real_cpu_fold_preparation_can_train_without_bronze(tmp_path):
-    bars, universe = synthetic_frames(150)
+    bars, universe = synthetic_frames(260)
     bars_path, universe_path = tmp_path / "bars.parquet", tmp_path / "universe.parquet"
     bars.write_parquet(bars_path)
     universe.write_parquet(universe_path)
-    calendar = sessions(150)
+    calendar = sessions(260)
     folds = [
         {
             "fold_id": f"wf{index}",
@@ -28,7 +30,7 @@ def test_real_cpu_fold_preparation_can_train_without_bronze(tmp_path):
             "embargo_sessions": 2,
         }
         for index, (train, valid, test) in enumerate(
-            [(40, 60, 80), (60, 80, 100), (80, 105, 145)], 1
+            [(105, 140, 175), (140, 175, 210), (175, 210, 250)], 1
         )
     ]
     base_path = tmp_path / "dataset.yaml"
@@ -43,10 +45,31 @@ def test_real_cpu_fold_preparation_can_train_without_bronze(tmp_path):
                     "market_channels": MARKET_CONTEXT_CHANNELS,
                 },
                 "label": {"horizon": 5, "auxiliary_horizons": [1, 20]},
+                "finance_selection": {
+                    "supervised_selection_fraction": 0.15,
+                    "probe_fit_dates": 2,
+                    "probe_selection_dates": 2,
+                    "future_horizon": 5,
+                },
                 "split": {key: value for key, value in folds[-1].items() if key != "fold_id"},
             }
         )
     )
+    experiment_paths = {}
+    for stage in ("scratch", "pretrained", "pretraining"):
+        experiment = {"model": {"statistics_windows": [5, 20]}}
+        if stage == "pretrained":
+            experiment.update(
+                {
+                    "initialization": "finance_pretrained",
+                    "pretrained_checkpoint": str(tmp_path / "not-trained-encoder.pt"),
+                }
+            )
+        elif stage == "pretraining":
+            experiment["training"] = {"probe": {"fit_dates": 2, "selection_dates": 2}}
+        path = tmp_path / f"{stage}.yaml"
+        path.write_text(yaml.safe_dump(experiment))
+        experiment_paths[stage] = str(path)
     research_path = tmp_path / "research.yaml"
     research_path.write_text(
         yaml.safe_dump(
@@ -54,11 +77,7 @@ def test_real_cpu_fold_preparation_can_train_without_bronze(tmp_path):
                 "base_dataset_config": str(base_path),
                 "snapshot_output_root": str(tmp_path / "snapshots"),
                 "folds": folds,
-                "experiments": {
-                    "scratch": "absent.yaml",
-                    "pretrained": "absent.yaml",
-                    "pretraining": "absent.yaml",
-                },
+                "experiments": experiment_paths,
             }
         )
     )
@@ -72,9 +91,27 @@ def test_real_cpu_fold_preparation_can_train_without_bronze(tmp_path):
         "--output",
         str(output),
     ]
-    result = runner.invoke(app, args)
-    assert result.exit_code == 0, result.output
-    report = json.loads(result.output)
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from typer.testing import CliRunner
+from facdigger.cli import app
+result = CliRunner().invoke(app, sys.argv[1:])
+assert result.exit_code == 0, result.output
+assert 'torch' not in sys.modules
+assert 'transformers' not in sys.modules
+print(result.output)
+""",
+            *args,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(process.stdout)
     assert len({plan["dataset_id"] for plan in report["folds"]}) == 3
     bars_path.unlink()
     universe_path.unlink()

@@ -12,7 +12,7 @@ import polars as pl
 from facdigger.data.contracts import DataContractError
 from facdigger.datasets.window import (
     FinancePretrainingWindowDataset,
-    FinanceTransformerWindowDataset,
+    FinanceTransformerInferenceWindowDataset,
     MarketFeatureStore,
     SecurityFeatureStore,
 )
@@ -20,9 +20,10 @@ from facdigger.experiments.manifest import sha256_json
 from facdigger.training.common import (
     load_required_market_features,
     load_required_snapshot_features,
+    load_snapshot_inference_rows,
     load_training_snapshot,
-    split_supervised_training_index,
 )
+from facdigger.training.finance_data import finance_data_protocol, load_finance_selection
 from facdigger.training.finance_pretrain_config import (
     FinancePretrainingExperimentConfig,
 )
@@ -79,15 +80,19 @@ def run_finance_training_benchmark(
     if not isinstance(pretraining_artifact, str):
         raise DataContractError("snapshot has no finance pretraining index")
     pretraining_index = pl.read_parquet(dataset_path / pretraining_artifact)
-    protocol_index, _ = split_supervised_training_index(
-        frames["sample_index"],
-        selection_fraction=supervised_config.selection_fraction,
+    supervised_protocol = finance_data_protocol(dataset_path, manifest, supervised_config)
+    pretraining_protocol = finance_data_protocol(dataset_path, manifest, pretraining_config)
+    protocol_index, _, _ = load_finance_selection(
+        dataset_path, manifest, sample_index=frames["sample_index"]
     )
     train_rows = protocol_index.filter(pl.col("split") == "train_fit")
+    computational_rows = load_snapshot_inference_rows(
+        dataset_path, manifest, asof_dates=train_rows["asof_date"].unique().sort().to_list()
+    )
     required_rows = pl.concat(
         [
             pretraining_index.select("security_id", "feature_start", "asof_date", "future_end"),
-            train_rows.select("security_id", "feature_start", "asof_date").with_columns(
+            computational_rows.select("security_id", "feature_start", "asof_date").with_columns(
                 pl.col("asof_date").alias("future_end")
             ),
         ],
@@ -103,15 +108,13 @@ def run_finance_training_benchmark(
         channels=supervised_config.market_channels,
     )
     context_length = int(feature_config["context_length"])
-    supervised_dataset = FinanceTransformerWindowDataset(
+    supervised_dataset = FinanceTransformerInferenceWindowDataset(
         feature_store=feature_store,
         market_store=market_store,
-        sample_index=protocol_index,
+        inference_index=computational_rows,
         channels=supervised_config.channels,
         market_channels=supervised_config.market_channels,
         context_length=context_length,
-        split="train_fit",
-        horizons=supervised_config.horizons,
         primary_horizon=supervised_config.primary_horizon,
     )
     pretraining_dataset = FinancePretrainingWindowDataset(
@@ -126,6 +129,8 @@ def run_finance_training_benchmark(
     supervised = benchmark_finance_transformer_updates(
         supervised_config,
         train_dataset=supervised_dataset,
+        train_labelled_rows=train_rows,
+        data_protocol=supervised_protocol,
         dataset_id=str(manifest["dataset_id"]),
         optimizer_updates=optimizer_updates,
         warmup_updates=min(10, optimizer_updates - 1),
@@ -186,7 +191,10 @@ def run_finance_training_benchmark(
         "dataset_id": manifest["dataset_id"],
         "dataset_path": str(dataset_path),
         "context_length": context_length,
-        "supervised_train_rows": len(supervised_dataset),
+        "supervised_train_rows": train_rows.height,
+        "supervised_computational_rows": len(supervised_dataset),
+        "supervised_context_only_rows": len(supervised_dataset) - train_rows.height,
+        "data_protocols": {"supervised": supervised_protocol, "pretraining": pretraining_protocol},
         "pretraining_rows": len(pretraining_dataset),
         "benchmark_optimizer_updates": optimizer_updates,
         "supervised_config_hash": sha256_json(supervised_config.model_dump(mode="json")),

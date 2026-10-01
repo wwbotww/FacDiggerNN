@@ -138,8 +138,9 @@ def test_finance_transformer_trains_one_epoch_and_writes_replay_checkpoint(tmp_p
     train, selection = _datasets()
     _, audit = train_finance_transformer(
         _config(),
-        train_dataset=train,
-        valid_dataset=selection,
+        train_dataset=train, train_labelled_rows=train.sample_rows,
+        valid_dataset=selection, valid_labelled_rows=selection.sample_rows,
+        data_protocol={"dataset_id": "synthetic-finance-transformer"},
         dataset_id="synthetic-finance-transformer",
         checkpoint_dir=tmp_path / "checkpoints",
     )
@@ -162,7 +163,18 @@ def test_pretrained_resume_after_move_does_not_need_initial_encoder(tmp_path) ->
     payload["training"].update({"max_epochs": 2, "minimum_epochs": 2, "patience": 2})
     config = FinanceTransformerExperimentConfig.model_validate(payload)
     encoder = build_finance_transformer_model(config, context_length=32)
+    data_protocol = {
+        "dataset_id": "fixture", "selection_plan": {"fixture": True},
+        "feature_scaler_sha256": "fixture-scaler",
+        "computational_universe": "target_free_inference_index",
+        "label_support": "complete_horizon_labels_on_original_phase_dates",
+    }
     torch.save({
+        "data_protocol": {
+            **data_protocol,
+            "computational_universe": "pretraining_index_before_probe_selection",
+            "label_support": "probe_complete_horizon_labels",
+        },
         "contract": "finance_patch_pretrain_encoder", "dataset_id": "fixture",
         "context_length": 32, "channels": config.channels,
         "market_channels": config.market_channels,
@@ -170,19 +182,25 @@ def test_pretrained_resume_after_move_does_not_need_initial_encoder(tmp_path) ->
         "market_encoder_state": encoder.market_encoder.state_dict(),
     }, encoder_path)
     full, full_audit = train_finance_transformer(
-        config, train_dataset=train, valid_dataset=selection, dataset_id="fixture",
+        config, train_dataset=train, train_labelled_rows=train.sample_rows,
+        valid_dataset=selection, valid_labelled_rows=selection.sample_rows,
+        data_protocol=data_protocol, dataset_id="fixture",
         checkpoint_dir=tmp_path / "continuous",
     )
     partial = tmp_path / "original-checkpoints"
     train_finance_transformer(
-        config, train_dataset=train, valid_dataset=selection, dataset_id="fixture",
+        config, train_dataset=train, train_labelled_rows=train.sample_rows,
+        valid_dataset=selection, valid_labelled_rows=selection.sample_rows,
+        data_protocol=data_protocol, dataset_id="fixture",
         checkpoint_dir=partial, stop_after_epoch=1,
     )
     encoder_path.rename(tmp_path / "offline-pretraining.pt")
     relocated = tmp_path / "relocated-checkpoints"
     partial.rename(relocated)
     resumed, audit = train_finance_transformer(
-        config, train_dataset=train, valid_dataset=selection, dataset_id="fixture",
+        config, train_dataset=train, train_labelled_rows=train.sample_rows,
+        valid_dataset=selection, valid_labelled_rows=selection.sample_rows,
+        data_protocol=data_protocol, dataset_id="fixture",
         checkpoint_dir=relocated, resume_from=relocated / "last.pt",
     )
     assert audit["resumed_from_epoch"] == 1

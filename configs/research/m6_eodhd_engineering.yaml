@@ -1,6 +1,6 @@
-research_id: m6_eodhd_engineering_full_date_v2
+research_id: m6_eodhd_engineering_exact_ratio
 base_dataset_config: configs/datasets/eodhd_historical_liquid.yaml
-output_root: artifacts/research
+output_root: artifacts/research_exact_ratio
 snapshot_output_root: data/walk_forward_snapshots
 seeds: [17, 42, 73]
 
@@ -32,7 +32,9 @@ non_overlapping_stride: 5
 non_overlapping_offset: 0
 
 decisions:
-  minimum_positive_cell_ratio: 0.6666666667
+  minimum_positive_cell_ratio:
+    numerator: 2
+    denominator: 3
   minimum_mean_rank_ic_delta: 0.0
   significance_alpha: 0.05
   multiple_comparison_method: holm

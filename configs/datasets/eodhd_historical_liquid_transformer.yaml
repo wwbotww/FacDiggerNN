@@ -45,6 +45,12 @@ label:
   auxiliary_horizons: [1, 20]
   benchmark: eligible_equal_weight
 
+finance_selection:
+  supervised_selection_fraction: 0.15
+  probe_fit_dates: 60
+  probe_selection_dates: 20
+  future_horizon: 5
+
 split:
   # Keep the standalone build aligned with the largest streamlined fold so
   # the mandatory RTX admission benchmark cannot understate total runtime.

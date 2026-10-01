@@ -1,8 +1,8 @@
-research_id: finance_transformer_scratch_vs_pretrained
+research_id: finance_transformer_corrected_scratch_vs_pretrained
 base_dataset_config: configs/datasets/eodhd_historical_liquid_transformer.yaml
-output_root: artifacts/transformer_comparison
-snapshot_output_root: data/transformer_walk_forward_snapshots
-admission_report: artifacts/benchmarks/finance-transformer-rtx2070s.json
+output_root: artifacts/transformer_comparison_corrected
+snapshot_output_root: data/transformer_walk_forward_corrected
+admission_report: artifacts/benchmarks/finance-transformer-corrected.json
 seed: 42
 
 folds:
@@ -28,6 +28,7 @@ experiments:
   pretrained: configs/experiments/finance_patch_transformer_pretrained.example.yaml
 
 decisions:
+  paired_mean_weighting: equal_date
   minimum_paired_mean_rank_ic_delta: 0.001
   minimum_positive_folds: 2
   require_positive_worst_fold: true

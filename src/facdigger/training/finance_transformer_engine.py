@@ -9,16 +9,19 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import polars as pl
 import torch
 
+from facdigger.data.contracts import DataContractError
+from facdigger.datasets.index import align_labelled_samples
 from facdigger.datasets.sampler import FullDateBatchSampler
-from facdigger.datasets.window import FinanceTransformerWindowDataset
 from facdigger.experiments.manifest import sha256_json
 from facdigger.models.finance_patch_transformer import (
     FinancePatchTransformer,
     build_finance_transformer_model,
 )
 from facdigger.models.finance_scoring import (
+    FinanceScoringDataset,
     _device_microbatches,
     _full_date_loader,
     _market_tensors,
@@ -63,6 +66,7 @@ def load_finance_pretrained_encoders(
     expected_context_length: int | None = None,
     expected_channels: list[str] | None = None,
     expected_market_channels: list[str] | None = None,
+    expected_data_protocol: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"financial pretraining checkpoint not found: {checkpoint_path}")
@@ -78,6 +82,10 @@ def load_finance_pretrained_encoders(
     for field, expected in expectations.items():
         if expected is not None and checkpoint.get(field) != expected:
             raise ValueError(f"pretraining checkpoint {field} does not match this run")
+    if expected_data_protocol is not None:
+        from facdigger.training.finance_data import validate_encoder_data_protocol
+
+        validate_encoder_data_protocol(checkpoint, expected_data_protocol)
     model.local_encoder.load_state_dict(checkpoint["local_encoder_state"], strict=True)
     model.market_encoder.load_state_dict(checkpoint["market_encoder_state"], strict=True)
     return {
@@ -143,11 +151,12 @@ def _replay_matches(
 
 def backward_complete_date_with_embedding_replay(
     model: FinancePatchTransformer,
-    dataset: FinanceTransformerWindowDataset,
+    dataset: FinanceScoringDataset,
     full_date_batch: dict[str, torch.Tensor],
     *,
     device: str,
     target_rank_lookup: torch.Tensor,
+    row_to_label_index: torch.Tensor,
     horizon_weights: dict[int, float],
     epsilon: float,
     scale_regularization: float,
@@ -183,13 +192,18 @@ def backward_complete_date_with_embedding_replay(
     local_leaf = torch.cat(detached_local, dim=0).requires_grad_(True)
     market_leaf = detached_market.requires_grad_(True)
     indices = full_date_batch["sample_index"].long()
-    target_ranks = target_rank_lookup[indices].to(
+    label_ids = row_to_label_index[indices]
+    label_mask = label_ids >= 0
+    if int(label_mask.sum()) < 2:
+        raise DataContractError("complete date has fewer than two labelled samples")
+    # Never index -1: there is no placeholder target for an unlabelled token.
+    target_ranks = target_rank_lookup[label_ids[label_mask]].to(
         device=device, dtype=torch.float32, non_blocking=True
     )
     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
         date_output = model.score_date(local_leaf, market_leaf)
     loss, loss_audit = _multi_horizon_loss(
-        date_output.scores,
+        date_output.scores[label_mask.to(device=device)],
         target_ranks,
         horizons=model.horizons,
         horizon_weights=horizon_weights,
@@ -251,6 +265,8 @@ def backward_complete_date_with_embedding_replay(
     return {
         **loss_audit,
         "rows": int(local_leaf.shape[0]),
+        "labelled_rows": int(label_mask.sum()),
+        "unlabelled_rows": int((~label_mask).sum()),
         "physical_microbatches": len(microbatches),
         "maximum_local_replay_error": maximum_local_replay_error,
         "market_replay_error": market_replay_error,
@@ -285,8 +301,9 @@ def _daily_rank_ics(
 
 def evaluate_finance_transformer_selection(
     model: FinancePatchTransformer,
-    dataset: FinanceTransformerWindowDataset,
+    dataset: FinanceScoringDataset,
     *,
+    labelled_rows: pl.DataFrame,
     batch_size: int,
     device: str,
     precision: str,
@@ -309,14 +326,18 @@ def evaluate_finance_transformer_selection(
         check_stop=check_stop,
         progress_callback=progress_callback,
     )
-    targets = dataset.sample_rows["target"].to_numpy()
+    labelled = align_labelled_samples(
+        dataset.sample_rows, labelled_rows.sort("asof_date", "security_id")
+    )
+    scores = scores[labelled["_computational_row"].to_numpy()]
+    targets = labelled["target"].to_numpy()
     daily = _daily_rank_ics(
         scores,
         targets,
-        dataset.asof_dates,
+        labelled["asof_date"].to_list(),
         minimum_cross_section_size=minimum_cross_section_size,
     )
-    total_dates = len(dataset.sample_rows["asof_date"].unique())
+    total_dates = labelled["asof_date"].n_unique()
     coverage = len(daily) / total_dates if total_dates else 0.0
     if len(daily) < minimum_dates:
         raise ValueError(f"selection has too few valid dates: {len(daily)} < {minimum_dates}")
@@ -339,7 +360,41 @@ def evaluate_finance_transformer_selection(
         "skipped_dates": total_dates - len(daily),
         "date_coverage": coverage,
         "score_std": float(np.std(scores)),
+        "computational_rows": len(dataset),
+        "labelled_rows": labelled.height,
     }
+
+
+def _supervised_target_lookup(
+    config: FinanceTransformerExperimentConfig,
+    dataset: FinanceScoringDataset,
+    labelled_rows: pl.DataFrame,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep target ranks on L while indexing every computational token in C."""
+
+    labelled = align_labelled_samples(dataset.sample_rows, labelled_rows)
+    if set(dataset.asof_dates) != set(labelled["asof_date"].to_list()):
+        raise DataContractError("computational and supervised date sets differ")
+    ranks = torch.stack(
+        [
+            torch.from_numpy(
+                cross_sectional_rank_targets(
+                    labelled[f"target_{horizon}"].to_numpy(),
+                    labelled["asof_date"].to_list(),
+                    minimum_cross_section_size=(
+                        config.training.objective.minimum_cross_section_size
+                    ),
+                )
+            )
+            for horizon in config.horizons
+        ],
+        dim=1,
+    )
+    row_to_label = torch.full((len(dataset),), -1, dtype=torch.long)
+    row_to_label[torch.from_numpy(labelled["_computational_row"].to_numpy().astype(np.int64))] = (
+        torch.arange(labelled.height)
+    )
+    return ranks, row_to_label
 
 
 def _decay_parameter(name: str, parameter: torch.Tensor) -> bool:
@@ -419,6 +474,7 @@ def _checkpoint_payload(
     sampler: FullDateBatchSampler,
     dataset_id: str,
     protocol_hash: str,
+    data_protocol: dict[str, Any],
     config_payload: dict[str, Any],
     initialization_audit: dict[str, Any],
 ) -> dict[str, Any]:
@@ -449,6 +505,7 @@ def _checkpoint_payload(
         "rng_state": _rng_state(),
         "dataset_id": dataset_id,
         "protocol_hash": protocol_hash,
+        "data_protocol": data_protocol,
         "config": config_payload,
         "initialization": initialization_audit,
     }
@@ -457,8 +514,11 @@ def _checkpoint_payload(
 def train_finance_transformer(
     config: FinanceTransformerExperimentConfig,
     *,
-    train_dataset: FinanceTransformerWindowDataset,
-    valid_dataset: FinanceTransformerWindowDataset,
+    train_dataset: FinanceScoringDataset,
+    train_labelled_rows: pl.DataFrame,
+    valid_dataset: FinanceScoringDataset,
+    valid_labelled_rows: pl.DataFrame,
+    data_protocol: dict[str, Any],
     dataset_id: str,
     checkpoint_dir: Path,
     resume_from: Path | None = None,
@@ -487,6 +547,7 @@ def train_finance_transformer(
                     expected_context_length=train_dataset.context_length,
                     expected_channels=config.channels,
                     expected_market_channels=config.market_channels,
+                    expected_data_protocol=data_protocol,
                 )
             )
         model = model.to(device)
@@ -520,23 +581,11 @@ def train_finance_transformer(
             ),
         )
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-        target_rank_lookup = torch.stack(
-            [
-                torch.from_numpy(
-                    cross_sectional_rank_targets(
-                        train_dataset.sample_rows[f"target_{horizon}"].to_numpy(),
-                        train_dataset.asof_dates,
-                        minimum_cross_section_size=(
-                            config.training.objective.minimum_cross_section_size
-                        ),
-                    )
-                )
-                for horizon in config.horizons
-            ],
-            dim=1,
+        target_rank_lookup, row_to_label_index = _supervised_target_lookup(
+            config, train_dataset, train_labelled_rows
         )
         config_payload = config.model_dump(mode="json")
-        protocol_hash = sha256_json(config_payload)
+        protocol_hash = sha256_json({"config": config_payload, "data_protocol": data_protocol})
         start_epoch = 1
         global_step = 0
         best_selection_score = float("-inf")
@@ -559,7 +608,10 @@ def train_finance_transformer(
                 raise ValueError("resume checkpoint is not a finance Transformer checkpoint")
             if checkpoint["dataset_id"] != dataset_id:
                 raise ValueError("resume checkpoint dataset_id does not match")
-            if checkpoint["protocol_hash"] != protocol_hash:
+            if (
+                checkpoint.get("protocol_hash") != protocol_hash
+                or checkpoint.get("data_protocol") != data_protocol
+            ):
                 raise ValueError("resume checkpoint training protocol does not match")
             initialization_audit = dict(checkpoint["initialization"])
             model.load_state_dict(checkpoint["model_state"])
@@ -594,6 +646,7 @@ def train_finance_transformer(
                     or (
                         best_payload.get("dataset_id") != dataset_id
                         or best_payload.get("protocol_hash") != protocol_hash
+                        or best_payload.get("data_protocol") != data_protocol
                         or best_payload.get("best_selection_score") != best_selection_score
                     )
                 ):
@@ -641,6 +694,7 @@ def train_finance_transformer(
             sampler=train_sampler,
             dataset_id=dataset_id,
             protocol_hash=protocol_hash,
+            data_protocol=data_protocol,
             config_payload=config_payload,
             initialization_audit=initialization_audit,
         )
@@ -727,6 +781,7 @@ def train_finance_transformer(
                         batch,
                         device=device,
                         target_rank_lookup=target_rank_lookup,
+                        row_to_label_index=row_to_label_index,
                         horizon_weights=config.training.objective.horizon_weights,
                         epsilon=config.training.objective.epsilon,
                         scale_regularization=(config.training.objective.scale_regularization),
@@ -801,6 +856,7 @@ def train_finance_transformer(
             selection = evaluate_finance_transformer_selection(
                 model,
                 valid_dataset,
+                labelled_rows=valid_labelled_rows,
                 batch_size=config.training.batch_size,
                 device=device,
                 precision=config.training.precision,
@@ -932,13 +988,16 @@ def train_finance_transformer(
         "last_checkpoint": str(last_checkpoint),
         "best_checkpoint": str(best_checkpoint),
         "protocol_hash": protocol_hash,
+        "data_protocol": data_protocol,
     }
 
 
 def benchmark_finance_transformer_updates(
     config: FinanceTransformerExperimentConfig,
     *,
-    train_dataset: FinanceTransformerWindowDataset,
+    train_dataset: FinanceScoringDataset,
+    train_labelled_rows: pl.DataFrame,
+    data_protocol: dict[str, Any],
     dataset_id: str,
     optimizer_updates: int = 100,
     warmup_updates: int = 10,
@@ -962,6 +1021,7 @@ def benchmark_finance_transformer_updates(
             expected_context_length=train_dataset.context_length,
             expected_channels=config.channels,
             expected_market_channels=config.market_channels,
+            expected_data_protocol=data_protocol,
         )
     model = model.to(device)
     optimizer = torch.optim.AdamW(
@@ -983,20 +1043,8 @@ def benchmark_finance_transformer_updates(
     )
     updates_per_epoch = math.ceil(len(loader) / config.training.dates_per_optimizer_step)
     total_update_budget = updates_per_epoch * config.training.max_epochs
-    target_rank_lookup = torch.stack(
-        [
-            torch.from_numpy(
-                cross_sectional_rank_targets(
-                    train_dataset.sample_rows[f"target_{horizon}"].to_numpy(),
-                    train_dataset.asof_dates,
-                    minimum_cross_section_size=(
-                        config.training.objective.minimum_cross_section_size
-                    ),
-                )
-            )
-            for horizon in config.horizons
-        ],
-        dim=1,
+    target_rank_lookup, row_to_label_index = _supervised_target_lookup(
+        config, train_dataset, train_labelled_rows
     )
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -1027,6 +1075,7 @@ def benchmark_finance_transformer_updates(
                 batch,
                 device=device,
                 target_rank_lookup=target_rank_lookup,
+                row_to_label_index=row_to_label_index,
                 horizon_weights=config.training.objective.horizon_weights,
                 epsilon=config.training.objective.epsilon,
                 scale_regularization=config.training.objective.scale_regularization,
@@ -1067,6 +1116,9 @@ def benchmark_finance_transformer_updates(
     return {
         "kind": "finance_transformer_complete_date_updates",
         "dataset_id": dataset_id,
+        "data_protocol": data_protocol,
+        "labelled_rows": train_labelled_rows.height,
+        "computational_rows": len(train_dataset),
         "device": device,
         "precision": "fp16" if amp_enabled else "fp32",
         "requested_updates": optimizer_updates,

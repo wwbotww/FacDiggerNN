@@ -128,3 +128,25 @@ assert 'torch' not in sys.modules
 assert 'transformers' not in sys.modules
 """
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("change", ["missing", "supervised", "probe"])
+def test_prepare_rejects_selection_declaration_drift_before_writing(tmp_path, monkeypatch, change):
+    import yaml
+
+    config, calls, _, _ = setup_builder(tmp_path, monkeypatch)
+    raw = yaml.safe_load(config.base_dataset_config.read_text())
+    if change == "missing":
+        raw.pop("finance_selection")
+    elif change == "supervised":
+        raw["finance_selection"]["supervised_selection_fraction"] = .2
+    else:
+        raw["finance_selection"]["probe_fit_dates"] = 61
+    dataset_config = tmp_path / "dataset.yaml"
+    dataset_config.write_text(yaml.safe_dump(raw))
+    config = config.model_copy(update={"base_dataset_config": dataset_config})
+    output = tmp_path / "prepared"
+    with pytest.raises(DataContractError, match="selection"):
+        prepare_transformer_snapshots(config, output)
+    assert calls == []
+    assert not output.exists()

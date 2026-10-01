@@ -41,7 +41,12 @@ def _run(kind, path, *, control=None, callback=None, resume=None):
     if kind == "supervised":
         config = _config()
         train, selection = _datasets()
-        kwargs = {"train_dataset": train, "valid_dataset": selection}
+        kwargs = {
+            "train_dataset": train,
+            "train_labelled_rows": train.sample_rows,
+            "valid_dataset": selection,
+            "valid_labelled_rows": selection.sample_rows,
+        }
         trainer = train_finance_transformer
     else:
         config, train, fit, selection = _training_fixture()
@@ -67,6 +72,13 @@ def _run(kind, path, *, control=None, callback=None, resume=None):
         config,
         **kwargs,
         dataset_id="fixture",
+        data_protocol={
+            "dataset_id": "fixture",
+            "computational_universe": (
+                "target_free_inference_index" if kind == "supervised"
+                else "pretraining_index_before_probe_selection"
+            ),
+        },
         checkpoint_dir=path,
         resume_from=resume,
         control=control,

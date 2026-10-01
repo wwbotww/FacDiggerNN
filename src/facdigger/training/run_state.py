@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,6 +36,43 @@ class TrainingRun:
     manifest: dict[str, Any]
 
 
+def verify_checkpoint_protocol(
+    path: Path,
+    *,
+    model_type: str,
+    config_payload: dict[str, Any],
+    data_protocol: dict[str, Any],
+    for_resume: bool = False,
+) -> None:
+    """Reject incompatible checkpoint envelopes before recording a new attempt."""
+    import torch
+
+    if model_type == "finance_patch_transformer":
+        best_contract = "finance_patch_transformer_checkpoint"
+        allowed = {best_contract, "finance_patch_transformer_training_resume"}
+    elif model_type == "finance_patch_pretrain":
+        best_contract = "finance_patch_pretrain_encoder"
+        allowed = {"finance_patch_pretrain_resume", "finance_patch_pretrain_progress"}
+    else:
+        raise DataContractError("unknown Finance checkpoint model type")
+    expected_hash = sha256_json({"config": config_payload, "data_protocol": data_protocol})
+
+    def check(payload: Any, contracts: set[str]) -> None:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("contract") not in contracts
+            or payload.get("dataset_id") != data_protocol.get("dataset_id")
+            or payload.get("data_protocol") != data_protocol
+            or payload.get("protocol_hash") != expected_hash
+        ):
+            raise DataContractError("checkpoint data protocol differs from the bound run")
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    check(payload, allowed if for_resume else {best_contract})
+    if for_resume and payload.get("best_checkpoint") is not None:
+        check(payload["best_checkpoint"], {best_contract})
+
+
 def verify_completed_artifacts(run_dir: Path, manifest: dict[str, Any]) -> None:
     checkpoint = manifest["checkpoint"]
     for name, digest in (
@@ -54,6 +91,13 @@ def verify_completed_artifacts(run_dir: Path, manifest: dict[str, Any]) -> None:
         path = (run_dir / name).resolve()
         if not path.is_relative_to(run_dir.resolve()) or not path.is_file():
             raise DataContractError(f"completed stage artifact missing: {name}")
+    if "data_protocol" in manifest:
+        verify_checkpoint_protocol(
+            run_dir / checkpoint["file"],
+            model_type=manifest["model_type"],
+            config_payload=yaml.safe_load((run_dir / "resolved_config.yaml").read_text("utf-8")),
+            data_protocol=manifest["data_protocol"],
+        )
 
 
 @contextmanager
@@ -66,6 +110,7 @@ def training_run(
     control: TrainingControl,
     resume_from: str | Path | None,
     run_dir: str | Path | None,
+    data_protocol_loader: Callable[[Path, dict[str, Any]], dict[str, Any]],
 ) -> Iterator[TrainingRun]:
     now = datetime.now(timezone.utc).isoformat()
     payload = config.model_dump(mode="json")
@@ -108,11 +153,10 @@ def training_run(
         elif resume is not None or (root / "checkpoints").exists():
             raise FileNotFoundError("checkpoint has no bound run manifest")
         attempt = len(previous.get("attempts", [])) + 1 if previous else 1
-        observation = TrainingProgress(
-            None
-            if previous and previous.get("status") == "complete"
-            else lambda event: append_progress(root / "progress.jsonl", event, attempt=attempt)
-        )
+        # Buffer validation observations until the previous run and actual inputs agree.
+        # Rejected reentry must not append an attempt or change historical progress.
+        validation_events: list[dict[str, Any]] = []
+        observation = TrainingProgress(validation_events.append)
         with observation.phase("input_validation"):
             dataset = resolve_dataset(
                 Path(dataset_dir),
@@ -120,7 +164,20 @@ def training_run(
                 dataset_id=str(previous["dataset_id"]) if previous else None,
                 manifest_hash=previous["dataset_manifest_hash"] if previous else None,
             )
-        dataset_manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+            dataset_manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+            data_protocol = data_protocol_loader(dataset, dataset_manifest)
+            if previous is not None and previous.get("data_protocol") != data_protocol:
+                raise DataContractError(
+                    "training data protocol differs; use the pinned original code or a new run"
+                )
+            if resume is not None:
+                verify_checkpoint_protocol(
+                    resume,
+                    model_type=model_type,
+                    config_payload=payload,
+                    data_protocol=data_protocol,
+                    for_resume=True,
+                )
         if previous is not None and previous.get("status") == "complete":
             verify_completed_artifacts(root, previous)
             yield TrainingRun(root, dataset, resume, previous)
@@ -134,6 +191,7 @@ def training_run(
             "dataset_path": str(dataset),
             "dataset_manifest_hash": sha256_file(dataset / "manifest.json"),
             "config_hash": config_hash,
+            "data_protocol": data_protocol,
             "git": collect_git_state(repository_root),
         }
         manifest.update(
@@ -161,6 +219,8 @@ def training_run(
             yaml.safe_dump(payload, allow_unicode=True, sort_keys=True),
         )
         write_json(manifest_path, manifest)
+        for event in validation_events:
+            append_progress(root / "progress.jsonl", event, attempt=attempt)
         try:
             yield TrainingRun(root, dataset, resume, manifest)
         except BaseException as exc:

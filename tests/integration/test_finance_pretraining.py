@@ -188,6 +188,10 @@ def test_finance_pretraining_selects_and_writes_encoder_checkpoint(tmp_path) -> 
         probe_fit_dataset=probe("probe_fit"),
         probe_selection_dataset=probe("probe_selection"),
         dataset_id="dataset",
+        data_protocol={
+            "dataset_id": "dataset",
+            "computational_universe": "pretraining_index_before_probe_selection",
+        },
         checkpoint_dir=checkpoint_dir,
     )
 
@@ -230,6 +234,11 @@ def test_finance_pretraining_selects_and_writes_encoder_checkpoint(tmp_path) -> 
     supervised_benchmark = benchmark_finance_transformer_updates(
         supervised_config,
         train_dataset=probe("probe_fit"),
+        train_labelled_rows=probe("probe_fit").sample_rows,
+        data_protocol={
+            "dataset_id": "dataset",
+            "computational_universe": "target_free_inference_index",
+        },
         dataset_id="dataset",
         optimizer_updates=2,
         warmup_updates=0,

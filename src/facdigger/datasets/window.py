@@ -315,7 +315,8 @@ class SnapshotInferenceWindowDataset(_IndexedFeatureWindows):
     def __init__(
         self,
         *,
-        features: pl.DataFrame,
+        features: pl.DataFrame | None = None,
+        feature_store: SecurityFeatureStore | None = None,
         inference_index: pl.DataFrame,
         channels: list[str],
         context_length: int,
@@ -349,6 +350,7 @@ class SnapshotInferenceWindowDataset(_IndexedFeatureWindows):
         ]
         super().__init__(
             features=features,
+            feature_store=feature_store,
             sample_rows=inference_index.select(
                 [column for column in columns if column in inference_index.columns]
             ),
@@ -363,8 +365,10 @@ class FinanceTransformerInferenceWindowDataset(SnapshotInferenceWindowDataset):
     def __init__(
         self,
         *,
-        features: pl.DataFrame,
-        market_features: pl.DataFrame,
+        features: pl.DataFrame | None = None,
+        feature_store: SecurityFeatureStore | None = None,
+        market_features: pl.DataFrame | None = None,
+        market_store: MarketFeatureStore | None = None,
         inference_index: pl.DataFrame,
         channels: list[str],
         market_channels: list[str],
@@ -373,12 +377,24 @@ class FinanceTransformerInferenceWindowDataset(SnapshotInferenceWindowDataset):
     ) -> None:
         super().__init__(
             features=features,
+            feature_store=feature_store,
             inference_index=inference_index,
             channels=channels,
             context_length=context_length,
         )
         self.primary_horizon = primary_horizon
-        self.market_store = MarketFeatureStore(features=market_features, channels=market_channels)
+        if market_store is None:
+            if market_features is None:
+                raise ValueError("market_features or market_store is required")
+            market_store = MarketFeatureStore(features=market_features, channels=market_channels)
+        elif market_features is not None:
+            raise ValueError("market_features and market_store are mutually exclusive")
+        if tuple(market_channels) != market_store.channels:
+            raise DataContractError(
+                "market channels must exactly match the shared market feature store"
+            )
+        self.market_store = market_store
+        self.market_channels = tuple(market_channels)
 
     def market_window_for_sample_indices(
         self, sample_indices: np.ndarray | list[int]

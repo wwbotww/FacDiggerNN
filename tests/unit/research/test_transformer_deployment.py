@@ -41,7 +41,10 @@ def _config(tmp_path):
 )
 @pytest.mark.parametrize("schema_version", [4, 5])
 def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(
-    tmp_path, monkeypatch, damage, schema_version,
+    tmp_path,
+    monkeypatch,
+    damage,
+    schema_version,
 ):
     config = _config(tmp_path)
     base = load_dataset_build_config(config.base_dataset_config)
@@ -52,7 +55,8 @@ def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(
         if damage == "protocol" and fold.fold_id == "wf1":
             protocol["split"]["embargo_sessions"] += 1
         identity = {
-            "schema_version": schema_version, "config": protocol,
+            "schema_version": schema_version,
+            "config": protocol,
             "input_file_hashes": {"fixture": "a"},
         }
         if damage == "mixed_sources" and fold.fold_id == "wf2":
@@ -87,7 +91,19 @@ def test_prebuilt_folds_need_no_bronze_and_reject_changed_inputs(
 
 
 @pytest.mark.parametrize(
-    "change", [None, "missing_budget", "budget", "hardware", "ram", "gpu", "time", "fp16"]
+    "change",
+    [
+        None,
+        "missing_budget",
+        "budget",
+        "hardware",
+        "ram",
+        "gpu",
+        "time",
+        "fp16",
+        "old_protocol",
+        "label_pool",
+    ],
 )
 def test_explicit_resource_admission_binds_budget_device_and_current_allocation(
     tmp_path, monkeypatch, change
@@ -106,6 +122,27 @@ def test_explicit_resource_admission_binds_budget_device_and_current_allocation(
     payload = {
         "benchmark_optimizer_updates": 100,
         "dataset_id": "largest-fold",
+        "data_protocols": {
+            stage: {
+                "dataset_id": "largest-fold",
+                "computational_universe": universe,
+                "label_support": support,
+                "selection_plan": {"a_end": "2020-01-01"},
+                "feature_scaler_sha256": "a" * 64,
+            }
+            for stage, universe, support in (
+                (
+                    "supervised",
+                    "target_free_inference_index",
+                    "complete_horizon_labels_on_original_phase_dates",
+                ),
+                (
+                    "pretraining",
+                    "pretraining_index_before_probe_selection",
+                    "probe_complete_horizon_labels",
+                ),
+            )
+        },
         "supervised_config_hash": sha256_json(supervised.model_dump(mode="json")),
         "pretraining_config_hash": sha256_json(pretraining.model_dump(mode="json")),
         "matrix_projection": {"pretraining_runs": 3, "supervised_cells": 6, "projected_days": 18},
@@ -134,6 +171,10 @@ def test_explicit_resource_admission_binds_budget_device_and_current_allocation(
         payload["supervised"]["cuda_peak_reserved_bytes"] = 10 * 1024**3
     elif change == "time":
         payload["matrix_projection"]["projected_days"] = 21
+    elif change == "old_protocol":
+        del payload["data_protocols"]
+    elif change == "label_pool":
+        payload["data_protocols"]["supervised"]["computational_universe"] = "sample_index"
     elif change == "fp16":
         payload["admission"]["cuda_fp16_verified"] = False
     write_json(config.admission_report, payload)

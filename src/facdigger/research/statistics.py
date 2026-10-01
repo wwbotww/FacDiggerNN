@@ -70,6 +70,8 @@ def newey_west_mean_inference(
         raise ValueError("lags cannot be negative")
     if not 0 < alpha < 0.5:
         raise ValueError("alpha must satisfy 0 < alpha < 0.5")
+    if not math.isfinite(null_mean):
+        raise ValueError("null_mean must be finite")
     array = _as_finite_array(values, name="values")
     count = len(array)
     if count == 0:
@@ -118,34 +120,44 @@ def newey_west_mean_inference(
 
 
 def non_overlapping_mean_inference(
-    values: list[float], *, stride: int, offset: int
+    values: list[float], *, stride: int, offset: int,
+    null_mean: float = 0.0, alpha: float = 0.05,
 ) -> dict[str, Any]:
     if stride < 1:
         raise ValueError("stride must be positive")
     if not 0 <= offset < stride:
         raise ValueError("offset must satisfy 0 <= offset < stride")
+    if not 0 < alpha < 0.5:
+        raise ValueError("alpha must satisfy 0 < alpha < 0.5")
+    if not math.isfinite(null_mean):
+        raise ValueError("null_mean must be finite")
     selected = _as_finite_array(values, name="values")[offset::stride]
     count = len(selected)
-    if count == 0:
-        return {
-            "n": 0,
-            "mean": None,
-            "standard_error": None,
-            "t_stat": None,
-            "stride": stride,
-            "offset": offset,
-        }
-    mean = float(selected.mean())
+    mean = float(selected.mean()) if count else None
     standard_error = float(selected.std(ddof=1) / math.sqrt(count)) if count > 1 else None
+    # Preserve the original sample-SE behavior, including SE=0 for constant data.
+    # This is descriptive robustness inference, not an additional decision gate.
+    t_stat = (
+        (mean - null_mean) / standard_error
+        if mean is not None and standard_error is not None and standard_error > 0 else None
+    )
     return {
         "n": count,
         "mean": mean,
         "standard_error": standard_error,
-        "t_stat": (
-            mean / standard_error if standard_error is not None and standard_error > 0 else None
-        ),
+        "t_stat": t_stat,
         "stride": stride,
         "offset": offset,
+        "null_mean": null_mean,
+        "alternative": "greater",
+        "p_value_one_sided": (
+            0.5 * math.erfc(t_stat / math.sqrt(2.0)) if t_stat is not None else None
+        ),
+        "confidence_level": 1.0 - alpha,
+        "lower_bound": (
+            mean - NormalDist().inv_cdf(1.0 - alpha) * standard_error
+            if t_stat is not None else None
+        ),
     }
 
 
@@ -166,6 +178,8 @@ def panel_mean_inference(
         raise ValueError("invalid non-overlapping stride or offset")
     if not 0 < alpha < 0.5:
         raise ValueError("alpha must satisfy 0 < alpha < 0.5")
+    if not math.isfinite(null_mean):
+        raise ValueError("null_mean must be finite")
     arrays = [
         _as_finite_array(group, name=f"groups[{index}]") for index, group in enumerate(groups)
     ]
@@ -174,7 +188,9 @@ def panel_mean_inference(
         return {
             "hac": newey_west_mean_inference([], hac_lags, null_mean=null_mean, alpha=alpha),
             "non_overlapping": {
-                **non_overlapping_mean_inference([], stride=stride, offset=offset),
+                **non_overlapping_mean_inference(
+                    [], stride=stride, offset=offset, null_mean=null_mean, alpha=alpha
+                ),
                 "fold_counts": [],
             },
         }
@@ -220,7 +236,7 @@ def panel_mean_inference(
     fold_counts = [len(array) for array in selected]
     non_overlapping_values = np.concatenate(selected) if selected else np.asarray([])
     non_overlapping = non_overlapping_mean_inference(
-        non_overlapping_values.tolist(), stride=1, offset=0
+        non_overlapping_values.tolist(), stride=1, offset=0, null_mean=null_mean, alpha=alpha
     )
     non_overlapping.update({"stride": stride, "offset": offset, "fold_counts": fold_counts})
     return {"hac": hac, "non_overlapping": non_overlapping}

@@ -387,6 +387,7 @@ def _resume_payload(
     history: list[dict[str, Any]],
     dataset_id: str,
     protocol_hash: str,
+    data_protocol: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "contract": FINANCE_PRETRAIN_RESUME_CHECKPOINT,
@@ -403,6 +404,7 @@ def _resume_payload(
         "history": history,
         "dataset_id": dataset_id,
         "protocol_hash": protocol_hash,
+        "data_protocol": data_protocol,
         "rng_state": _rng_state(),
     }
 
@@ -414,6 +416,7 @@ def _encoder_payload(
     probe: dict[str, Any],
     dataset_id: str,
     protocol_hash: str,
+    data_protocol: dict[str, Any],
     config: FinancePretrainingExperimentConfig,
 ) -> dict[str, Any]:
     return {
@@ -426,6 +429,7 @@ def _encoder_payload(
         "probe": probe,
         "dataset_id": dataset_id,
         "protocol_hash": protocol_hash,
+        "data_protocol": data_protocol,
         "context_length": model.context_length,
         "channels": config.channels,
         "market_channels": config.market_channels,
@@ -441,6 +445,7 @@ def train_finance_pretraining(
     probe_selection_dataset: FinanceTransformerWindowDataset,
     dataset_id: str,
     checkpoint_dir: Path,
+    data_protocol: dict[str, Any],
     resume_from: Path | None = None,
     stop_after_epoch: int | None = None,
     control: TrainingControl | None = None,
@@ -481,7 +486,9 @@ def train_finance_pretraining(
             ),
         )
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-        protocol_hash = sha256_json(config.model_dump(mode="json"))
+        protocol_hash = sha256_json(
+            {"config": config.model_dump(mode="json"), "data_protocol": data_protocol}
+        )
         start_epoch = 1
         global_step = 0
         best_probe_rank_ic = float("-inf")
@@ -503,7 +510,10 @@ def train_finance_pretraining(
                 raise ValueError("resume checkpoint is not a finance pretraining checkpoint")
             if checkpoint["dataset_id"] != dataset_id:
                 raise ValueError("pretraining resume dataset_id does not match")
-            if checkpoint["protocol_hash"] != protocol_hash:
+            if (
+                checkpoint["protocol_hash"] != protocol_hash
+                or checkpoint.get("data_protocol") != data_protocol
+            ):
                 raise ValueError("pretraining resume protocol does not match")
             model.load_state_dict(checkpoint["model_state"])
             optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -536,6 +546,7 @@ def train_finance_pretraining(
                     or (
                         best_payload.get("dataset_id") != dataset_id
                         or best_payload.get("protocol_hash") != protocol_hash
+                        or best_payload.get("data_protocol") != data_protocol
                         or best_payload.get("probe_rank_ic") != best_probe_rank_ic
                     )
                 ):
@@ -579,6 +590,7 @@ def train_finance_pretraining(
                     history=history,
                     dataset_id=dataset_id,
                     protocol_hash=protocol_hash,
+                    data_protocol=data_protocol,
                 )
                 state.update(
                     {
@@ -792,6 +804,7 @@ def train_finance_pretraining(
                     probe=probe,
                     dataset_id=dataset_id,
                     protocol_hash=protocol_hash,
+                    data_protocol=data_protocol,
                     config=config,
                 )
             )

@@ -19,6 +19,7 @@ class TransformerExperimentPaths(StrictModel):
 
 
 class TransformerComparisonDecision(StrictModel):
+    paired_mean_weighting: Literal["equal_date"] = "equal_date"
     minimum_paired_mean_rank_ic_delta: float = 0.001
     minimum_positive_folds: Literal[2] = 2
     require_positive_worst_fold: Literal[True] = True

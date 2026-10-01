@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from facdigger.data.config import SplitConfig, StrictModel
 
@@ -22,8 +22,31 @@ class ResearchModelConfigs(StrictModel):
     e3: Path
 
 
+class PositiveCellRatio(StrictModel):
+    """Exact minimum success fraction for a discrete fold/seed matrix."""
+
+    numerator: int = Field(default=2, strict=True, ge=0)
+    denominator: int = Field(default=3, strict=True, ge=1)
+
+    @model_validator(mode="after")
+    def validate_fraction(self) -> PositiveCellRatio:
+        if self.numerator > self.denominator:
+            raise ValueError("positive-cell numerator must not exceed denominator")
+        return self
+
+    def required_count(self, cell_count: int) -> int:
+        if cell_count < 1:
+            raise ValueError("positive-cell threshold requires at least one cell")
+        return (cell_count * self.numerator + self.denominator - 1) // self.denominator
+
+    def is_satisfied_by(self, positive_count: int, cell_count: int) -> bool:
+        if cell_count < 1 or not 0 <= positive_count <= cell_count:
+            raise ValueError("invalid positive-cell counts")
+        return positive_count * self.denominator >= cell_count * self.numerator
+
+
 class ResearchDecisionConfig(StrictModel):
-    minimum_positive_cell_ratio: float = Field(default=2 / 3, ge=0, le=1)
+    minimum_positive_cell_ratio: PositiveCellRatio = Field(default_factory=PositiveCellRatio)
     minimum_mean_rank_ic_delta: float = 0.0
     significance_alpha: float = Field(default=0.05, gt=0, lt=0.5)
     multiple_comparison_method: Literal["holm"] = "holm"
@@ -34,6 +57,16 @@ class ResearchDecisionConfig(StrictModel):
     cost_bps: float = Field(default=20.0, ge=0)
     require_neutralized_positive: bool = True
     require_source_research_ready: bool = True
+
+    @field_validator("minimum_positive_cell_ratio", mode="before")
+    @classmethod
+    def require_exact_positive_cell_ratio(cls, value: object) -> object:
+        if not isinstance(value, (dict, PositiveCellRatio)):
+            raise ValueError(
+                "minimum_positive_cell_ratio must use integer numerator and denominator; "
+                "migrate the old decimal research configuration explicitly"
+            )
+        return value
 
 
 class M6ResearchConfig(StrictModel):

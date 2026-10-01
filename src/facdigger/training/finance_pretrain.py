@@ -25,6 +25,7 @@ from facdigger.training.common import (
     load_required_snapshot_features,
     load_training_snapshot,
 )
+from facdigger.training.finance_data import finance_data_protocol, load_finance_selection
 from facdigger.training.finance_pretrain_config import (
     FinancePretrainingExperimentConfig,
 )
@@ -38,55 +39,6 @@ from facdigger.training.runtime import (
 from facdigger.training.runtime import (
     write_json as _write_json,
 )
-
-
-def _probe_index(
-    sample_index: pl.DataFrame,
-    *,
-    fit_dates: int,
-    selection_dates: int,
-) -> tuple[pl.DataFrame, dict[str, Any]]:
-    official_train = sample_index.filter(pl.col("split") == "train").sort(
-        ["asof_date", "security_id"]
-    )
-    dates = official_train["asof_date"].unique().sort().to_list()
-    if len(dates) < fit_dates + selection_dates:
-        raise DataContractError(
-            "finance pretraining probe has fewer Train dates than its fixed protocol"
-        )
-    selection = dates[-selection_dates:]
-    selection_start = selection[0]
-    fit_candidates = official_train.filter(pl.col("label_end") < selection_start)
-    available_fit_dates = fit_candidates["asof_date"].unique().sort().to_list()
-    if len(available_fit_dates) < fit_dates:
-        raise DataContractError("finance pretraining probe purge leaves too few fit dates")
-    fit = available_fit_dates[-fit_dates:]
-    probe_fit = official_train.filter(pl.col("asof_date").is_in(fit)).with_columns(
-        pl.lit("probe_fit").alias("split")
-    )
-    probe_selection = official_train.filter(pl.col("asof_date").is_in(selection)).with_columns(
-        pl.lit("probe_selection").alias("split")
-    )
-    if probe_fit.is_empty() or probe_selection.is_empty():
-        raise DataContractError("finance pretraining probe produced an empty partition")
-    if probe_fit["label_end"].max() >= selection_start:
-        raise DataContractError("finance pretraining probe labels overlap selection")
-    return (
-        pl.concat([probe_fit, probe_selection], how="vertical").sort(["asof_date", "security_id"]),
-        {
-            "policy": "fixed_train_tail_probe_with_label_overlap_purge",
-            "fit_dates": fit_dates,
-            "selection_dates": selection_dates,
-            "fit_rows": probe_fit.height,
-            "selection_rows": probe_selection.height,
-            "fit_min_asof_date": probe_fit["asof_date"].min(),
-            "fit_max_label_end": probe_fit["label_end"].max(),
-            "selection_min_asof_date": selection_start,
-            "selection_max_asof_date": probe_selection["asof_date"].max(),
-            "outer_validation_rows_used": 0,
-            "outer_test_rows_used": 0,
-        },
-    )
 
 
 def run_finance_pretraining(
@@ -109,6 +61,9 @@ def run_finance_pretraining(
             control=session_control,
             resume_from=resume_from,
             run_dir=run_dir,
+            data_protocol_loader=lambda path, manifest: finance_data_protocol(
+                path, manifest, config
+            ),
         ) as run:
             if run.manifest["status"] == "complete":
                 return run.path, json.loads(
@@ -159,11 +114,10 @@ def _run_finance_pretraining(
         pretraining_index = pl.read_parquet(dataset_path / artifact)
         if any(column.startswith("target") for column in pretraining_index.columns):
             raise DataContractError("snapshot pretraining index contains supervised targets")
-        probe_index, probe_audit = _probe_index(
-            frames["sample_index"],
-            fit_dates=config.training.probe.fit_dates,
-            selection_dates=config.training.probe.selection_dates,
+        _, probe_index, plan = load_finance_selection(
+            dataset_path, dataset_manifest, sample_index=frames["sample_index"]
         )
+        probe_audit = plan["probe"]
         context_length = int(feature_config["context_length"])
         if config.model.statistics_windows[-1] > context_length:
             raise DataContractError("model statistics window exceeds snapshot context")
@@ -237,6 +191,7 @@ def _run_finance_pretraining(
         probe_fit_dataset=probe_fit_dataset,
         probe_selection_dataset=probe_selection_dataset,
         dataset_id=str(dataset_manifest["dataset_id"]),
+        data_protocol=run.manifest["data_protocol"],
         checkpoint_dir=run_dir / "checkpoints",
         resume_from=resume_path,
         control=control,

@@ -13,6 +13,7 @@ import yaml
 
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
+from facdigger.datasets.splits import split_supervised_training_index
 from facdigger.datasets.window import SecurityFeatureStore, SnapshotWindowDataset
 from facdigger.environment import collect_environment
 from facdigger.evaluation.contracts import prediction_coverage
@@ -25,7 +26,6 @@ from facdigger.training.common import (
     load_required_snapshot_features,
     load_source_provenance,
     load_training_snapshot,
-    split_supervised_training_index,
 )
 from facdigger.training.e1_engine import predict_e1
 from facdigger.training.e2_config import E2ExperimentConfig

@@ -6,11 +6,11 @@ from pathlib import Path
 
 import polars as pl
 
+from facdigger.datasets.splits import split_supervised_training_index
 from facdigger.training.common import (
     apply_source_readiness_gate,
     load_required_snapshot_features,
     load_training_snapshot,
-    split_supervised_training_index,
 )
 
 

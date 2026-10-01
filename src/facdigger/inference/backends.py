@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
@@ -144,6 +145,10 @@ class CheckpointBackend(ABC):
             }
             if self.full_date_cross_section:
                 self._audit["full_date_cross_section"] = True
+            if self.model_type == "finance_patch_transformer":
+                self._audit["checkpoint_contract"] = checkpoint.get("contract")
+                if "data_protocol" in checkpoint:
+                    self._audit["checkpoint_data_protocol"] = deepcopy(checkpoint["data_protocol"])
         assert self._device is not None and self._precision is not None
         return self._model, self._device, self._precision
 
@@ -163,7 +168,7 @@ class CheckpointBackend(ABC):
 
     @property
     def audit(self) -> dict[str, Any]:
-        return dict(self._audit)
+        return deepcopy(self._audit)
 
     @staticmethod
     def score_frame(dataset: SnapshotInferenceWindowDataset, scores: Any) -> pl.DataFrame:
