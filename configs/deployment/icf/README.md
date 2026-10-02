@@ -11,6 +11,25 @@
 后者记录最大 fold 基准结果和固定 `e165754` 后的恢复验证；**不表示完整矩阵已经完成，
 也不是当前实时作业状态**。升级或换节点须重新核验相应范围。
 
+第二批 R+C 有单独的 `scripts/icf/diagnostics.sbatch`，不走正式矩阵或故障注入入口。
+通用协议、命令和预算见[诊断方案6.10](../../../docs/因子效果诊断与实验改进方案.md#batch2-execution)。
+启动前显式设置 `FD_DIAG_CODE`、`FD_DIAG_COMMIT`、`FD_DIAG_PYTHON`、`FD_DIAG_ROOT`、
+`FD_DIAG_DATASET`、`FD_DIAG_CHECKSUMS`；R 另需 `FD_DIAG_OLD_MATRIX`、`FD_DIAG_OLD_SNAPSHOTS`。
+路径不含凭据，code 必须是隔离的干净提交。script 的一个位置参数为 R/cache/候选名。
+
+| phase 参数 | sbatch 时限 | 内存 | GPU |
+|---|---|---|---|
+| R | `04:00:00` | `32G` | `h200_1g.18gb:1` |
+| cache | `02:00:00` | `64G` | 无 |
+| statistics_linear | `00:45:00` | `32G` | `h200_1g.18gb:1` |
+| statistics_mlp | `00:45:00` | `32G` | `h200_1g.18gb:1` |
+| finance | `06:30:00` | `32G` | `h200_1g.18gb:1` |
+
+所有阶段4 CPU；显式传 `--output/--error` 到隔离证据目录。C 的三个作业依赖 cache 成功
+并等待 R 结束；C 加 `--signal=USR1@180`，signal 交给 srun step 中的 TrainingControl。
+默认禁止 requeue。失败后依据 sacct 已消耗时间核销本轮总预算，不能再次申请整份预算。
+这些是学校部署值；普通服务器可以直接调用 research 脚本并保持相同科学配置。
+
 ## 1. 准备独立环境和稳定资产
 
 固定已审阅提交的完整 clone 到 `/home/$USER/facdigger/code`，保留 `.git`、配置和

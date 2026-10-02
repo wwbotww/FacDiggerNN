@@ -206,6 +206,7 @@ def _verify_replay(
     predictions: pl.DataFrame,
     *,
     require_match: bool,
+    asof_dates: list[date] | None = None,
 ) -> dict[str, Any]:
     original_path = run_dir / "predictions.parquet"
     expected = split == manifest["evaluation_split"]
@@ -220,6 +221,10 @@ def _verify_replay(
         return {"applicable": True, "available": False, "matched": None}
     keys = ["security_id", "asof_date", "target"]
     original = pl.read_parquet(original_path).sort(["asof_date", "security_id"])
+    if asof_dates is not None:
+        original = original.filter(pl.col("asof_date").is_in(asof_dates))
+        if set(original["asof_date"].to_list()) != set(asof_dates):
+            raise DataContractError("replay panel contains dates absent from source predictions")
     replayed = predictions.sort(["asof_date", "security_id"])
     if not original.select(keys).equals(replayed.select(keys), null_equal=True):
         raise DataContractError("replayed prediction keys or targets differ from source run")

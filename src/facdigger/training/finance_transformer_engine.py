@@ -27,6 +27,7 @@ from facdigger.models.finance_scoring import (
     _market_tensors,
     predict_finance_transformer,
 )
+from facdigger.models.finance_statistics import FinanceStatisticsRanker, StatisticsKind
 from facdigger.training.e1_engine import (
     _dates_in_current_optimizer_step,
     _restore_rng_state,
@@ -211,6 +212,17 @@ def backward_complete_date_with_embedding_replay(
         scale_regularization=scale_regularization,
     )
     scaler.scale(loss / dates_in_optimizer_step).backward()
+    if isinstance(model, FinanceStatisticsRanker):
+        # Cached statistics have no trainable encoder; the full-date head graph above
+        # already computed every parameter gradient on the same labelled support.
+        return {
+            **loss_audit, "rows": int(local_leaf.shape[0]),
+            "labelled_rows": int(label_mask.sum()),
+            "unlabelled_rows": int((~label_mask).sum()),
+            "physical_microbatches": len(microbatches),
+            "maximum_local_replay_error": 0.0, "market_replay_error": 0.0,
+            "context_gate": date_output.context_gate.detach().float().cpu().tolist(),
+        }
     if local_leaf.grad is None or market_leaf.grad is None:
         raise RuntimeError("cross-sectional graph did not return embedding gradients")
     local_gradients = local_leaf.grad.detach().clone()
@@ -409,7 +421,7 @@ def _optimizer_parameter_groups(
     head_learning_rate: float,
     weight_decay: float,
 ) -> list[dict[str, Any]]:
-    encoder_ids = {
+    encoder_ids = set() if isinstance(model, FinanceStatisticsRanker) else {
         id(parameter)
         for module in (
             model.local_encoder.backbone,
@@ -481,12 +493,17 @@ def _checkpoint_payload(
     return {
         "schema_version": 4,
         "contract": FINANCE_TRANSFORMER_CHECKPOINT,
-        "model_type": "finance_patch_transformer",
+        "model_type": (
+            model.kind if isinstance(model, FinanceStatisticsRanker)
+            else "finance_patch_transformer"
+        ),
         "objective": FINANCE_TRANSFORMER_OBJECTIVE,
         "target_transform": TARGET_TRANSFORM,
         "optimization_protocol": {
             "unit": "complete_date",
-            "method": "exact_leaf_embedding_replay",
+            "method": ("full_date_head_on_fixed_statistics"
+                       if isinstance(model, FinanceStatisticsRanker)
+                       else "exact_leaf_embedding_replay"),
             "physical_microbatch_size": config_payload["training"]["batch_size"],
             "dates_per_optimizer_step": config_payload["training"]["dates_per_optimizer_step"],
         },
@@ -525,6 +542,8 @@ def train_finance_transformer(
     stop_after_epoch: int | None = None,
     control: TrainingControl | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    diagnostic_model: StatisticsKind | None = None,
+    state_observer: Callable[[torch.nn.Module, int], None] | None = None,
 ) -> tuple[FinancePatchTransformer, dict[str, Any]]:
     started_at = time.perf_counter()
     control = control or TrainingControl()
@@ -535,7 +554,17 @@ def train_finance_transformer(
         seed_everything(config.seed)
         device = select_device(config.training.device)
         amp_enabled = device == "cuda" and config.training.precision == "fp16"
-        model = build_finance_transformer_model(config, context_length=train_dataset.context_length)
+        if diagnostic_model is not None and config.initialization != "scratch":
+            raise ValueError("statistics diagnostics require scratch initialization")
+        model = (
+            FinanceStatisticsRanker(
+                diagnostic_model,
+                input_dim=(len(config.channels) + len(config.market_channels))
+                * (5 * len(config.model.statistics_windows) + 1),
+                horizons=tuple(config.horizons),
+            ) if diagnostic_model is not None else
+            build_finance_transformer_model(config, context_length=train_dataset.context_length)
+        )
         initialization_audit: dict[str, Any] = {"method": config.initialization}
         if config.initialization == "finance_pretrained" and resume_from is None:
             assert config.pretrained_checkpoint is not None
@@ -585,7 +614,10 @@ def train_finance_transformer(
             config, train_dataset, train_labelled_rows
         )
         config_payload = config.model_dump(mode="json")
-        protocol_hash = sha256_json({"config": config_payload, "data_protocol": data_protocol})
+        protocol_identity = {"config": config_payload, "data_protocol": data_protocol}
+        if diagnostic_model is not None:
+            protocol_identity["diagnostic_model"] = diagnostic_model
+        protocol_hash = sha256_json(protocol_identity)
         start_epoch = 1
         global_step = 0
         best_selection_score = float("-inf")
@@ -735,6 +767,28 @@ def train_finance_transformer(
                 )
             control.raise_if_stopping(last_checkpoint)
 
+    def observe(epoch_number: int) -> None:
+        if state_observer is None:
+            return
+        rng = _rng_state()
+        modes = [(module, module.training) for module in model.modules()]
+        gradients = [(p, None if p.grad is None else p.grad.detach().clone())
+                     for p in model.parameters()]
+        try:
+            with torch.no_grad():
+                state_observer(model, epoch_number)
+        finally:
+            for module, training in modes:
+                module.training = training
+            for parameter, gradient in gradients:
+                parameter.grad = gradient
+            _restore_rng_state(rng)
+
+    if resume_from is None:
+        observe(0)
+    elif phase == "epoch_complete":
+        # Repair an observation interrupted after the committed training boundary.
+        observe(int(checkpoint["epoch"]))
     if resume_from is None and control.enabled:
         persist(force=True)
     elif resume_from is not None:
@@ -799,6 +853,16 @@ def train_finance_transformer(
                 )
                 if not should_step:
                     continue
+                module_gradient_norms = {}
+                if state_observer is not None:
+                    scale = scaler.get_scale() if amp_enabled else 1.0
+                    for name, parameter in model.named_parameters():
+                        if parameter.grad is not None:
+                            family = name.split(".", 1)[0]
+                            norm = (parameter.grad.detach().float() / scale).square().sum()
+                            module_gradient_norms[family] = (
+                                module_gradient_norms.get(family, 0.0) + float(norm.cpu())
+                            )
                 gradient_norm, optimizer_updated = _step_optimizer(
                     optimizer,
                     scaler,
@@ -808,6 +872,15 @@ def train_finance_transformer(
                     experiment_name="finance_patch_transformer",
                 )
                 cursor = date_index
+                if state_observer is not None and progress_callback is not None:
+                    progress_callback({
+                        "event": "diagnostic_gradients", "epoch": epoch, "cursor": cursor,
+                        "optimizer_updated": optimizer_updated,
+                        "module_pre_clip_norms": {
+                            k: math.sqrt(v) if math.isfinite(v) else None
+                            for k, v in module_gradient_norms.items()
+                        },
+                    })
                 max_update_seconds = max(max_update_seconds, time.perf_counter() - update_started)
                 if not optimizer_updated:
                     amp_skipped_optimizer_steps += 1
@@ -934,6 +1007,7 @@ def train_finance_transformer(
         if improved:
             with observation.phase("best_export", epoch=best_epoch):
                 save_checkpoint(best_checkpoint, best_payload)
+        observe(epoch)
         if progress_callback is not None:
             progress_callback(
                 {
@@ -966,7 +1040,9 @@ def train_finance_transformer(
         "target_transform": TARGET_TRANSFORM,
         "optimization_protocol": {
             "unit": "complete_date",
-            "method": "exact_leaf_embedding_replay",
+            "method": ("full_date_head_on_fixed_statistics"
+                       if isinstance(model, FinanceStatisticsRanker)
+                       else "exact_leaf_embedding_replay"),
             "physical_microbatch_size": config.training.batch_size,
             "dates_per_optimizer_step": config.training.dates_per_optimizer_step,
             "total_update_budget": total_update_budget,

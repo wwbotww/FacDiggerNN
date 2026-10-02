@@ -160,20 +160,31 @@ class MultiScaleStatisticsEncoder(nn.Module):
         return [mean, std, minimum, maximum, observed_ratio]
 
     def forward(self, values: torch.Tensor, observed_mask: torch.Tensor) -> torch.Tensor:
+        return self.network(self.statistics(
+            values, observed_mask, num_asset_channels=self.num_asset_channels,
+            windows=self.windows,
+        ))
+
+    @staticmethod
+    def statistics(
+        values: torch.Tensor, observed_mask: torch.Tensor, *,
+        num_asset_channels: int, windows: tuple[int, ...],
+    ) -> torch.Tensor:
+        """The shared deterministic masked extraction, before any learned projection."""
         if values.shape != observed_mask.shape or values.ndim != 3:
             raise ValueError("values and observed_mask must share [B,L,C] shape")
-        if values.shape[2] < self.num_asset_channels:
+        if values.shape[2] < num_asset_channels:
             raise ValueError("values contain fewer channels than the statistics config")
-        asset_values = values[:, :, : self.num_asset_channels]
-        asset_observed = observed_mask[:, :, : self.num_asset_channels].bool()
+        asset_values = values[:, :, :num_asset_channels]
+        asset_observed = observed_mask[:, :, :num_asset_channels].bool()
         statistics: list[torch.Tensor] = []
-        for window in self.windows:
+        for window in windows:
             if window > values.shape[1]:
                 raise ValueError(
                     f"statistics window {window} exceeds context {values.shape[1]}"
                 )
             statistics.extend(
-                self._window_statistics(
+                MultiScaleStatisticsEncoder._window_statistics(
                     asset_values[:, -window:, :], asset_observed[:, -window:, :]
                 )
             )
@@ -189,7 +200,7 @@ class MultiScaleStatisticsEncoder(nn.Module):
         ).squeeze(1)
         latest = latest * (last_indices >= 0).to(latest.dtype)
         statistics.append(latest)
-        return self.network(torch.cat(statistics, dim=1))
+        return torch.cat(statistics, dim=1)
 
 
 def _patchtst_backbone(

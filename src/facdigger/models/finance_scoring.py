@@ -88,7 +88,7 @@ def _market_tensors(
     return values, observed
 
 
-def predict_finance_transformer(
+def predict_finance_horizons(
     model: FinancePatchTransformer,
     dataset: FinanceScoringDataset,
     *,
@@ -108,8 +108,7 @@ def predict_finance_transformer(
     )
     sampler.set_epoch(0)
     amp_enabled = device == "cuda" and precision == "fp16"
-    primary_column = model.horizons.index(dataset.primary_horizon)
-    predictions = np.empty(len(dataset), dtype=np.float64)
+    predictions = np.empty((len(dataset), len(model.horizons)), dtype=np.float64)
     model.eval()
     with torch.no_grad():
         for date_index, full_date_batch in enumerate(loader, start=1):
@@ -130,11 +129,28 @@ def predict_finance_transformer(
             )
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
                 market = model.encode_market(market_values, market_observed)
-                scores = model.score_date(torch.cat(local_chunks, dim=0), market).scores[
-                    :, primary_column
-                ]
+                scores = model.score_date(torch.cat(local_chunks, dim=0), market).scores
             indices = full_date_batch["sample_index"].numpy()
             predictions[indices] = scores.detach().float().cpu().numpy()
             if progress_callback is not None:
                 progress_callback(date_index, len(loader))
     return predictions
+
+
+def predict_finance_transformer(
+    model: FinancePatchTransformer,
+    dataset: FinanceScoringDataset,
+    *,
+    batch_size: int,
+    device: str,
+    precision: str,
+    num_workers: int,
+    check_stop: Callable[[], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> np.ndarray:
+    """Keep the public primary-horizon prediction contract unchanged."""
+    scores = predict_finance_horizons(
+        model, dataset, batch_size=batch_size, device=device, precision=precision,
+        num_workers=num_workers, check_stop=check_stop, progress_callback=progress_callback,
+    )
+    return scores[:, model.horizons.index(dataset.primary_horizon)]
