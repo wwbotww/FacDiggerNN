@@ -295,6 +295,9 @@ def _run_prefix(
             if last["progress"]["finished"]:
                 raise DataContractError("two epochs cannot satisfy full-training completion")
             device = select_device(config.training.device)
+            audit["observation_precision"] = (
+                "fp16" if device == "cuda" and config.training.precision == "fp16" else "fp32"
+            )
             model = (
                 build_finance_transformer_model(config, context_length=datasets["F"].context_length)
                 if candidate == "finance"

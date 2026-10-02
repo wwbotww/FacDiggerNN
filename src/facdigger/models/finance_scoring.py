@@ -107,7 +107,7 @@ def predict_finance_horizons(
         minimum_group_size=1,
     )
     sampler.set_epoch(0)
-    amp_enabled = device == "cuda" and precision == "fp16"
+    amp_enabled = torch.device(device).type == "cuda" and precision == "fp16"
     predictions = np.empty((len(dataset), len(model.horizons)), dtype=np.float64)
     model.eval()
     with torch.no_grad():

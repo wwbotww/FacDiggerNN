@@ -30,6 +30,14 @@
 默认禁止 requeue。失败后依据 sacct 已消耗时间核销本轮总预算，不能再次申请整份预算。
 这些是学校部署值；普通服务器可以直接调用 research 脚本并保持相同科学配置。
 
+完整 F/固定8日梯度诊断另用 `scripts/icf/fixed_diagnostics.sbatch`。保留上述通用路径
+变量，`FD_DIAG_ROOT` 必须改成新证据目录；另设 `FD_DIAG_SOURCE` 为已完成的原 `C/`
+父目录、`FD_DIAG_CACHE` 为原 `cache/`。code/commit 绑定新实现，原 R/C checkout 不动。
+候选参数仍为 finance/statistics_linear/statistics_mlp；分别显式申请2小时/10分钟/20分钟，
+每个4 CPU、32 GiB、`h200_1g.18gb:1`，合计2.5 GPU小时；添加 `--signal=USR1@180`
+及独立日志路径，禁止自动重排队。这里没有训练更新或 S/V 重评分。
+通用计算与恢复边界见[固定状态入口](../../../docs/因子效果诊断与实验改进方案.md#batch2-fixed-execution)。
+
 ## 1. 准备独立环境和稳定资产
 
 固定已审阅提交的完整 clone 到 `/home/$USER/facdigger/code`，保留 `.git`、配置和

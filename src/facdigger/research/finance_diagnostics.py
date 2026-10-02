@@ -152,14 +152,20 @@ def diagnostic_daily(
 
 
 def score_panel(
-    model: Any, dataset: Any, labelled: pl.DataFrame, config: Any, *, check_stop=None
+    model: Any,
+    dataset: Any,
+    labelled: pl.DataFrame,
+    config: Any,
+    *,
+    check_stop=None,
+    precision: str | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     scores = predict_finance_horizons(
         model,
         dataset,
         batch_size=config.training.batch_size,
         device=str(next(model.parameters()).device),
-        precision=config.training.precision,
+        precision=config.training.precision if precision is None else precision,
         num_workers=0,
         check_stop=check_stop,
     )

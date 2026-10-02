@@ -105,10 +105,14 @@ def _multi_horizon_loss(
     horizon_weights: dict[int, float],
     epsilon: float,
     scale_regularization: float,
+    diagnostic_component: int | str | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if scores.shape != target_ranks.shape or scores.ndim != 2:
         raise ValueError("scores and target ranks must share [N,H] shape")
+    if diagnostic_component not in (None, "scale", *horizons):
+        raise ValueError("unknown diagnostic loss component")
     total = scores.new_zeros((), dtype=torch.float32)
+    component = None
     audit: dict[str, float] = {}
     scale_penalty = scores.new_zeros((), dtype=torch.float32)
     for column, horizon in enumerate(horizons):
@@ -118,13 +122,19 @@ def _multi_horizon_loss(
         )
         score_std = scores[:, column].float().std(unbiased=False)
         total = total + weight * horizon_loss
+        if diagnostic_component == horizon:
+            component = weight * horizon_loss
         scale_penalty = scale_penalty + weight * torch.log(score_std + epsilon).square()
         audit[f"rank_loss_{horizon}"] = float(horizon_loss.detach().cpu())
         audit[f"score_std_{horizon}"] = float(score_std.detach().cpu())
     total = total + scale_regularization * scale_penalty
+    if diagnostic_component == "scale":
+        component = scale_regularization * scale_penalty
     audit["scale_penalty"] = float(scale_penalty.detach().cpu())
     audit["loss"] = float(total.detach().cpu())
-    return total, audit
+    # Training and evaluation retain the exact original total and arithmetic order.
+    # Research can differentiate one weighted term without changing the public config.
+    return total if diagnostic_component is None else component, audit
 
 
 def _replay_matches(
@@ -167,6 +177,7 @@ def backward_complete_date_with_embedding_replay(
     dates_in_optimizer_step: int,
     relative_tolerance: float,
     absolute_tolerance: float,
+    diagnostic_component: int | str | None = None,
 ) -> dict[str, Any]:
     """Backpropagate one exact full-date hierarchy with bounded temporal graphs."""
 
@@ -210,6 +221,7 @@ def backward_complete_date_with_embedding_replay(
         horizon_weights=horizon_weights,
         epsilon=epsilon,
         scale_regularization=scale_regularization,
+        diagnostic_component=diagnostic_component,
     )
     scaler.scale(loss / dates_in_optimizer_step).backward()
     if isinstance(model, FinanceStatisticsRanker):
