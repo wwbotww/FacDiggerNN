@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -180,7 +181,7 @@ def _run_prefix(
             checkpoint_interval_seconds=600,
             max_walltime_seconds=budget_seconds,
             shutdown_margin_seconds=180,
-            handle_signals=True,
+            handle_signals=hasattr(signal, "SIGUSR1"),
         ),
         clock=time.monotonic,
     )

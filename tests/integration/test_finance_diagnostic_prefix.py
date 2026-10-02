@@ -161,6 +161,7 @@ def test_observation_and_prefix_resume_preserve_training_state(tmp_path, candida
 
 def test_prefix_orchestration_exports_diagnostics_without_finishing_training(tmp_path, monkeypatch):
     import json
+    from types import SimpleNamespace
 
     import polars as pl
 
@@ -204,6 +205,8 @@ def test_prefix_orchestration_exports_diagnostics_without_finishing_training(tmp
         runner, "collect_git_state", lambda *a: {"dirty": False, "commit": "fixture"}
     )
     monkeypatch.setattr(runner, "collect_environment", lambda: {})
+    # Windows has no SIGUSR1; the same runner still uses walltime/epoch-boundary pause.
+    monkeypatch.setattr(runner, "signal", SimpleNamespace())
     monkeypatch.setattr(
         runner, "fixed_dates", lambda rows: rows["asof_date"].unique().sort().to_list()
     )
