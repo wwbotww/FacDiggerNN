@@ -33,9 +33,15 @@
 完整 F/固定8日梯度诊断另用 `scripts/icf/fixed_diagnostics.sbatch`。保留上述通用路径
 变量，`FD_DIAG_ROOT` 必须改成新证据目录；另设 `FD_DIAG_SOURCE` 为已完成的原 `C/`
 父目录、`FD_DIAG_CACHE` 为原 `cache/`。code/commit 绑定新实现，原 R/C checkout 不动。
-候选参数仍为 finance/statistics_linear/statistics_mlp；分别显式申请2小时/10分钟/20分钟，
-每个4 CPU、32 GiB、`h200_1g.18gb:1`，合计2.5 GPU小时；添加 `--signal=USR1@180`
-及独立日志路径，禁止自动重排队。这里没有训练更新或 S/V 重评分。
+候选参数仍为 finance/statistics_linear/statistics_mlp。Finance与MLP分别申请2小时/20分钟，
+`--signal=USR1@180`；2026-10-03获准扩展的Linear续跑申请45分钟，`--signal=USR1@300`，
+内部预算2,100秒、退出余量300秒、累计内部预算上限3,600秒。45分钟与35分钟内部预算
+之间另留10分钟覆盖启动和延迟退出，不能保证抢占内核中的磁盘等待。
+每个仍为4 CPU、32 GiB、`h200_1g.18gb:1`，独立日志，禁止自动重排队。
+Linear设置 `FD_DIAG_REUSE_LINEAR_CHUNKS=/path/to/previous-fixed/statistics_linear`，新输出
+目录校验并复用旧的已提交块；原审计、代码身份和部分结果不改写。旧225秒allocation
+另计，新45分钟allocation加旧用量不超过本次设定的1小时Linear累计上限。
+这里没有训练更新或 S/V 重评分，原来2.5小时是首轮部署预算记录，不是科学协议限制。
 通用计算与恢复边界见[固定状态入口](../../../docs/因子效果诊断与实验改进方案.md#batch2-fixed-execution)。
 
 ## 1. 准备独立环境和稳定资产

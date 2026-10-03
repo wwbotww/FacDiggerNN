@@ -243,6 +243,109 @@ def test_indexed_cuda_scoring_uses_the_same_precision(monkeypatch):
     assert not (plain == fp32).all()
 
 
+def test_linear_budget_continuation_reuses_committed_dates_without_rebinding_old_run(
+    tmp_path, monkeypatch
+):
+    config, dataset, labels, model, source = _fixture(tmp_path, monkeypatch, "statistics_linear")
+    previous = tmp_path / "previous"
+    destination = tmp_path / "continued"
+    original_write = runner._write_chunk
+    original_score = runner.score_panel
+    scored = []
+
+    def score(model, data, *args, **kwargs):
+        scored.extend(data.sample_rows["asof_date"].unique().to_list())
+        return original_score(model, data, *args, **kwargs)
+
+    def pause(path, tables):
+        original_write(path, tables)
+        raise TimeoutError("injected safe pause")
+
+    def run(output, **kwargs):
+        return runner.run_fixed_diagnostics(
+            tmp_path / "snapshot",
+            tmp_path / "checksums",
+            config,
+            tmp_path / "cache",
+            source,
+            output,
+            repository_root=tmp_path,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(runner, "score_panel", score)
+    monkeypatch.setattr(runner, "_write_chunk", pause)
+    assert run(previous, budget_seconds=300)["status"] == "paused_budget_or_signal"
+    monkeypatch.setattr(runner, "_write_chunk", original_write)
+    path = previous / "diagnostic.json"
+    audit = json.loads(path.read_text())
+    audit["attempts"][-1]["elapsed_seconds"] = 100.0
+    write_json(path, audit)
+    # An uncommitted temporary output must not be imported as successful scoring.
+    incomplete = previous / "chunks/epoch-1-0001"
+    incomplete.mkdir()
+    (incomplete / "predictions.parquet.tmp").write_bytes(b"interrupted write")
+    original_hashes = {p: sha256_file(p) for p in previous.rglob("*") if p.is_file()}
+    monkeypatch.setattr(
+        runner, "collect_git_state", lambda *a: {"dirty": False, "commit": "runtime-change"}
+    )
+    # Changing resource policy does not silently permit overwriting an old run identity.
+    with pytest.raises(DataContractError, match="continuation identity"):
+        run(previous, budget_seconds=300)
+    with pytest.raises(ValueError, match="outside approved bounds"):
+        run(destination, budget_seconds=900, reuse_linear_chunks=previous)
+    with pytest.raises(ValueError, match="debit previous"):
+        run(
+            destination,
+            budget_seconds=900,
+            cumulative_budget_seconds=999,
+            reuse_linear_chunks=previous,
+        )
+    completed = run(
+        destination,
+        budget_seconds=2100,
+        cumulative_budget_seconds=3600,
+        shutdown_margin_seconds=300,
+        reuse_linear_chunks=previous,
+    )
+    assert completed["status"] == "fixed_diagnostics_complete"
+    assert completed["identity"]["code_commit"] == "runtime-change"
+    assert completed["identity"]["reused_linear_chunks"]["identity"] == audit["identity"]
+    assert completed["identity"]["reused_linear_chunks"]["dates_per_epoch"] == {"1": 1, "2": 0}
+    assert completed["attempts"][-1]["prior_elapsed_seconds"] == 100.0
+    assert completed["attempts"][-1]["shutdown_margin_seconds"] == 300
+    assert completed["optimizer_updates"] == 0 and completed["model_state_unchanged"]
+    dates = labels["asof_date"].unique().sort().to_list()
+    assert sorted(scored) == sorted([dates[1], dates[2]] * 2)
+    assert original_hashes == {p: sha256_file(p) for p in original_hashes}
+    events = [
+        json.loads(line) for line in (destination / "progress.jsonl").read_text().splitlines()
+    ]
+    assert len([event for event in events if event["event"] == "F_chunk_reused"]) == 1
+    for epoch in (1, 2):
+        model.load_state_dict(
+            torch.load(source / f"observations/epoch-{epoch}.pt", weights_only=False)["model_state"]
+        )
+        daily, predictions = original_score(model, dataset, labels, config)
+        assert pl.read_parquet(destination / f"epoch-{epoch}-F-daily.parquet").equals(
+            daily.sort("asof_date", "horizon")
+        )
+        assert pl.read_parquet(destination / f"epoch-{epoch}-F-predictions.parquet").equals(
+            predictions
+        )
+    # Explicit reuse still refuses scientific drift and damaged source output.
+    altered = json.loads(path.read_text())
+    altered["identity"]["fixed_forward_precision"] = "fp16"
+    write_json(path, altered)
+    with pytest.raises(DataContractError, match="scientific protocol"):
+        run(tmp_path / "wrong-precision", budget_seconds=300, reuse_linear_chunks=previous)
+    write_json(path, audit)
+    with (previous / "chunks/epoch-1-0000/predictions.parquet").open("ab") as stream:
+        stream.write(b"corrupt")
+    with pytest.raises(DataContractError, match="checksum mismatch"):
+        run(tmp_path / "damaged", budget_seconds=300, reuse_linear_chunks=previous)
+
+
 @pytest.mark.parametrize("candidate", ["finance", "statistics_mlp"])
 def test_gradient_geometry_preserves_state_modes_rng_and_existing_gradients(
     tmp_path,

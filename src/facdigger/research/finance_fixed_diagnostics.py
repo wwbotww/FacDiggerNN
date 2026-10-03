@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import signal
 import time
 from pathlib import Path
@@ -199,6 +200,51 @@ def _source_files(source: Path) -> list[Path]:
     ]
 
 
+def _linear_chunk_source(path: Path, identity: dict) -> dict:
+    """Bind an explicitly reused, paused Linear observation; never rewrite its identity.
+
+    A new output can use already committed scores after a runtime-code change.
+    Ordinary in-place continuation still requires the exact code commit. All
+    scientific fields, source weight hashes, precision and dependencies must match.
+    """
+    previous = json.loads((path / "diagnostic.json").read_text())
+    previous_identity = previous["identity"]
+    current_science = {k: v for k, v in identity.items() if k != "code_commit"}
+    previous_science = {k: v for k, v in previous_identity.items() if k != "code_commit"}
+    if (
+        identity["source"]["candidate"] != "statistics_linear"
+        or previous_science != current_science
+        or previous.get("status") != "paused_budget_or_signal"
+        or previous.get("optimizer_updates") != 0
+        or previous.get("holdout_used") is not False
+    ):
+        raise DataContractError("reused Linear chunks differ from the fixed scientific protocol")
+    elapsed = 0.0
+    for attempt in previous["attempts"]:
+        seconds = attempt.get("elapsed_seconds")
+        if seconds is None or not math.isfinite(seconds) or seconds < 0:
+            raise DataContractError("reused Linear attempt has no closed resource accounting")
+        elapsed += seconds
+    manifests, dates = {}, {"1": 0, "2": 0}
+    for marker in sorted((path / "chunks").glob("*/complete.json")):
+        match = re.fullmatch(r"epoch-([12])-\d{4}", marker.parent.name)
+        if match is None:
+            raise DataContractError("reused Linear chunk name differs")
+        tables = _read_chunk(marker.parent)
+        manifests[marker.parent.name] = sha256_file(marker)
+        dates[match[1]] += tables["daily"]["asof_date"].n_unique()
+    if not manifests:
+        raise DataContractError("reused Linear run has no committed chunks")
+    return {
+        "path": str(path.resolve()),
+        "audit_sha256": sha256_file(path / "diagnostic.json"),
+        "identity": previous_identity,
+        "chunk_manifests": manifests,
+        "dates_per_epoch": dates,
+        "elapsed_seconds": elapsed,
+    }
+
+
 def _summary(output: Path, dates: list, gradients: list) -> dict:
     bins = {
         day: i + 1 for i, part in enumerate(np.array_split(np.asarray(dates), 5)) for day in part
@@ -269,16 +315,34 @@ def run_fixed_diagnostics(
     *,
     budget_seconds: float,
     repository_root: Path,
+    cumulative_budget_seconds: float | None = None,
+    shutdown_margin_seconds: float = 120,
+    reuse_linear_chunks: Path | None = None,
 ) -> dict:
     started = time.monotonic()
-    for protected in (snapshot, cache, source):
+    protected_inputs = [snapshot, cache, source]
+    if reuse_linear_chunks is not None:
+        protected_inputs.append(reuse_linear_chunks)
+    for protected in protected_inputs:
         if output.resolve().is_relative_to(
             protected.resolve()
         ) or protected.resolve().is_relative_to(output.resolve()):
             raise ValueError("fixed diagnostic output must be disjoint from immutable inputs")
     original = json.loads((source / "diagnostic.json").read_text())
     candidate = original["identity"]["candidate"]
-    if candidate not in ALLOCATION_CAPS or not 120 < budget_seconds <= ALLOCATION_CAPS[candidate]:
+    if candidate not in ALLOCATION_CAPS:
+        raise ValueError("unknown fixed diagnostic candidate")
+    cumulative_budget = (
+        ALLOCATION_CAPS[candidate]
+        if cumulative_budget_seconds is None
+        else cumulative_budget_seconds
+    )
+    runtime = TrainingRuntimeConfig(
+        max_walltime_seconds=budget_seconds,
+        shutdown_margin_seconds=shutdown_margin_seconds,
+        handle_signals=hasattr(signal, "SIGUSR1"),
+    )
+    if not math.isfinite(cumulative_budget) or not 0 < budget_seconds <= cumulative_budget:
         raise ValueError("fixed diagnostic candidate/allocation budget is outside approved bounds")
     if (
         original.get("status") != "observations_complete"
@@ -340,6 +404,9 @@ def run_fixed_diagnostics(
         if device == "cuda" and config.training.precision == "fp16"
         else 2e-5,
     }
+    scientific_identity = identity.copy()
+    if reuse_linear_chunks is not None:
+        identity["reused_linear_chunks"] = _linear_chunk_source(reuse_linear_chunks, identity)
     output.mkdir(parents=True, exist_ok=True)
     audit_path = output / "diagnostic.json"
     with run_lock(output / ".diagnostic.lock"):
@@ -357,21 +424,24 @@ def run_fixed_diagnostics(
                 "holdout_used": False,
             }
         # An unclosed attempt conservatively consumes its reserved budget.
-        used = sum(a.get("elapsed_seconds", a["budget_seconds"]) for a in audit["attempts"])
-        if used + budget_seconds > ALLOCATION_CAPS[candidate]:
+        used = identity.get("reused_linear_chunks", {}).get("elapsed_seconds", 0.0)
+        used += sum(a.get("elapsed_seconds", a["budget_seconds"]) for a in audit["attempts"])
+        if used + budget_seconds > cumulative_budget:
             raise ValueError("retry budget must debit previous fixed diagnostic attempts")
-        audit["attempts"].append({"environment": environment, "budget_seconds": budget_seconds})
+        audit["attempts"].append(
+            {
+                "environment": environment,
+                "budget_seconds": budget_seconds,
+                "cumulative_budget_seconds": cumulative_budget,
+                "shutdown_margin_seconds": shutdown_margin_seconds,
+                "prior_elapsed_seconds": used,
+            }
+        )
         audit["status"] = "running"
         audit.pop("reason", None)
         audit.pop("error", None)
         write_json(audit_path, audit)
-        control = TrainingControl(
-            TrainingRuntimeConfig(
-                max_walltime_seconds=budget_seconds,
-                shutdown_margin_seconds=120,
-                handle_signals=hasattr(signal, "SIGUSR1"),
-            )
-        )
+        control = TrainingControl(runtime)
         control.started = started
 
         def check_stop():
@@ -394,11 +464,16 @@ def run_fixed_diagnostics(
                     check_stop,
                     started,
                     budget_seconds,
+                    shutdown_margin_seconds,
                 )
                 if source_hashes != {
                     str(p.relative_to(source)): sha256_file(p) for p in _source_files(source)
                 }:
                     raise DataContractError("original C inputs changed during fixed diagnostics")
+                if reuse_linear_chunks is not None and identity["reused_linear_chunks"] != (
+                    _linear_chunk_source(reuse_linear_chunks, scientific_identity)
+                ):
+                    raise DataContractError("reused Linear inputs changed during fixed diagnostics")
                 audit["status"] = "fixed_diagnostics_complete"
         except TimeoutError as exc:
             audit.update(status="paused_budget_or_signal", reason=str(exc))
@@ -425,6 +500,7 @@ def _observe_fixed(
     check_stop,
     started,
     budget_seconds,
+    shutdown_margin_seconds,
 ):
     manifest, fit, pool = fit_inputs(
         snapshot, checksums, config, original["identity"]["data_protocol"]
@@ -439,6 +515,10 @@ def _observe_fixed(
     gradient_dates = [] if candidate == "statistics_linear" else fixed_dates(fit, bins=4, per_bin=2)
     remaining = [day for day in dates if day not in set(panel)]
     chunks = [remaining[i : i + CHUNK_DATES] for i in range(0, len(remaining), CHUNK_DATES)]
+    reusable = audit["identity"].get("reused_linear_chunks", {})
+    expected_chunks = {f"epoch-{epoch}-{i:04d}" for epoch in (1, 2) for i in range(len(chunks))}
+    if not set(reusable.get("chunk_manifests", {})) <= expected_chunks:
+        raise DataContractError("reused Linear chunks are outside the fixed F plan")
     audit.update(
         F_dates=len(dates),
         reused_dates_per_epoch=len(panel),
@@ -533,6 +613,28 @@ def _observe_fixed(
             day_pool = pool.filter(pl.col("asof_date").is_in(days))
             if (chunk / "complete.json").exists():
                 tables = _read_chunk(chunk)
+            elif chunk.name in reusable.get("chunk_manifests", {}):
+                previous_chunk = Path(reusable["path"]) / "chunks" / chunk.name
+                if (
+                    sha256_file(previous_chunk / "complete.json")
+                    != (reusable["chunk_manifests"][chunk.name])
+                ):
+                    raise DataContractError("reused Linear chunk manifest changed")
+                tables = _read_chunk(previous_chunk)
+                validate_observation(tables, day_pool, day_fit, config)
+                _write_chunk(chunk, tables)
+                append_progress(
+                    output / "progress.jsonl",
+                    {
+                        "event": "F_chunk_reused",
+                        "epoch": epoch,
+                        "chunk": i,
+                        "dates": len(days),
+                        "source": str(previous_chunk),
+                        "optimizer_updates": 0,
+                    },
+                    attempt=len(audit["attempts"]),
+                )
             else:
                 chunk_started = time.monotonic()
                 daily, predictions = score_panel(
@@ -584,7 +686,7 @@ def _observe_fixed(
                         "seconds_per_date": seconds_per_date,
                     }
                     audit["forward_only_projected_seconds"] = lower_bound
-                    if lower_bound >= budget_seconds - 120:
+                    if lower_bound >= budget_seconds - shutdown_margin_seconds:
                         raise TimeoutError("fixed forward projection exceeds remaining budget")
             validate_observation(tables, day_pool, day_fit, config)
             parts.append(tables)

@@ -11,6 +11,9 @@ if __name__ == "__main__":
     for argument in ("dataset", "checksums", "config", "cache", "source", "output"):
         parser.add_argument(f"--{argument}", type=Path, required=True)
     parser.add_argument("--budget-seconds", type=float, required=True)
+    parser.add_argument("--cumulative-budget-seconds", type=float)
+    parser.add_argument("--shutdown-margin-seconds", type=float, default=120)
+    parser.add_argument("--reuse-linear-chunks", type=Path)
     args = parser.parse_args()
     result = run_fixed_diagnostics(
         args.dataset,
@@ -21,5 +24,8 @@ if __name__ == "__main__":
         args.output,
         budget_seconds=args.budget_seconds,
         repository_root=Path(__file__).resolve().parents[2],
+        cumulative_budget_seconds=args.cumulative_budget_seconds,
+        shutdown_margin_seconds=args.shutdown_margin_seconds,
+        reuse_linear_chunks=args.reuse_linear_chunks,
     )
     print(result["status"], flush=True)
