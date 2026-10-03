@@ -440,11 +440,15 @@ def test_gradient_component_loss_preserves_original_total():
         _multi_horizon_loss(scores, targets, **kwargs, diagnostic_component="other")
 
 
+@pytest.mark.parametrize("phases", [("F",), ("F", "S")])
 def test_fit_inputs_reconstruct_original_plan_without_collecting_holdout_targets(
     tmp_path,
     monkeypatch,
+    phases,
 ):
     from facdigger.data.snapshots import build_dataset_snapshot
+    from facdigger.research import finance_diagnostics as shared
+    from facdigger.training import finance_data
     from facdigger.training.finance_data import finance_data_protocol, load_finance_selection
     from facdigger.training.finance_transformer_config import FinanceTransformerExperimentConfig
     from facdigger.training.runtime import write_snapshot_checksums
@@ -466,8 +470,38 @@ def test_fit_inputs_reconstruct_original_plan_without_collecting_holdout_targets
         assert {"train", "valid", "test"}.issubset(set(sample_index["split"].to_list()))
         return load_finance_selection(*args, sample_index=sample_index)
 
-    monkeypatch.setattr(runner, "load_finance_selection", metadata_only)
-    _, fit, pool = runner.fit_inputs(snapshot, inventory, config, expected)
+    monkeypatch.setattr(shared, "load_finance_selection", metadata_only)
+    monkeypatch.setattr(finance_data, "load_finance_selection", metadata_only)
+    collect = pl.LazyFrame.collect
+    read = pl.read_parquet
+    collected_targets = []
+
+    def guarded_collect(frame, *a, **kw):
+        result = collect(frame, *a, **kw)
+        if "sample_index.parquet" in frame.explain() and any(
+            c.startswith("target") for c in result.columns
+        ):
+            assert set(result["split"].to_list()) == {"train"}
+            collected_targets.append(result.height)
+        return result
+
+    def guarded_read(path, *a, **kw):
+        assert str(path) != str(snapshot / "sample_index.parquet")
+        return read(path, *a, **kw)
+
+    monkeypatch.setattr(pl.LazyFrame, "collect", guarded_collect)
+    monkeypatch.setattr(pl, "read_parquet", guarded_read)
+    if phases == ("F",):
+        _, fit, pool = runner.fit_inputs(snapshot, inventory, config, expected)
+    else:
+        _, protocol, labelled, pools = shared.diagnostic_inputs(
+            snapshot, inventory, config, phases=phases
+        )
+        assert protocol == expected
+        assert set(labelled) == set(pools) == {"F", "S"}
+        assert labelled["S"].equals(original.filter(pl.col("split") == "inner_selection"))
+        fit, pool = labelled["F"], pools["F"]
+    assert collected_targets
     assert fit.equals(original.filter(pl.col("split") == "train_fit"))
     assert fit["target_5"].is_finite().all()
     assert fit["asof_date"].unique().sort().equals(pool["asof_date"].unique().sort())

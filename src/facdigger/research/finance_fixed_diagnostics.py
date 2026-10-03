@@ -23,27 +23,20 @@ from facdigger.experiments.manifest import collect_git_state
 from facdigger.models.finance_patch_transformer import build_finance_transformer_model
 from facdigger.models.finance_statistics import FinanceStatisticsRanker
 from facdigger.research.finance_diagnostics import (
+    diagnostic_inputs,
     fixed_dates,
     score_panel,
     statistics_style_exposures,
     window_datasets,
 )
 from facdigger.research.finance_fixed_gradients import loss_gradient_diagnostics
-from facdigger.training.common import load_snapshot_inference_rows, load_source_provenance
 from facdigger.training.e1_engine import select_device
-from facdigger.training.finance_data import (
-    SUPERVISED_LABEL_SUPPORT,
-    SUPERVISED_UNIVERSE,
-    _artifact_path,
-    load_finance_selection,
-)
 from facdigger.training.progress import append_progress
 from facdigger.training.runtime import (
     TrainingControl,
     TrainingRuntimeConfig,
     _sync_directory,
     run_lock,
-    snapshot_checksums,
     write_json,
 )
 
@@ -55,48 +48,12 @@ KEYS = ["sample_id", "security_id", "asof_date"]
 
 def fit_inputs(snapshot: Path, checksums: Path, config, expected_protocol: dict):
     """Reconstruct the existing plan using metadata; collect target values for F only."""
-    if (
-        config.evaluation_split != "valid"
-        or config.unlock_test
-        or config.initialization != "scratch"
-    ):
-        raise DataContractError("fixed diagnostics require scratch with locked holdout")
-    if snapshot_checksums(snapshot) != json.loads(checksums.read_text()):
-        raise DataContractError("fixed diagnostic snapshot checksum mismatch")
-    manifest = json.loads((snapshot / "manifest.json").read_text())
-    load_source_provenance(snapshot, manifest)
-    index = pl.scan_parquet(_artifact_path(snapshot, manifest, "sample_index"))
-    metadata = index.select(
-        "sample_id",
-        "security_id",
-        "asof_date",
-        "split",
-        "label_end",
-        *[f"label_end_{h}" for h in (1, 5, 20)],
-    ).collect()
-    selection, _, plan = load_finance_selection(snapshot, manifest, sample_index=metadata)
-    protocol = {
-        "dataset_id": manifest["dataset_id"],
-        "selection_plan": plan,
-        "feature_scaler_sha256": sha256_file(_artifact_path(snapshot, manifest, "scaler")),
-        "computational_universe": SUPERVISED_UNIVERSE,
-        "label_support": SUPERVISED_LABEL_SUPPORT,
-    }
+    manifest, protocol, labelled, pools = diagnostic_inputs(
+        snapshot, checksums, config, phases=("F",)
+    )
     if protocol != expected_protocol:
         raise DataContractError("fixed diagnostic data protocol differs from C")
-    fit_keys = selection.filter(pl.col("split") == "train_fit").select("sample_id")
-    fit = (
-        index.filter(pl.col("split") == "train")
-        .join(fit_keys.lazy(), on="sample_id", how="semi")
-        .collect()
-        .with_columns(pl.lit("train_fit").alias("split"))
-        .sort("asof_date", "security_id")
-    )
-    if fit.height != plan["supervised"]["fit_rows"]:
-        raise DataContractError("fixed diagnostic F support differs from plan")
-    dates = fit["asof_date"].unique().sort().to_list()
-    pool = load_snapshot_inference_rows(snapshot, manifest, asof_dates=dates)
-    return manifest, fit, pool
+    return manifest, labelled["F"], pools["F"]
 
 
 def subset_dates(dataset, dates):

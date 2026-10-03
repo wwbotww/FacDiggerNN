@@ -21,11 +21,25 @@ if __name__ == "__main__":
     parser.add_argument("--cache", type=Path)
     parser.add_argument("--candidate", choices=("finance", "statistics_linear", "statistics_mlp"))
     parser.add_argument("--budget-seconds", type=float, required=True)
+    parser.add_argument("--seed", type=int, help="Explicit seed override, bound to the run config")
+    parser.add_argument("--observation-scope", choices=("all", "fit-selection"), default="all")
+    parser.add_argument("--observation-precision", choices=("fp32", "fp16"))
+    parser.add_argument("--full-fit", action="store_true", help="Observe all F dates at epochs 1/2")
+    parser.add_argument("--shutdown-margin-seconds", type=float, default=180)
+    parser.add_argument("--cumulative-budget-seconds", type=float)
     args = parser.parse_args()
     config = FinanceTransformerExperimentConfig.model_validate(
         yaml.safe_load(args.config.read_text())
     )
+    if args.seed is not None:
+        config = FinanceTransformerExperimentConfig.model_validate(
+            {**config.model_dump(mode="json"), "seed": args.seed}
+        )
     if args.action == "prepare":
+        if args.observation_scope != "all" or args.observation_precision or args.full_fit:
+            parser.error(
+                "observation options require run; prepare creates the original F/S/V cache"
+            )
         prepare_prefix_statistics(
             args.dataset, args.checksums, config, args.output, budget_seconds=args.budget_seconds
         )
@@ -41,5 +55,10 @@ if __name__ == "__main__":
             candidate=args.candidate,
             budget_seconds=args.budget_seconds,
             repository_root=Path(__file__).resolve().parents[2],
+            observation_scope=args.observation_scope,
+            observation_precision=args.observation_precision,
+            full_fit=args.full_fit,
+            shutdown_margin_seconds=args.shutdown_margin_seconds,
+            cumulative_budget_seconds=args.cumulative_budget_seconds,
         )
         print(result["status"], flush=True)

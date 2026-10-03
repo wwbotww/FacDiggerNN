@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +21,63 @@ from facdigger.models.finance_scoring import predict_finance_horizons
 from facdigger.training.common import (
     load_required_market_features,
     load_required_snapshot_features,
+    load_snapshot_inference_rows,
+    load_source_provenance,
+)
+from facdigger.training.finance_data import (
+    _artifact_path,
+    finance_data_protocol,
+    load_finance_selection,
 )
 from facdigger.training.finance_transformer_engine import _multi_horizon_loss
 from facdigger.training.ranking import average_ranks, cross_sectional_rank_targets
+from facdigger.training.runtime import snapshot_checksums
+
+
+def diagnostic_inputs(
+    snapshot: Path, checksums: Path, config: Any, *, phases: tuple[str, ...] = ("F", "S", "V")
+) -> tuple:
+    """Verify the original plan using metadata; collect targets only for requested phases."""
+    if not phases or len(set(phases)) != len(phases) or set(phases) - {"F", "S", "V"}:
+        raise ValueError("diagnostic phases must be a nonempty subset of F/S/V")
+    if (
+        config.evaluation_split != "valid"
+        or config.unlock_test
+        or config.initialization != "scratch"
+    ):
+        raise DataContractError("diagnostics require scratch with locked holdout")
+    if snapshot_checksums(snapshot) != json.loads(checksums.read_text()):
+        raise DataContractError("diagnostic snapshot checksum mismatch")
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    load_source_provenance(snapshot, manifest)
+    index = pl.scan_parquet(_artifact_path(snapshot, manifest, "sample_index"))
+    metadata = index.select(
+        "sample_id", "security_id", "asof_date", "split", "label_end",
+        *[f"label_end_{h}" for h in config.horizons],
+    ).collect()
+    protocol = finance_data_protocol(snapshot, manifest, config, sample_index=metadata)
+    selection, _, plan = load_finance_selection(snapshot, manifest, sample_index=metadata)
+    labelled, pools = {}, {}
+    for phase in phases:
+        if phase == "V":
+            part = index.filter(pl.col("split") == "valid").collect()
+        else:
+            split = "train_fit" if phase == "F" else "inner_selection"
+            keys = selection.filter(pl.col("split") == split).select("sample_id")
+            part = (
+                index.filter(pl.col("split") == "train")
+                .join(keys.lazy(), on="sample_id", how="semi")
+                .collect()
+                .with_columns(pl.lit(split).alias("split"))
+            )
+            expected = plan["supervised"]["fit_rows" if phase == "F" else "selection_rows"]
+            if part.height != expected:
+                raise DataContractError("diagnostic label support differs from selection plan")
+        labelled[phase] = part.sort("asof_date", "security_id")
+        pools[phase] = load_snapshot_inference_rows(
+            snapshot, manifest, asof_dates=part["asof_date"].unique().sort().to_list()
+        )
+    return manifest, protocol, labelled, pools
 
 
 def fixed_dates(rows: pl.DataFrame, *, bins: int = 5, per_bin: int = 12) -> list[Any]:

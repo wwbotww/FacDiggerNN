@@ -21,19 +21,23 @@ from facdigger.experiments.manifest import collect_git_state, sha256_json
 from facdigger.models.finance_patch_transformer import build_finance_transformer_model
 from facdigger.models.finance_statistics import FinanceStatisticsRanker
 from facdigger.research.finance_diagnostics import (
+    diagnostic_inputs,
     evaluate_diagnostic_validation,
     fixed_dates,
     score_panel,
     statistics_style_exposures,
     window_datasets,
 )
-from facdigger.training.common import (
-    load_snapshot_inference_rows,
-    load_source_provenance,
-    load_training_snapshot,
+from facdigger.research.finance_fixed_diagnostics import (
+    CHUNK_DATES,
+    _atomic_parquet,
+    _read_chunk,
+    _summary,
+    _write_chunk,
+    subset_dates,
+    validate_observation,
 )
 from facdigger.training.e1_engine import select_device
-from facdigger.training.finance_data import finance_data_protocol, load_finance_selection
 from facdigger.training.finance_transformer_engine import train_finance_transformer
 from facdigger.training.progress import append_progress
 from facdigger.training.runtime import (
@@ -42,38 +46,8 @@ from facdigger.training.runtime import (
     TrainingRuntimeConfig,
     run_lock,
     save_checkpoint,
-    snapshot_checksums,
     write_json,
 )
-
-
-def diagnostic_inputs(snapshot: Path, checksums: Path, config: Any) -> tuple:
-    if (
-        config.evaluation_split != "valid"
-        or config.unlock_test
-        or config.initialization != "scratch"
-    ):
-        raise DataContractError("C requires scratch, locked holdout and validation evaluation")
-    if snapshot_checksums(snapshot) != json.loads(checksums.read_text()):
-        raise DataContractError("diagnostic snapshot differs from immutable checksum inventory")
-    manifest, frames = load_training_snapshot(snapshot, include_features=False)
-    load_source_provenance(snapshot, manifest)
-    protocol = finance_data_protocol(snapshot, manifest, config)
-    rows, _, _ = load_finance_selection(snapshot, manifest, sample_index=frames["sample_index"])
-    labelled = {
-        "F": rows.filter(pl.col("split") == "train_fit"),
-        "S": rows.filter(pl.col("split") == "inner_selection"),
-        "V": frames["sample_index"].filter(pl.col("split") == "valid"),
-    }
-    pools = {
-        phase: load_snapshot_inference_rows(
-            snapshot,
-            manifest,
-            asof_dates=part["asof_date"].unique().sort().to_list(),
-        )
-        for phase, part in labelled.items()
-    }
-    return manifest, protocol, labelled, pools
 
 
 def prepare_prefix_statistics(
@@ -122,6 +96,11 @@ def run_prefix_diagnostics(
     candidate: str,
     repository_root: Path,
     budget_seconds: float,
+    observation_scope: str = "all",
+    observation_precision: str | None = None,
+    full_fit: bool = False,
+    shutdown_margin_seconds: float = 180,
+    cumulative_budget_seconds: float | None = None,
 ) -> dict:
     if candidate not in {"finance", "statistics_linear", "statistics_mlp"}:
         raise ValueError("C has exactly three preregistered candidates")
@@ -129,6 +108,17 @@ def run_prefix_diagnostics(
         raise ValueError("C candidate cannot exceed the entire eight-hour allocation budget")
     if config.training.max_epochs != 10 or config.training.minimum_epochs != 6:
         raise ValueError("C must retain the original ten-epoch training clock")
+    if observation_scope not in {"all", "fit-selection"}:
+        raise ValueError("unknown diagnostic observation scope")
+    if observation_precision not in {None, "fp16", "fp32"}:
+        raise ValueError("unknown diagnostic observation precision")
+    if cumulative_budget_seconds is not None and (
+        not math.isfinite(cumulative_budget_seconds) or cumulative_budget_seconds < budget_seconds
+    ):
+        raise ValueError("cumulative diagnostic budget must cover this attempt")
+    TrainingRuntimeConfig(
+        max_walltime_seconds=budget_seconds, shutdown_margin_seconds=shutdown_margin_seconds
+    )
     for source in (snapshot, cache):
         if output.resolve().is_relative_to(source.resolve()):
             raise ValueError("diagnostic output must be outside immutable inputs")
@@ -148,19 +138,46 @@ def run_prefix_diagnostics(
             git=git,
             started=started,
             budget_seconds=budget_seconds,
+            observation_scope=observation_scope,
+            observation_precision=observation_precision,
+            full_fit=full_fit,
+            shutdown_margin_seconds=shutdown_margin_seconds,
+            cumulative_budget_seconds=cumulative_budget_seconds,
         )
 
 
 def _run_prefix(
-    snapshot, checksums, config, cache, output, *, candidate, git, started, budget_seconds
+    snapshot, checksums, config, cache, output, *, candidate, git, started, budget_seconds,
+    observation_scope, observation_precision, full_fit, shutdown_margin_seconds,
+    cumulative_budget_seconds,
 ) -> dict:
-    manifest, protocol, labelled, pools = diagnostic_inputs(snapshot, checksums, config)
+    phases = ("F", "S") if observation_scope == "fit-selection" else ("F", "S", "V")
+    manifest, protocol, labelled, pools = diagnostic_inputs(
+        snapshot, checksums, config, phases=phases
+    )
+    if set(labelled) != set(phases) or set(pools) != set(phases):
+        raise DataContractError("diagnostic inputs exceed the bound observation scope")
+    device = select_device(config.training.device)
+    requested_precision = observation_precision or config.training.precision
+    effective_precision = "fp16" if device == "cuda" and requested_precision == "fp16" else "fp32"
+    environment = collect_environment()
     identity = {
         "candidate": candidate,
         "config": config.model_dump(mode="json"),
         "data_protocol": protocol,
         "prefix_epochs": 2,
     }
+    if observation_scope != "all" or observation_precision is not None or full_fit:
+        identity["observation_policy"] = {
+            "phases": list(phases), "full_fit_epochs": [1, 2] if full_fit else [],
+            "requested_precision": requested_precision, "effective_precision": effective_precision,
+            "device": device, "code_commit": git["commit"], "chunk_dates": CHUNK_DATES,
+            "dependencies": {
+                row["name"]: row["installed_version"]
+                for row in environment.get("dependencies", [])
+                if row["name"] in {"numpy", "torch", "transformers"}
+            },
+        }
     audit_path = output / "diagnostic.json"
     previous = json.loads(audit_path.read_text()) if audit_path.is_file() else None
     if previous and previous["identity"] != identity:
@@ -170,17 +187,26 @@ def _run_prefix(
     if last_path.is_file() and previous is None:
         raise DataContractError("checkpoint has no bound diagnostic identity")
     audit = previous or {"identity": identity, "attempts": [], "holdout_used": False}
+    if cumulative_budget_seconds is not None:
+        charged = sum(a.get("elapsed_seconds", a["budget_seconds"]) for a in audit["attempts"])
+        budget_seconds = min(budget_seconds, cumulative_budget_seconds - charged)
+        audit["cumulative_budget_seconds"] = cumulative_budget_seconds
+        if budget_seconds <= shutdown_margin_seconds:
+            audit.update(status="paused_budget", reason="cumulative diagnostic budget exhausted")
+            write_json(audit_path, audit)
+            return audit
     audit["attempts"].append(
-        {"git": git, "environment": collect_environment(), "budget_seconds": budget_seconds}
+        {"git": git, "environment": environment, "budget_seconds": budget_seconds,
+         "shutdown_margin_seconds": shutdown_margin_seconds}
     )
-    audit.update(status="running", training_status="running")
+    audit.update(status="running", training_status="running", validation_used="V" in phases)
     write_json(audit_path, audit)
     windows = tuple(config.model.statistics_windows)
     control = TrainingControl(
         TrainingRuntimeConfig(
             checkpoint_interval_seconds=600,
             max_walltime_seconds=budget_seconds,
-            shutdown_margin_seconds=180,
+            shutdown_margin_seconds=shutdown_margin_seconds,
             handle_signals=hasattr(signal, "SIGUSR1"),
         ),
         clock=time.monotonic,
@@ -211,16 +237,16 @@ def _run_prefix(
                 time.monotonic() - started + event["elapsed_seconds"] / 100 * (groups - 100)
             )
             audit["update_only_projected_seconds"] = lower_bound
-            if lower_bound >= budget_seconds - 180:
+            if lower_bound >= budget_seconds - shutdown_margin_seconds:
                 control.request_stop("diagnostic_projection_over_budget")
         if event["event"] == "epoch_completed" and event["epoch"] == 2:
             control.request_stop("diagnostic_prefix_epoch_2")
 
     def check_stop():
-        if time.monotonic() - started >= budget_seconds - 120 or control.reason in {
-            "SIGTERM",
-            "time_limit_warning",
-        }:
+        if (
+            time.monotonic() - started >= budget_seconds - shutdown_margin_seconds
+            or control.reason in {"SIGTERM", "time_limit_warning"}
+        ):
             raise TimeoutError("C observation allocation budget/signal reached")
 
     def validate_last(state):
@@ -294,10 +320,7 @@ def _run_prefix(
                 return audit
             if last["progress"]["finished"]:
                 raise DataContractError("two epochs cannot satisfy full-training completion")
-            device = select_device(config.training.device)
-            audit["observation_precision"] = (
-                "fp16" if device == "cuda" and config.training.precision == "fp16" else "fp32"
-            )
+            audit["observation_precision"] = effective_precision
             model = (
                 build_finance_transformer_model(config, context_length=datasets["F"].context_length)
                 if candidate == "finance"
@@ -312,6 +335,12 @@ def _run_prefix(
             if not (output / "observations/epoch-2.pt").exists():
                 model.load_state_dict(last["model_state"], strict=True)
                 save_observation(model, 2)
+            if full_fit:
+                sources = [last_path] + [output / f"observations/epoch-{e}.pt" for e in (0, 1, 2)]
+                hashes = {str(p.relative_to(output)): sha256_file(p) for p in sources}
+                if audit.setdefault("observation_source_sha256", hashes) != hashes:
+                    raise DataContractError("committed observation source weights changed")
+                write_json(audit_path, audit)
             fit_labels = labelled["F"].filter(pl.col("asof_date").is_in(panel))
             if candidate == "finance":
                 fit = FinanceTransformerInferenceWindowDataset(
@@ -358,17 +387,40 @@ def _run_prefix(
                     ("S", datasets["S"], labelled["S"]),
                 ):
                     check_stop()
+                    style_cache = cached["F"].subset(panel) if phase == "F" else cached["S"]
+                    if full_fit:
+                        if phase == "F" and epoch in (1, 2):
+                            dataset = datasets["F"]
+                            support, style_cache = labelled["F"], cached["F"]
+                        _observe_chunks(
+                            model, dataset, support, style_cache, config, output,
+                            epoch=epoch, phase=phase, precision=effective_precision,
+                            check_stop=check_stop, attempt=len(audit["attempts"]),
+                        )
+                        continue
                     daily, predictions = score_panel(
-                        model, dataset, support, config, check_stop=check_stop
+                        model, dataset, support, config, check_stop=check_stop,
+                        precision=effective_precision,
                     )
                     daily.write_parquet(output / f"epoch-{epoch}-{phase}-daily.parquet")
                     predictions.write_parquet(output / f"epoch-{epoch}-{phase}-predictions.parquet")
-                    style_cache = cached["F"].subset(panel) if phase == "F" else cached["S"]
                     statistics_style_exposures(predictions, style_cache, support).write_parquet(
                         output / f"epoch-{epoch}-{phase}-styles.parquet"
                     )
+                if any(
+                    not torch.equal(state["model_state"][key], value.detach().cpu())
+                    for key, value in model.state_dict().items()
+                ):
+                    raise DataContractError("fixed observation changed model weights/buffers")
+            if full_fit:
+                dates = labelled["F"]["asof_date"].unique().sort().to_list()
+                summary = _summary(output, dates, [])
+                summary["training_global_step"] = last["global_step"]
+                write_json(output / "full-fit-summary.json", summary)
+                audit["F_dates"] = len(dates)
             # V is opened only after the prefix ends; S chose best, epoch zero is ineligible.
-            for epoch in sorted({2, int(last["best_epoch"])}):
+            validation_epochs = sorted({2, int(last["best_epoch"])}) if "V" in datasets else []
+            for epoch in validation_epochs:
                 if epoch not in {1, 2}:
                     raise DataContractError("diagnostic best must be a completed eligible epoch")
                 state = torch.load(
@@ -378,7 +430,8 @@ def _run_prefix(
                 )
                 model.load_state_dict(state["model_state"], strict=True)
                 daily, predictions = score_panel(
-                    model, datasets["V"], labelled["V"], config, check_stop=check_stop
+                    model, datasets["V"], labelled["V"], config, check_stop=check_stop,
+                    precision=effective_precision,
                 )
                 daily.write_parquet(output / f"epoch-{epoch}-V-daily.parquet")
                 predictions.write_parquet(output / f"epoch-{epoch}-V-predictions.parquet")
@@ -400,6 +453,8 @@ def _run_prefix(
                 status="observations_complete",
                 training_status="paused",
                 checkpoint_sha256=sha256_file(last_path),
+                observation_optimizer_updates=0,
+                observation_model_state_unchanged=True,
             )
     except TimeoutError as exc:
         audit.update(status="paused_budget", reason=str(exc))
@@ -410,3 +465,51 @@ def _run_prefix(
         audit["attempts"][-1]["elapsed_seconds"] = time.monotonic() - started
         write_json(audit_path, audit)
     return audit
+
+
+def _observe_chunks(
+    model, dataset, labelled, cached, config, output, *, epoch, phase, precision,
+    check_stop, attempt,
+) -> None:
+    """Reuse complete-date commits; observation never advances the training clock."""
+    dates = labelled["asof_date"].unique().sort().to_list()
+    parts = []
+    for number, start in enumerate(range(0, len(dates), CHUNK_DATES)):
+        check_stop()
+        days = dates[start:start + CHUNK_DATES]
+        data = subset_dates(dataset, days)
+        support = labelled.filter(pl.col("asof_date").is_in(days))
+        path = output / "chunks" / f"epoch-{epoch}-{phase}-{number:04d}"
+        if (path / "complete.json").is_file():
+            tables = _read_chunk(path)
+            event = "observation_chunk_reused"
+        else:
+            daily, predictions = score_panel(
+                model, data, support, config, precision=precision, check_stop=check_stop
+            )
+            tables = {
+                "daily": daily, "predictions": predictions,
+                "styles": statistics_style_exposures(predictions, cached.subset(days), support),
+            }
+            validate_observation(tables, data.sample_rows, support, config)
+            _write_chunk(path, tables)
+            event = "observation_chunk_committed"
+        validate_observation(tables, data.sample_rows, support, config)
+        append_progress(
+            output / "progress.jsonl",
+            {"event": event, "epoch": epoch, "phase": phase, "chunk": number,
+             "dates": len(days), "last_date": str(days[-1]), "optimizer_updates": 0},
+            attempt=attempt,
+        )
+        parts.append(tables)
+    merged = {
+        name: pl.concat([part[name] for part in parts]).sort(
+            "asof_date", "security_id" if name == "predictions" else "horizon" if name == "daily"
+            else "style",
+        )
+        for name in ("daily", "predictions", "styles")
+    }
+    validate_observation(merged, dataset.sample_rows, labelled, config)
+    for name, table in merged.items():
+        check_stop()
+        _atomic_parquet(output / f"epoch-{epoch}-{phase}-{name}.parquet", table)

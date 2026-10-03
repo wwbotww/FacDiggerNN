@@ -91,9 +91,11 @@ def finance_data_protocol(
     dataset_dir: str | Path,
     manifest: dict[str, Any],
     config: FinanceTransformerExperimentConfig | FinancePretrainingExperimentConfig,
+    *,
+    sample_index: pl.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Resolve experiment assertions before a run can write state or reuse artifacts."""
-    _, _, plan = load_finance_selection(dataset_dir, manifest)
+    _, _, plan = load_finance_selection(dataset_dir, manifest, sample_index=sample_index)
     features = manifest["config"]["features"]
     if (
         config.channels != features["channels"]

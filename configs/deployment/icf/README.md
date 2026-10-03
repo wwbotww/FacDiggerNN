@@ -44,6 +44,18 @@ Linear设置 `FD_DIAG_REUSE_LINEAR_CHUNKS=/path/to/previous-fixed/statistics_lin
 这里没有训练更新或 S/V 重评分，原来2.5小时是首轮部署预算记录，不是科学协议限制。
 通用计算与恢复边界见[固定状态入口](../../../docs/因子效果诊断与实验改进方案.md#batch2-fixed-execution)。
 
+2026-10-03确认的廉价seed复现使用`scripts/icf/seed_diagnostics.sbatch`，两个位置参数
+分别是`statistics_linear`或`statistics_mlp`、seed `17`或`73`。保留上述通用路径变量，
+`FD_DIAG_ROOT`指向新的seed复现根目录，`FD_DIAG_CACHE`复用原RC缓存；不需要SOURCE
+或历史矩阵变量。输出为`$FD_DIAG_ROOT/seed-<seed>/<candidate>`，不重训seed42。
+包装固定F/S观察、FP32前向与完整F epoch1/2；训练仍保持原FP16/两轮前缀。
+
+每run45分钟、4 CPU/32 GiB/一个`h200_1g.18gb`，内部及累计入口预算35分钟，其中
+预留5分钟安全退出；外部另留10分钟启动/延迟退出余量，`--signal=USR1@300`，禁止
+自动requeue。四run合计最多3 GPU小时，续跑前核销实际`sacct` allocation及入口attempt。
+显式传日志路径和`--chdir`，固定干净代码提交；不要修改其他checkout、缓存或原C结果。
+完整科学条件及跨平台命令见[方案6.17–6.18](../../../docs/因子效果诊断与实验改进方案.md#batch2-seed-execution)。
+
 ## 1. 准备独立环境和稳定资产
 
 固定已审阅提交的完整 clone 到 `/home/$USER/facdigger/code`，保留 `.git`、配置和
