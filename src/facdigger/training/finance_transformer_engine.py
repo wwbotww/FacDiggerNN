@@ -27,7 +27,11 @@ from facdigger.models.finance_scoring import (
     _market_tensors,
     predict_finance_transformer,
 )
-from facdigger.models.finance_statistics import FinanceStatisticsRanker, StatisticsKind
+from facdigger.models.finance_statistics import (
+    FinanceStatisticsRanker,
+    StatisticsKind,
+    statistics_dropout_identity,
+)
 from facdigger.training.e1_engine import (
     _dates_in_current_optimizer_step,
     _restore_rng_state,
@@ -555,8 +559,10 @@ def train_finance_transformer(
     control: TrainingControl | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     diagnostic_model: StatisticsKind | None = None,
+    statistics_dropout: float = 0.1,
     state_observer: Callable[[torch.nn.Module, int], None] | None = None,
 ) -> tuple[FinancePatchTransformer, dict[str, Any]]:
+    dropout_identity = statistics_dropout_identity(diagnostic_model, statistics_dropout)
     started_at = time.perf_counter()
     control = control or TrainingControl()
     observation = TrainingProgress(progress_callback)
@@ -574,6 +580,7 @@ def train_finance_transformer(
                 input_dim=(len(config.channels) + len(config.market_channels))
                 * (5 * len(config.model.statistics_windows) + 1),
                 horizons=tuple(config.horizons),
+                dropout=statistics_dropout,
             ) if diagnostic_model is not None else
             build_finance_transformer_model(config, context_length=train_dataset.context_length)
         )
@@ -626,7 +633,9 @@ def train_finance_transformer(
             config, train_dataset, train_labelled_rows
         )
         config_payload = config.model_dump(mode="json")
-        protocol_identity = {"config": config_payload, "data_protocol": data_protocol}
+        protocol_identity = {
+            "config": config_payload, "data_protocol": data_protocol, **dropout_identity,
+        }
         if diagnostic_model is not None:
             protocol_identity["diagnostic_model"] = diagnostic_model
         protocol_hash = sha256_json(protocol_identity)

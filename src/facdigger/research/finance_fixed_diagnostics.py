@@ -501,6 +501,7 @@ def _observe_fixed(
             input_dim=(len(config.channels) + len(config.market_channels))
             * (5 * len(config.model.statistics_windows) + 1),
             horizons=tuple(config.horizons),
+            dropout=original["identity"].get("statistics_dropout", 0.1),
         )
     ).to(device)
     all_gradients = []

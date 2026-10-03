@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import torch
@@ -12,11 +13,24 @@ from facdigger.models.finance_patch_transformer import DateScoreOutput, LocalEnc
 StatisticsKind = Literal["statistics_linear", "statistics_mlp"]
 
 
+def statistics_dropout_identity(kind: str | None, dropout: float) -> dict[str, float]:
+    """Old diagnostic identities implicitly mean the original hardcoded 0.1."""
+    if not math.isfinite(dropout) or not 0 <= dropout < 1:
+        raise ValueError("statistics dropout must be finite and in [0, 1)")
+    if kind != "statistics_mlp" and dropout != 0.1:
+        raise ValueError("statistics dropout override requires statistics_mlp")
+    return {"statistics_dropout": dropout} if dropout != 0.1 else {}
+
+
 class FinanceStatisticsRanker(nn.Module):
     """Use the Finance date/loss loop with precomputed, non-learned encodings."""
 
-    def __init__(self, kind: StatisticsKind, *, input_dim: int, horizons: tuple[int, ...]):
+    def __init__(
+        self, kind: StatisticsKind, *, input_dim: int, horizons: tuple[int, ...],
+        dropout: float = 0.1,
+    ):
         super().__init__()
+        statistics_dropout_identity(kind, dropout)
         self.horizons = horizons
         self.kind = kind
         if kind == "statistics_linear":
@@ -25,10 +39,10 @@ class FinanceStatisticsRanker(nn.Module):
             self.head = nn.Sequential(
                 nn.Linear(input_dim, 64),
                 nn.GELU(),
-                nn.Dropout(0.1),
+                nn.Dropout(dropout),
                 nn.Linear(64, 64),
                 nn.GELU(),
-                nn.Dropout(0.1),
+                nn.Dropout(dropout),
                 nn.Linear(64, len(horizons)),
             )
         else:

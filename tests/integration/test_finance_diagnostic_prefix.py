@@ -82,8 +82,10 @@ def test_cache_exact_masked_statistics_and_fail_closed_identity(tmp_path):
         )
 
 
-@pytest.mark.parametrize("candidate", [None, "statistics_linear", "statistics_mlp"])
-def test_observation_and_prefix_resume_preserve_training_state(tmp_path, candidate):
+@pytest.mark.parametrize("candidate,dropout", [
+    (None, 0.1), ("statistics_linear", 0.1), ("statistics_mlp", 0.1), ("statistics_mlp", 0.3),
+])
+def test_observation_and_prefix_resume_preserve_training_state(tmp_path, candidate, dropout):
     torch.set_num_threads(1)
     train, selection = _datasets()
     config = _config()
@@ -99,6 +101,10 @@ def test_observation_and_prefix_resume_preserve_training_state(tmp_path, candida
     observed = []
 
     def observer(model, epoch):
+        if candidate == "statistics_mlp":
+            assert [m.p for m in model.modules() if isinstance(m, torch.nn.Dropout)] == [
+                dropout, dropout,
+            ]
         # Deliberately consume every RNG and change evaluation mode/gradients.
         observed.append(epoch)
         random.random()
@@ -111,7 +117,7 @@ def test_observation_and_prefix_resume_preserve_training_state(tmp_path, candida
         primary = predict_finance_transformer(model, selection, **kwargs)
         np.testing.assert_array_equal(scores[:, 1], primary)
 
-    def run(path, *, observe=False, stop=False, resume=None):
+    def run(path, *, observe=False, stop=False, resume=None, probability=dropout):
         control = TrainingControl(TrainingRuntimeConfig(checkpoint_interval_seconds=9999))
 
         def progress(event):
@@ -133,6 +139,7 @@ def test_observation_and_prefix_resume_preserve_training_state(tmp_path, candida
             progress_callback=progress,
             state_observer=observer if observe else None,
             diagnostic_model=candidate,
+            statistics_dropout=probability,
         )
 
     run(tmp_path / "continuous")
@@ -144,6 +151,12 @@ def test_observation_and_prefix_resume_preserve_training_state(tmp_path, candida
     assert paused["progress"]["finished"] is False
     assert paused["config"]["training"]["max_epochs"] == 10
     assert paused["global_step"] == 4
+    if candidate == "statistics_mlp":
+        with pytest.raises(ValueError, match="training protocol does not match"):
+            run(
+                tmp_path / "paused", resume=tmp_path / "paused/last.pt",
+                probability=0.3 if dropout == 0.1 else 0.1,
+            )
     run(tmp_path / "paused", observe=True, resume=tmp_path / "paused/last.pt")
     expected = torch.load(tmp_path / "continuous/last.pt", weights_only=False)
     for name in ("observed", "paused"):
@@ -160,11 +173,12 @@ def test_observation_and_prefix_resume_preserve_training_state(tmp_path, candida
 
 
 @pytest.mark.parametrize(
-    "candidate,fit_selection",
-    [("statistics_mlp", False), ("statistics_linear", True), ("statistics_mlp", True)],
+    "candidate,fit_selection,dropout",
+    [("statistics_mlp", False, 0.1), ("statistics_linear", True, 0.1),
+     ("statistics_mlp", True, 0.1), ("statistics_mlp", True, 0.3)],
 )
 def test_prefix_orchestration_exports_diagnostics_without_finishing_training(
-    tmp_path, monkeypatch, candidate, fit_selection
+    tmp_path, monkeypatch, candidate, fit_selection, dropout
 ):
     import json
     from types import SimpleNamespace
@@ -226,6 +240,7 @@ def test_prefix_orchestration_exports_diagnostics_without_finishing_training(
          "full_fit": True, "shutdown_margin_seconds": 300, "cumulative_budget_seconds": 600}
         if fit_selection else {}
     )
+    options["statistics_dropout"] = dropout
 
     def run(**overrides):
         return runner.run_prefix_diagnostics(
@@ -241,6 +256,10 @@ def test_prefix_orchestration_exports_diagnostics_without_finishing_training(
         original_score = runner.score_panel
 
         def score(model, data, *a, **kw):
+            if candidate == "statistics_mlp":
+                assert [m.p for m in model.modules() if isinstance(m, torch.nn.Dropout)] == [
+                    dropout, dropout,
+                ]
             assert kw["precision"] == "fp32"
             scored_dates.extend(data.sample_rows["asof_date"].unique().to_list())
             return original_score(model, data, *a, **kw)
@@ -264,6 +283,7 @@ def test_prefix_orchestration_exports_diagnostics_without_finishing_training(
     result = run()
     assert result["status"] == "observations_complete"
     assert result["training_status"] == "paused" and result["committed_epoch"] == 2
+    assert result["identity"].get("statistics_dropout", 0.1) == dropout
     assert result["best_epoch"] in (1, 2)
     assert (tmp_path / "run/epoch-0-S-daily.parquet").exists()
     assert not (tmp_path / "run/epoch-0-V-daily.parquet").exists()
@@ -283,7 +303,7 @@ def test_prefix_orchestration_exports_diagnostics_without_finishing_training(
         assert sha256_file(tmp_path / "run/checkpoints/last.pt") == checkpoint_hash
         for epoch in (1, 2):
             model = runner.FinanceStatisticsRanker(
-                candidate, input_dim=20 * 11, horizons=(1, 5, 20)
+                candidate, input_dim=20 * 11, horizons=(1, 5, 20), dropout=dropout,
             )
             state = torch.load(tmp_path / f"run/observations/epoch-{epoch}.pt", weights_only=False)
             model.load_state_dict(state["model_state"])
@@ -295,6 +315,9 @@ def test_prefix_orchestration_exports_diagnostics_without_finishing_training(
         for overrides in ({"full_fit": False}, {"observation_precision": "fp16"}):
             with pytest.raises(DataContractError, match="continuation identity"):
                 run(**overrides)
+        if candidate == "statistics_mlp":
+            with pytest.raises(DataContractError, match="continuation identity"):
+                run(statistics_dropout=0.3 if dropout == 0.1 else 0.1)
         chunk = next((tmp_path / "run/chunks").glob("*/daily.parquet"))
         with chunk.open("ab") as stream:
             stream.write(b"corrupt")

@@ -19,7 +19,7 @@ from facdigger.datasets.window import FinanceTransformerInferenceWindowDataset
 from facdigger.environment import collect_environment
 from facdigger.experiments.manifest import collect_git_state, sha256_json
 from facdigger.models.finance_patch_transformer import build_finance_transformer_model
-from facdigger.models.finance_statistics import FinanceStatisticsRanker
+from facdigger.models.finance_statistics import FinanceStatisticsRanker, statistics_dropout_identity
 from facdigger.research.finance_diagnostics import (
     diagnostic_inputs,
     evaluate_diagnostic_validation,
@@ -101,7 +101,9 @@ def run_prefix_diagnostics(
     full_fit: bool = False,
     shutdown_margin_seconds: float = 180,
     cumulative_budget_seconds: float | None = None,
+    statistics_dropout: float = 0.1,
 ) -> dict:
+    statistics_dropout_identity(candidate, statistics_dropout)
     if candidate not in {"finance", "statistics_linear", "statistics_mlp"}:
         raise ValueError("C has exactly three preregistered candidates")
     if not 0 < budget_seconds <= 8 * 3600:
@@ -143,13 +145,14 @@ def run_prefix_diagnostics(
             full_fit=full_fit,
             shutdown_margin_seconds=shutdown_margin_seconds,
             cumulative_budget_seconds=cumulative_budget_seconds,
+            statistics_dropout=statistics_dropout,
         )
 
 
 def _run_prefix(
     snapshot, checksums, config, cache, output, *, candidate, git, started, budget_seconds,
     observation_scope, observation_precision, full_fit, shutdown_margin_seconds,
-    cumulative_budget_seconds,
+    cumulative_budget_seconds, statistics_dropout,
 ) -> dict:
     phases = ("F", "S") if observation_scope == "fit-selection" else ("F", "S", "V")
     manifest, protocol, labelled, pools = diagnostic_inputs(
@@ -166,6 +169,7 @@ def _run_prefix(
         "config": config.model_dump(mode="json"),
         "data_protocol": protocol,
         "prefix_epochs": 2,
+        **statistics_dropout_identity(candidate, statistics_dropout),
     }
     if observation_scope != "all" or observation_precision is not None or full_fit:
         identity["observation_policy"] = {
@@ -250,7 +254,10 @@ def _run_prefix(
             raise TimeoutError("C observation allocation budget/signal reached")
 
     def validate_last(state):
-        expected = {"config": identity["config"], "data_protocol": protocol}
+        expected = {
+            "config": identity["config"], "data_protocol": protocol,
+            **statistics_dropout_identity(candidate, statistics_dropout),
+        }
         if candidate != "finance":
             expected["diagnostic_model"] = candidate
         if (
@@ -301,6 +308,7 @@ def _run_prefix(
                         progress_callback=progress,
                         state_observer=save_observation,
                         diagnostic_model=None if candidate == "finance" else candidate,
+                        statistics_dropout=statistics_dropout,
                     )
                     raise RuntimeError("two-epoch diagnostic must pause, never finalize training")
                 except TrainingPaused as exc:
@@ -329,6 +337,7 @@ def _run_prefix(
                     input_dim=(len(config.channels) + len(config.market_channels))
                     * (5 * len(windows) + 1),
                     horizons=tuple(config.horizons),
+                    dropout=statistics_dropout,
                 )
             ).to(device)
             # A signal can arrive between the epoch commit and observer callback.

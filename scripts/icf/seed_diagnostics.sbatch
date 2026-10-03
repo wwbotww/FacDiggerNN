@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Approved seed repeats only. Site resources do not change the two-epoch scientific budget.
+# Approved seed/dropout contrasts. Site resources do not change the scientific budget.
 #SBATCH --partition=Teaching
 #SBATCH --account=teaching
 #SBATCH --qos=teaching
@@ -22,10 +22,16 @@ case "${1:?statistics_linear or statistics_mlp}" in
   statistics_linear|statistics_mlp) ;;
   *) exit 2 ;;
 esac
-case "${2:?seed 17 or 73}" in
-  17|73) ;;
-  *) exit 2 ;;
-esac
+extra=()
+if [[ "${3:-}" == "dropout-0.3" && "$1" == "statistics_mlp" ]]; then
+  case "${2:?seed 17, 42 or 73}" in 17|42|73) ;; *) exit 2 ;; esac
+  extra=(--statistics-dropout 0.3)
+elif [[ $# == 2 ]]; then
+  case "${2:?seed 17 or 73}" in 17|73) ;; *) exit 2 ;; esac
+else
+  exit 2
+fi
+(( $# <= 3 )) || exit 2
 export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 POLARS_MAX_THREADS=4
 export PYTHONUNBUFFERED=1 PYTHONPATH="$FD_DIAG_CODE/src"
 cd "$FD_DIAG_CODE"
@@ -38,4 +44,5 @@ srun --ntasks=1 --cpu-bind=cores /usr/bin/time -v "$FD_DIAG_PYTHON" \
   --cache "$FD_DIAG_CACHE" --candidate "$1" --seed "$2" \
   --output "$FD_DIAG_ROOT/seed-$2/$1" \
   --observation-scope fit-selection --observation-precision fp32 --full-fit \
+  "${extra[@]}" \
   --budget-seconds 2100 --cumulative-budget-seconds 2100 --shutdown-margin-seconds 300

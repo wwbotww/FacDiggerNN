@@ -22,12 +22,20 @@ if __name__ == "__main__":
     parser.add_argument("--candidate", choices=("finance", "statistics_linear", "statistics_mlp"))
     parser.add_argument("--budget-seconds", type=float, required=True)
     parser.add_argument("--seed", type=int, help="Explicit seed override, bound to the run config")
+    parser.add_argument(
+        "--statistics-dropout", type=float,
+        help="MLP diagnostic dropout only; default 0.1, independent of Finance model.dropout",
+    )
     parser.add_argument("--observation-scope", choices=("all", "fit-selection"), default="all")
     parser.add_argument("--observation-precision", choices=("fp32", "fp16"))
     parser.add_argument("--full-fit", action="store_true", help="Observe all F dates at epochs 1/2")
     parser.add_argument("--shutdown-margin-seconds", type=float, default=180)
     parser.add_argument("--cumulative-budget-seconds", type=float)
     args = parser.parse_args()
+    if args.statistics_dropout is not None and (
+        args.action != "run" or args.candidate != "statistics_mlp"
+    ):
+        parser.error("--statistics-dropout requires run --candidate statistics_mlp")
     config = FinanceTransformerExperimentConfig.model_validate(
         yaml.safe_load(args.config.read_text())
     )
@@ -60,5 +68,8 @@ if __name__ == "__main__":
             full_fit=args.full_fit,
             shutdown_margin_seconds=args.shutdown_margin_seconds,
             cumulative_budget_seconds=args.cumulative_budget_seconds,
+            statistics_dropout=(
+                0.1 if args.statistics_dropout is None else args.statistics_dropout
+            ),
         )
         print(result["status"], flush=True)

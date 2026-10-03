@@ -56,6 +56,13 @@ Linear设置 `FD_DIAG_REUSE_LINEAR_CHUNKS=/path/to/previous-fixed/statistics_lin
 显式传日志路径和`--chdir`，固定干净代码提交；不要修改其他checkout、缓存或原C结果。
 完整科学条件及跨平台命令见[方案6.17–6.18](../../../docs/因子效果诊断与实验改进方案.md#batch2-seed-execution)。
 
+随后确认的单项正则对照复用该包装，参数为
+`statistics_mlp <17|42|73> dropout-0.3`，显式传`--statistics-dropout 0.3`；
+`.1`控制和Linear均不重训。`FD_DIAG_ROOT`必须使用新目录；三run每项仍45分钟，
+合计最多8,100秒allocation。该参数独立于Finance YAML的`model.dropout`，后者
+历史上不控制统计MLP。所有观察/恢复/预算规则相同，见
+[方案6.21](../../../docs/因子效果诊断与实验改进方案.md#batch2-dropout-execution)。
+
 ## 1. 准备独立环境和稳定资产
 
 固定已审阅提交的完整 clone 到 `/home/$USER/facdigger/code`，保留 `.git`、配置和
