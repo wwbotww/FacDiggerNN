@@ -10,7 +10,7 @@
 | [项目 README](../README.md) | 定位、安装入口、能力和结论边界 |
 | [开发文档](开发文档.md) | 模块职责、内部契约、数据流、扩展位置 |
 | [实验设计文档](实验设计文档.md) | 当前 Finance Transformer 配对协议、质量与资源验收 |
-| [因子效果诊断与实验改进方案](因子效果诊断与实验改进方案.md) | 历史证据、完整 F/梯度与三 seed 结果（6.16、6.19）；dropout 对照结果（6.22）及待确认的保存预测增量诊断（6.23） |
+| [因子效果诊断与实验改进方案](因子效果诊断与实验改进方案.md) | 历史证据、完整 F/梯度与三 seed、dropout 结果（6.16、6.19、6.22）；扩展计划（6.24）与完整F/S实验入口（6.25） |
 | [第一批实验正确性修复实施方案](第一批实验正确性修复实施方案.md) | 修改范围、兼容边界与有限验收结果；代码、本地回归、小型 CUDA 与真实 wf3 更新准入通过 |
 | [训练运行与恢复](训练运行与恢复.md) | 跨平台数据准备、迁移、命令、进度和恢复 |
 | [Windows RTX 指南](RTX2070_Windows训练指南.md) | WSL2、驱动和 RTX 2070S 的平台差异 |
@@ -31,6 +31,7 @@
 | 小型 API smoke / 活动股票 pilot | [free](../configs/data/eodhd_free.yaml) / [pilot](../configs/data/eodhd_all_world_pilot.yaml) |
 | 历史动态流动性数据 | [采集](../configs/data/eodhd_historical_liquid.yaml) |
 | 当前 Finance 数据与 9 阶段矩阵 | [dataset](../configs/datasets/eodhd_historical_liquid_transformer.yaml) / [research](../configs/research/finance_transformer_streamlined.yaml) |
+| 完整F/S参照实验，独立于正式矩阵 | [60个组合](../configs/research/finance_complete_reference.yaml) / [通用运行配置](../configs/runtime/finance_complete.example.yaml) |
 | 通用训练控制 | [runtime](../configs/runtime/reliable.example.yaml) |
 | 旧 E0–E3/M6，可选而非默认 | [旧 dataset](../configs/datasets/eodhd_historical_liquid.yaml) / [M6](../configs/research/m6_eodhd_engineering.yaml) |
 | 无标签推理和交付身份 | [inference dataset](../configs/datasets/eodhd_historical_liquid_inference.yaml) / [delivery](../configs/inference/heyboss_delivery.example.yaml) |

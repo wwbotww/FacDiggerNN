@@ -1,0 +1,18 @@
+# Portable runtime only: paths and resource limits are separate from the scientific matrix.
+# Replace all paths with verified snapshots using the same source revision.
+checkpoint_interval_seconds: 600
+max_walltime_seconds: null
+shutdown_margin_seconds: 900
+# Set true explicitly on an ICF allocation with the matching USR1 lead.
+handle_signals: false
+dataset_overrides: {}
+fold_snapshots:
+  wf1:
+    path: /absolute/path/to/corrected-wf1-snapshot
+    checksums: /absolute/path/to/wf1.checksums.json
+  wf2:
+    path: /absolute/path/to/corrected-wf2-snapshot
+    checksums: /absolute/path/to/wf2.checksums.json
+  wf3:
+    path: /absolute/path/to/corrected-wf3-snapshot
+    checksums: /absolute/path/to/wf3.checksums.json
