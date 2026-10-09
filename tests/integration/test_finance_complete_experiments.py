@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, Event
 
 import pytest
 import torch
@@ -125,6 +128,54 @@ def setup_cells(tmp_path, monkeypatch, candidate="statistics_mlp", *, seeds=(42,
 
 def last(root, candidate="statistics_mlp", seed=42):
     return root / f"cells/wf/seed-{seed}/{candidate}/checkpoints/last.pt"
+
+
+def test_different_cells_wait_for_the_shared_binding_without_entering_training(
+    tmp_path, monkeypatch,
+):
+    from facdigger.training import runtime
+
+    setup = setup_cells(tmp_path, monkeypatch, seeds=(17, 42))
+    root = setup["plan"]("concurrent")
+    ready, waiting, release = Barrier(2), Event(), Event()
+    original_write, original_sleep = runner.write_json, time.sleep
+
+    def environment():
+        ready.wait(timeout=5)
+        return ENVIRONMENT
+
+    def delayed_binding(path, value):
+        if path.name == "execution.json":
+            assert release.wait(timeout=5)
+        original_write(path, value)
+
+    def observed_sleep(delay):
+        waiting.set()
+        original_sleep(delay)
+
+    class BeforeData(Exception):
+        pass
+
+    def stop_before_data(*args, **kwargs):
+        raise BeforeData
+
+    monkeypatch.setattr(runner, "collect_environment", environment)
+    monkeypatch.setattr(runner, "write_json", delayed_binding)
+    monkeypatch.setattr(runtime.time, "sleep", observed_sleep)
+    monkeypatch.setattr(runner, "load_fold_inputs", stop_before_data)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(setup["run"], root, seed) for seed in (17, 42)]
+        try:
+            assert waiting.wait(timeout=3), "the second cell must wait for the shared binding"
+        finally:
+            release.set()
+        for future in futures:
+            with pytest.raises(BeforeData):
+                future.result(timeout=5)
+    for seed in (17, 42):
+        cell = root / f"cells/wf/seed-{seed}/statistics_mlp"
+        assert json.loads((cell / "cell.json").read_text())["error"] == "BeforeData: "
+        assert not (cell / "checkpoints").exists()
 
 
 @pytest.mark.parametrize(

@@ -125,7 +125,15 @@ def run_experiment_cell(
             "data_protocol": location["data_protocol"], "execution": execution,
         }
         # All paired cells use the same numerical environment. Host/path is not an identity.
-        with run_lock(output / ".plan.lock"):
+        # Different cells may legitimately arrive together; only their short shared
+        # binding waits. The full-duration per-cell writer lock remains fail-fast.
+        lock_timeout = 60.0
+        if runtime.max_walltime_seconds is not None:
+            lock_timeout = min(lock_timeout, max(
+                0.0, runtime.max_walltime_seconds - runtime.shutdown_margin_seconds
+                - (time.monotonic() - started),
+            ))
+        with run_lock(output / ".plan.lock", timeout_seconds=lock_timeout):
             binding_path = output / "execution.json"
             if binding_path.is_file():
                 if json.loads(binding_path.read_text()) != execution:

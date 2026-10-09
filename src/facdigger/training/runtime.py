@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import errno
 import json
+import math
 import os
 import signal
 import time
@@ -163,8 +164,20 @@ def checkpoint_copy(value: Any) -> Any:
 
 
 @contextmanager
-def run_lock(path: Path) -> Iterator[None]:
-    """Hold an OS lock; never unlink it or steal it based on a remote PID."""
+def run_lock(path: Path, *, timeout_seconds: float = 0) -> Iterator[None]:
+    """Hold an OS lock, optionally waiting a finite time for a short shared operation."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+        raise ValueError("lock timeout must be finite and nonnegative")
+    deadline = time.monotonic() + timeout_seconds
+
+    def wait_or_fail(exc: OSError) -> None:
+        remaining = deadline - time.monotonic()
+        if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} or remaining <= 0:
+            raise RuntimeError(f"training run already has a writer: {path}") from exc
+        time.sleep(min(0.05, remaining))
+
+    # Never unlink the lock or steal it based on a remote PID. The default still
+    # rejects a duplicate training writer immediately; only callers opt into waiting.
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as stream:
         if os.name == "nt":
@@ -174,10 +187,12 @@ def run_lock(path: Path) -> Iterator[None]:
                 stream.write(b"\0")
                 stream.flush()
             stream.seek(0)
-            try:
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise RuntimeError(f"training run already has a writer: {path}") from exc
+            while True:
+                try:
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    wait_or_fail(exc)
             try:
                 yield
             finally:
@@ -186,10 +201,12 @@ def run_lock(path: Path) -> Iterator[None]:
         else:
             import fcntl
 
-            try:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise RuntimeError(f"training run already has a writer: {path}") from exc
+            while True:
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    wait_or_fail(exc)
             try:
                 yield
             finally:
