@@ -13,7 +13,10 @@ import tempfile
 import time
 from pathlib import Path
 
+from slurm_runtime import current_task_ref, remaining_seconds
+
 from facdigger.environment import collect_environment, environment_is_healthy
+from facdigger.training.progress import append_progress
 from facdigger.training.resources import training_hardware
 from facdigger.training.runtime import (
     DatasetLocation,
@@ -25,26 +28,6 @@ from facdigger.training.runtime import (
     snapshot_checksums,
     write_json,
 )
-
-
-def parse_time_left(value: str) -> int:
-    match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", value.strip())
-    if match is None:
-        raise ValueError(f"cannot determine finite Slurm time remaining: {value!r}")
-    days, hours, minutes, seconds = (int(item or 0) for item in match.groups())
-    if minutes >= 60 or seconds >= 60:
-        raise ValueError("invalid Slurm time remaining")
-    return days * 86400 + hours * 3600 + minutes * 60 + seconds
-
-
-def remaining_seconds(job_id: str) -> int:
-    result = subprocess.run(
-        ["squeue", "-h", "-j", job_id, "-o", "%L"],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    return parse_time_left(result.stdout)
 
 
 def check_environment() -> dict:
@@ -233,7 +216,22 @@ def run_job() -> int:
     if mode not in {"finance-transformer", "finance-pretrain", "transformer-run"}:
         raise ValueError("unknown training mode")
     with run_lock(run_dir / ".allocation.lock"):
-        charged = remaining_seconds(job_id)
+        startup_log = run_dir / "allocations/startup.jsonl"
+        startup_log.parent.mkdir(parents=True, exist_ok=True)
+        append_progress(startup_log, {"event": "allocation_startup", "job_id": job_id}, attempt=0)
+        try:
+            task_ref = current_task_ref()
+            charged = remaining_seconds(job_id)
+        except BaseException as exc:
+            append_progress(startup_log, {
+                "event": "allocation_startup_failed", "job_id": job_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            }, attempt=0)
+            raise
+        append_progress(startup_log, {
+            "event": "allocation_startup_complete", "job_id": job_id,
+            "task_ref": task_ref, "remaining_seconds": charged,
+        }, attempt=0)
         started = time.monotonic()
         state_path = run_dir / "allocation_state.json"
         state = (
@@ -446,7 +444,7 @@ def run_job() -> int:
             ):
                 # All result/ledger writes and scratch cleanup precede requeue,
                 # which may terminate this batch process before returning.
-                subprocess.run(["scontrol", "requeue", job_id], check=True)
+                subprocess.run(["scontrol", "requeue", task_ref], check=True)
         return returncode
 
 

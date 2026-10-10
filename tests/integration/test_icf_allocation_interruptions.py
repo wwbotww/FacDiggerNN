@@ -15,8 +15,10 @@ CHILD = """
 import importlib.util
 import os
 import signal
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(os.environ['ICF_JOB_SCRIPT']).parent))
 spec = importlib.util.spec_from_file_location('icf_job', os.environ['ICF_JOB_SCRIPT'])
 job = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(job)
@@ -52,6 +54,8 @@ def test_repeated_kills_before_first_checkpoint_are_bounded(tmp_path, kill_phase
         "ICF_READY": str(ready),
         "ICF_KILL_PHASE": kill_phase,
     }
+    for key in ("SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID"):
+        env.pop(key, None)
     for attempt in (1, 2):
         env["SLURM_JOB_ID"] = str(attempt)
         with subprocess.Popen(

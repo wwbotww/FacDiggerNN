@@ -16,20 +16,17 @@ from facdigger.training.runtime import snapshot_checksums, write_json
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/icf/job.py"
 spec = importlib.util.spec_from_file_location("icf_job", SCRIPT)
 job = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(job)
+sys.path.insert(0, str(SCRIPT.parent))
+try:
+    spec.loader.exec_module(job)
+finally:
+    sys.path.remove(str(SCRIPT.parent))
 
 
-@pytest.mark.parametrize(
-    "value,seconds", [("04:00:00", 14400), ("2-00:00:00", 172800), ("05:30", 330), ("00:00", 0)]
-)
-def test_slurm_remaining_time(value, seconds):
-    assert job.parse_time_left(value) == seconds
-
-
-@pytest.mark.parametrize("value", ["UNLIMITED", "", "INVALID", "0:90", "1:00\n2:00"])
-def test_unknown_time_is_not_an_unlimited_training_budget(value):
-    with pytest.raises(ValueError):
-        job.parse_time_left(value)
+@pytest.fixture(autouse=True)
+def isolated_slurm_array_environment(monkeypatch):
+    for key in ("SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID"):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_staging_preserves_input_and_checks_all_files(tmp_path):
@@ -50,12 +47,14 @@ def test_staging_preserves_input_and_checks_all_files(tmp_path):
     "code,reason,requeue",
     [(0, None, False), (1, None, False), (75, "SIGTERM", False), (75, "walltime_budget", True)],
 )
+@pytest.mark.parametrize("array_task", [None, "0", "58"])
 def test_job_uses_remaining_budget_and_only_requeues_committed_time_pause(
     tmp_path,
     monkeypatch,
     code,
     reason,
     requeue,
+    array_task,
 ):
     runtime = tmp_path / "runtime.yaml"
     runtime.write_text("handle_signals: true\nshutdown_margin_seconds: 300\n")
@@ -76,6 +75,9 @@ def test_job_uses_remaining_budget_and_only_requeues_committed_time_pause(
     }.items():
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("FD_STAGING_ROOT", raising=False)
+    if array_task is not None:
+        monkeypatch.setenv("SLURM_ARRAY_JOB_ID", "42")
+        monkeypatch.setenv("SLURM_ARRAY_TASK_ID", array_task)
     remaining = iter([3600, 1800])
     monkeypatch.setattr(job, "remaining_seconds", lambda _: next(remaining))
     monkeypatch.setattr(job, "check_environment", lambda: {"test": True})
@@ -97,7 +99,7 @@ def test_job_uses_remaining_budget_and_only_requeues_committed_time_pause(
             assert json.loads(generated.read_text())["max_walltime_seconds"] == 1800
             assert json.loads((generated.parent / "step.json").read_text())["run_dir"] == str(run)
             return SimpleNamespace(returncode=code)
-        assert args == ["scontrol", "requeue", "42"]
+        assert args == ["scontrol", "requeue", "42" if array_task is None else f"42_{array_task}"]
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(job.subprocess, "run", call)
@@ -176,6 +178,27 @@ def configure_job(tmp_path, monkeypatch):
         job, "progress_signature", lambda _: (snapshot["manifest"], snapshot["signature"])
     )
     return run, snapshot
+
+
+def test_first_budget_failure_is_audited_without_starting_training(tmp_path, monkeypatch):
+    run, _ = configure_job(tmp_path, monkeypatch)
+
+    def failed_query(_):
+        raise ValueError("Slurm record identity differs")
+
+    monkeypatch.setattr(job, "remaining_seconds", failed_query)
+    monkeypatch.setattr(job, "check_environment", lambda: pytest.fail("must not start training"))
+    for _ in range(2):
+        with pytest.raises(ValueError, match="identity differs"):
+            job.run_job()
+    events = [
+        json.loads(line) for line in (run / "allocations/startup.jsonl").read_text().splitlines()
+    ]
+    assert [e["event"] for e in events] == ["allocation_startup", "allocation_startup_failed"] * 2
+    assert all(e["job_id"] == "42" and e["attempt"] == 0 for e in events)
+    assert "ValueError" in events[-1]["error"]
+    assert not (run / "allocation_state.json").exists()
+    assert not (run / "checkpoints").exists()
 
 
 def test_early_failure_refunds_reservation_and_records_error(tmp_path, monkeypatch):
