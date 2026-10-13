@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 from facdigger.data.contracts import DataContractError
 from facdigger.data.snapshots import sha256_file
-from facdigger.datasets.window import MarketFeatureWindow
+from facdigger.datasets.window import MarketFeatureStore, MarketFeatureWindow
 from facdigger.models.finance_patch_transformer import MultiScaleStatisticsEncoder
 from facdigger.training.runtime import write_json
 
@@ -101,6 +101,23 @@ class FinanceStatisticsDataset:
         self.market_channels = manifest["market_channels"]
         self.windows = tuple(manifest["windows"])
         self.positions = np.arange(self.sample_rows.height)
+        self.current_market_verified = False
+
+    def verify_current_market(self, store: MarketFeatureStore) -> dict:
+        """Fail closed before interpreting the cache tail as current market state."""
+        self.current_market_verified = False
+        if tuple(self.market_channels) != store.channels:
+            raise DataContractError("current market channel order differs from the cache")
+        dates = self.sample_rows["asof_date"].unique().sort().to_list()
+        for day in dates:
+            current = store.window(day, context_length=1)
+            if not current.observed_mask.all() or not np.isfinite(current.values).all():
+                raise DataContractError(f"current market state is missing or non-finite: {day}")
+            cached = self.market[self.market_positions[str(day)], -len(self.market_channels):]
+            if not np.array_equal(cached, current.values[0]):
+                raise DataContractError(f"current market differs from the statistics cache: {day}")
+        self.current_market_verified = True
+        return {"dates": len(dates), "channels": self.market_channels, "exact_float32_match": True}
 
     def subset(self, dates: list) -> FinanceStatisticsDataset:
         from copy import copy

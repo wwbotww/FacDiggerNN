@@ -563,6 +563,10 @@ def train_finance_transformer(
     state_observer: Callable[[torch.nn.Module, int], None] | None = None,
 ) -> tuple[FinancePatchTransformer, dict[str, Any]]:
     dropout_identity = statistics_dropout_identity(diagnostic_model, statistics_dropout)
+    if diagnostic_model == "statistics_conditional_linear" and not all(
+        getattr(data, "current_market_verified", False) for data in (train_dataset, valid_dataset)
+    ):
+        raise ValueError("conditional Linear requires verified current market states in F/S")
     started_at = time.perf_counter()
     control = control or TrainingControl()
     observation = TrainingProgress(progress_callback)
@@ -581,6 +585,8 @@ def train_finance_transformer(
                 * (5 * len(config.model.statistics_windows) + 1),
                 horizons=tuple(config.horizons),
                 dropout=statistics_dropout,
+                local_dim=len(config.channels) * (5 * len(config.model.statistics_windows) + 1),
+                market_channels=len(config.market_channels),
             ) if diagnostic_model is not None else
             build_finance_transformer_model(config, context_length=train_dataset.context_length)
         )

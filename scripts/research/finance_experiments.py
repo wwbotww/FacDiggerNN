@@ -47,20 +47,85 @@ def main(argv=None):
     for name in ("status", "seal"):
         command = commands.add_parser(name)
         command.add_argument("--output", type=Path, required=True)
+    summary = commands.add_parser("summary", help="Read saved complete F/S results; no reselection")
+    summary.add_argument("--source", type=Path, required=True)
+    summary.add_argument("--output", type=Path, required=True)
+    comparison = commands.add_parser(
+        "compare-plan", help="Bind original controls and both interventions"
+    )
+    for role in ("reference", "conditional", "low-lr", "output"):
+        comparison.add_argument(f"--{role}", type=Path, required=True)
+    for name in ("compare-summary", "compare-seal", "validation-gate", "admit"):
+        command = commands.add_parser(name)
+        command.add_argument("--comparison", type=Path, required=True)
+        if name in {"compare-summary", "admit"}:
+            command.add_argument("--output", type=Path, required=True)
+        if name == "admit":
+            command.add_argument(
+                "--caches", type=Path, required=True, help="JSON fold -> F/S cache root"
+            )
     args = parser.parse_args(argv)
     repository_root = Path(__file__).resolve().parents[2]
     if args.action == "list":
         result = {"cells": experiment_cells(load_finance_experiment_config(args.config))}
     elif args.action == "plan":
         result = freeze_experiment_plan(
-            load_finance_experiment_config(args.config), load_training_runtime(args.runtime),
-            args.output, repository_root=repository_root,
+            load_finance_experiment_config(args.config),
+            load_training_runtime(args.runtime),
+            args.output,
+            repository_root=repository_root,
         )
         result = {"plan_hash": result["plan_hash"], "cells": result["identity"]["cells"]}
     elif args.action == "status":
         result = experiment_status(args.output)
     elif args.action == "seal":
         result = seal_experiment_selections(args.output, repository_root=repository_root)
+    elif args.action == "summary":
+        from facdigger.research.finance_experiment_summary import summarize_experiments
+
+        result = summarize_experiments(
+            {"source": args.source},
+            args.output,
+            repository_root=repository_root,
+        )
+    elif args.action == "compare-plan":
+        from facdigger.research.finance_comparison import freeze_intervention_comparison
+
+        bound = freeze_intervention_comparison(
+            {"reference": args.reference, "conditional": args.conditional, "low_lr": args.low_lr},
+            args.output,
+            repository_root=repository_root,
+        )
+        result = {"comparison_hash": bound["comparison_hash"], "validation_used": False}
+    elif args.action in {"compare-summary", "compare-seal", "validation-gate", "admit"}:
+        from facdigger.research.finance_comparison import (
+            require_complete_validation_package,
+            seal_comparison_selections,
+            summarize_comparison,
+        )
+
+        if args.action == "compare-summary":
+            result = summarize_comparison(
+                args.comparison, args.output, repository_root=repository_root
+            )
+        elif args.action == "compare-seal":
+            seal = seal_comparison_selections(args.comparison, repository_root=repository_root)
+            result = {
+                "comparison_hash": seal["comparison_hash"],
+                "selections": len(seal["selections"]),
+            }
+        elif args.action == "admit":
+            from facdigger.research.finance_intervention_admission import admit_interventions
+
+            result = admit_interventions(
+                args.comparison,
+                {key: Path(value) for key, value in json.loads(args.caches.read_text()).items()},
+                args.output,
+                repository_root=repository_root,
+            )
+        else:
+            require_complete_validation_package(args.comparison)
+            result = {"validation_ready": True}
     else:
         values = load_training_runtime(args.runtime).model_dump(mode="json")
         for option, field in (
@@ -73,18 +138,32 @@ def main(argv=None):
         runtime = TrainingRuntimeConfig.model_validate(values)
         if args.action == "prepare":
             result = prepare_experiment_cache(
-                args.output, args.fold, repository_root=repository_root, runtime=runtime,
+                args.output,
+                args.fold,
+                repository_root=repository_root,
+                runtime=runtime,
             )
         else:
             audit = run_experiment_cell(
-                args.output, args.cell, repository_root=repository_root, runtime=runtime,
-                cache=args.cache, parent_prefix=args.parent_prefix,
+                args.output,
+                args.cell,
+                repository_root=repository_root,
+                runtime=runtime,
+                cache=args.cache,
+                parent_prefix=args.parent_prefix,
                 cumulative_budget_seconds=args.cumulative_budget_seconds,
             )
             result = {
-                key: audit[key] for key in (
-                    "status", "phase", "epoch", "global_step", "best_epoch", "stop_reason",
-                ) if key in audit
+                key: audit[key]
+                for key in (
+                    "status",
+                    "phase",
+                    "epoch",
+                    "global_step",
+                    "best_epoch",
+                    "stop_reason",
+                )
+                if key in audit
             }
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 75 if result.get("status") == "paused" else 0

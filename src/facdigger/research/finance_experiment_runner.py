@@ -15,6 +15,7 @@ from facdigger.data.snapshots import sha256_file
 from facdigger.datasets.finance_statistics import FinanceStatisticsDataset
 from facdigger.environment import collect_environment
 from facdigger.research.finance_diagnostics import window_datasets
+from facdigger.research.finance_experiment_cache import verify_conditional_market
 from facdigger.research.finance_experiment_config import candidate_settings, cell_config
 from facdigger.research.finance_experiment_plan import (
     clean_git,
@@ -204,6 +205,10 @@ def run_experiment_cell(
                     )
                     for phase in ("F", "S")
                 }
+                if cell["candidate"] == "statistics_conditional_linear":
+                    audit["current_market"] = verify_conditional_market(
+                        Path(location["path"]), manifest, config, pools, cached,
+                    )
                 datasets = (
                     window_datasets(Path(location["path"]), manifest, config, pools)
                     if cell["candidate"] == "finance" else cached

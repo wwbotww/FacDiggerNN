@@ -7,8 +7,11 @@ import shutil
 import time
 from pathlib import Path
 
+import polars as pl
+
 from facdigger.data.contracts import DataContractError
 from facdigger.datasets.finance_statistics import FinanceStatisticsDataset, cache_statistics
+from facdigger.datasets.window import MarketFeatureStore
 from facdigger.research.finance_diagnostics import window_datasets
 from facdigger.research.finance_experiment_config import cell_config
 from facdigger.research.finance_experiment_plan import (
@@ -16,6 +19,7 @@ from facdigger.research.finance_experiment_plan import (
     load_fold_inputs,
     read_experiment_plan,
 )
+from facdigger.training.common import load_required_market_features
 from facdigger.training.runtime import (
     TrainingControl,
     TrainingPaused,
@@ -23,6 +27,18 @@ from facdigger.training.runtime import (
     run_lock,
     write_json,
 )
+
+
+def verify_conditional_market(snapshot, manifest, config, pools, cached) -> dict:
+    # Only these phases' input dates; never use a label's future_end as a feature boundary.
+    required = pl.concat([
+        rows.select("feature_start", "asof_date") for rows in pools.values()
+    ]).unique()
+    store = MarketFeatureStore(
+        features=load_required_market_features(snapshot, manifest, required),
+        channels=config.market_channels,
+    )
+    return {phase: data.verify_current_market(store) for phase, data in cached.items()}
 
 
 def prepare_experiment_cache(
@@ -94,10 +110,15 @@ def prepare_experiment_cache(
                     )
                     check_stop()
                     pending.replace(path)
-                FinanceStatisticsDataset(
+                cached = FinanceStatisticsDataset(
                     path, identity=protocol, windows=tuple(binding["windows"]),
                     expected_rows=pools[phase],
                 )
+                if "statistics_conditional_linear" in plan["identity"]["research"]["candidates"]:
+                    verify_conditional_market(
+                        Path(plan["identity"]["folds"][fold_id]["path"]), manifest, config,
+                        {phase: pools[phase]}, {phase: cached},
+                    )
                 if phase not in audit["completed_phases"]:
                     audit["completed_phases"].append(phase)
                 write_json(audit_path, audit)

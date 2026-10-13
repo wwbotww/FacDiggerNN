@@ -13,7 +13,8 @@ from facdigger.research.config import ResearchFoldConfig
 from facdigger.training.finance_transformer_config import FinanceTransformerExperimentConfig
 
 Candidate = Literal[
-    "statistics_linear", "statistics_mlp", "statistics_mlp_dropout03", "finance"
+    "statistics_linear", "statistics_mlp", "statistics_mlp_dropout03", "finance",
+    "statistics_conditional_linear",
 ]
 
 
@@ -55,7 +56,7 @@ def candidate_settings(candidate: str) -> tuple[str | None, float]:
         return None, 0.1
     if candidate == "statistics_mlp_dropout03":
         return "statistics_mlp", 0.3
-    if candidate in {"statistics_linear", "statistics_mlp"}:
+    if candidate in {"statistics_linear", "statistics_mlp", "statistics_conditional_linear"}:
         return candidate, 0.1
     raise ValueError(f"unknown Finance experiment candidate: {candidate}")
 

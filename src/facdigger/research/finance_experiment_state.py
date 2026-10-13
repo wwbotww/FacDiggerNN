@@ -68,6 +68,8 @@ def build_cell_model(config, candidate: str, context_length: int, device: str):
             kind, input_dim=(len(config.channels) + len(config.market_channels))
             * (5 * len(config.model.statistics_windows) + 1),
             horizons=tuple(config.horizons), dropout=dropout,
+            local_dim=len(config.channels) * (5 * len(config.model.statistics_windows) + 1),
+            market_channels=len(config.market_channels),
         )
     )
     return model.to(device)

@@ -15,6 +15,7 @@ from test_finance_transformer_training import _config, _datasets
 
 from facdigger.data.contracts import DataContractError
 from facdigger.datasets.window import FinanceTransformerInferenceWindowDataset
+from facdigger.research import finance_experiment_cache as caching
 from facdigger.research import finance_experiment_plan as planning
 from facdigger.research import finance_experiment_runner as runner
 from facdigger.research import finance_prefix_diagnostics as prefix
@@ -44,7 +45,9 @@ ENVIRONMENT = {
 RUNTIME = TrainingRuntimeConfig(max_walltime_seconds=600, shutdown_margin_seconds=30)
 
 
-def setup_cells(tmp_path, monkeypatch, candidate="statistics_mlp", *, seeds=(42,), epochs=3):
+def setup_cells(
+    tmp_path, monkeypatch, candidate="statistics_mlp", *, seeds=(42,), epochs=3, lr_ratio=1,
+):
     torch.set_num_threads(1)
     train, selection = _datasets()
     raw = _config().model_dump(mode="json")
@@ -52,6 +55,8 @@ def setup_cells(tmp_path, monkeypatch, candidate="statistics_mlp", *, seeds=(42,
     raw["training"].update(
         max_epochs=epochs, minimum_epochs=6 if epochs == 10 else epochs, patience=3,
     )
+    for key in ("encoder_learning_rate", "head_learning_rate"):
+        raw["training"][key] *= lr_ratio
     config = _config().model_validate(raw)
     experiment_path = tmp_path / "experiment.yaml"
     experiment_path.write_text(yaml.safe_dump(config.model_dump(mode="json")))
@@ -102,6 +107,19 @@ def setup_cells(tmp_path, monkeypatch, candidate="statistics_mlp", *, seeds=(42,
     monkeypatch.setattr(
         runner, "window_datasets", lambda *a: windows,
     )
+    def market_features(*args):
+        import polars as pl
+        store = train.market_store
+        return pl.DataFrame({
+            "trade_date": store.dates,
+            **{name: store.values[:, i] for i, name in enumerate(store.channels)},
+            **{f"observed_{name}": store.observed[:, i] for i, name in enumerate(store.channels)},
+        })
+
+    monkeypatch.setattr(caching, "load_required_market_features", market_features)
+    if candidate == "statistics_conditional_linear":
+        for data in cached.values():
+            data.verify_current_market(train.market_store)
     runtime = TrainingRuntimeConfig(
         fold_snapshots={"wf": DatasetLocation(path=snapshot, checksums=checksums)},
     )
@@ -179,7 +197,10 @@ def test_different_cells_wait_for_the_shared_binding_without_entering_training(
 
 
 @pytest.mark.parametrize(
-    "candidate", ["statistics_linear", "statistics_mlp", "statistics_mlp_dropout03", "finance"],
+    "candidate", [
+        "statistics_linear", "statistics_mlp", "statistics_mlp_dropout03", "finance",
+        "statistics_conditional_linear",
+    ],
 )
 def test_complete_cells_match_the_existing_trainer_and_seal_without_v(
     tmp_path, monkeypatch, candidate,
@@ -220,10 +241,14 @@ def test_complete_cells_match_the_existing_trainer_and_seal_without_v(
 
 
 @pytest.mark.parametrize("phase", ["observation", "update", "final_commit"])
+@pytest.mark.parametrize("candidate,lr_ratio", [
+    ("statistics_mlp", 1), ("statistics_conditional_linear", 1),
+    ("statistics_mlp_dropout03", 0.3), ("finance", 0.3),
+])
 def test_complete_cell_resumes_without_changing_optimizer_clock_or_rng(
-    tmp_path, monkeypatch, phase,
+    tmp_path, monkeypatch, phase, candidate, lr_ratio,
 ):
-    setup = setup_cells(tmp_path, monkeypatch)
+    setup = setup_cells(tmp_path, monkeypatch, candidate, lr_ratio=lr_ratio)
     continuous = setup["plan"]("continuous")
     setup["run"](continuous)
     resumed = setup["plan"]("resumed")
@@ -233,7 +258,7 @@ def test_complete_cell_resumes_without_changing_optimizer_clock_or_rng(
         def interrupted(path, tables):
             original(path, tables)
             if path.name == "epoch-1-F-0000":
-                raise TrainingPaused("fixture observation", last(resumed))
+                raise TrainingPaused("fixture observation", last(resumed, candidate))
 
         monkeypatch.setattr(prefix, "_write_chunk", interrupted)
         def restore():
@@ -272,13 +297,14 @@ def test_complete_cell_resumes_without_changing_optimizer_clock_or_rng(
     restore()
     assert setup["run"](resumed)["status"] == "complete"
     _equal(
-        torch.load(last(continuous), weights_only=False),
-        torch.load(last(resumed), weights_only=False),
+        torch.load(last(continuous, candidate), weights_only=False),
+        torch.load(last(resumed, candidate), weights_only=False),
     )
     if phase == "observation":
+        progress_path = last(resumed, candidate).parents[1] / "progress.jsonl"
         events = [
             json.loads(line)
-            for line in (last(resumed).parents[1] / "progress.jsonl").read_text().splitlines()
+            for line in progress_path.read_text().splitlines()
         ]
         assert any(
             row["event"] == "observation_chunk_reused" and row["epoch"] == 1 for row in events
