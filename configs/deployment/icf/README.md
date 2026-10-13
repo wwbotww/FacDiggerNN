@@ -24,7 +24,8 @@
 也不是当前实时作业状态**。升级或换节点须重新核验相应范围。
 
 第二批 R+C 有单独的 `scripts/icf/diagnostics.sbatch`，不走正式矩阵或故障注入入口。
-通用协议、命令和预算见[诊断方案6.10](../../../docs/因子效果诊断与实验改进方案.md#batch2-execution)。
+通用命令和预算见[R/C运行入口](../../../docs/训练运行与恢复.md#batch2-execution)，
+科学设计见[R/C实验记录](../../../docs/实验记录/2026-10-02_两轮参照与完整F诊断.md#design)。
 启动前显式设置 `FD_DIAG_CODE`、`FD_DIAG_COMMIT`、`FD_DIAG_PYTHON`、`FD_DIAG_ROOT`、
 `FD_DIAG_DATASET`、`FD_DIAG_CHECKSUMS`；R 另需 `FD_DIAG_OLD_MATRIX`、`FD_DIAG_OLD_SNAPSHOTS`。
 路径不含凭据，code 必须是隔离的干净提交。script 的一个位置参数为 R/cache/候选名。
@@ -54,7 +55,7 @@ Linear设置 `FD_DIAG_REUSE_LINEAR_CHUNKS=/path/to/previous-fixed/statistics_lin
 目录校验并复用旧的已提交块；原审计、代码身份和部分结果不改写。旧225秒allocation
 另计，新45分钟allocation加旧用量不超过本次设定的1小时Linear累计上限。
 这里没有训练更新或 S/V 重评分，原来2.5小时是首轮部署预算记录，不是科学协议限制。
-通用计算与恢复边界见[固定状态入口](../../../docs/因子效果诊断与实验改进方案.md#batch2-fixed-execution)。
+通用计算与恢复边界见[固定状态入口](../../../docs/训练运行与恢复.md#batch2-fixed-execution)。
 
 2026-10-03确认的廉价seed复现使用`scripts/icf/seed_diagnostics.sbatch`，两个位置参数
 分别是`statistics_linear`或`statistics_mlp`、seed `17`或`73`。保留上述通用路径变量，
@@ -66,14 +67,15 @@ Linear设置 `FD_DIAG_REUSE_LINEAR_CHUNKS=/path/to/previous-fixed/statistics_lin
 预留5分钟安全退出；外部另留10分钟启动/延迟退出余量，`--signal=USR1@300`，禁止
 自动requeue。四run合计最多3 GPU小时，续跑前核销实际`sacct` allocation及入口attempt。
 显式传日志路径和`--chdir`，固定干净代码提交；不要修改其他checkout、缓存或原C结果。
-完整科学条件及跨平台命令见[方案6.17–6.18](../../../docs/因子效果诊断与实验改进方案.md#batch2-seed-execution)。
+完整科学条件见[seed复现设计](../../../docs/实验记录/2026-10-03_统计基线复现与Dropout对照.md#seed-design)，
+跨平台命令见[F/S运行入口](../../../docs/训练运行与恢复.md#batch2-seed-execution)。
 
 随后确认的单项正则对照复用该包装，参数为
 `statistics_mlp <17|42|73> dropout-0.3`，显式传`--statistics-dropout 0.3`；
 `.1`控制和Linear均不重训。`FD_DIAG_ROOT`必须使用新目录；三run每项仍45分钟，
 合计最多8,100秒allocation。该参数独立于Finance YAML的`model.dropout`，后者
 历史上不控制统计MLP。所有观察/恢复/预算规则相同，见
-[方案6.21](../../../docs/因子效果诊断与实验改进方案.md#batch2-dropout-execution)。
+[dropout运行入口](../../../docs/训练运行与恢复.md#batch2-dropout-execution)。
 
 ## 1. 准备独立环境和稳定资产
 
