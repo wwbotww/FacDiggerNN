@@ -19,7 +19,7 @@ uv run facdigger doctor
 ## 分支与发布
 
 本节是分支、实验版本与发布流程的唯一维护位置；文档内容的职责划分见
-[文档中心](docs/README.md#后续维护规则)。GitHub默认分支为`main`，新开发从`dev`开始。
+[文档中心](docs/README.md#后续维护规则)。GitHub默认分支为`dev`，新开发从`dev`开始；`main`保留稳定发布职责。
 
 | 分支 | 用途与集成方向 |
 |---|---|
