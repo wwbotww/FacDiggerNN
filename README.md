@@ -95,5 +95,5 @@ set +a
 - 新 Finance 训练快照是 schema v5；旧价量快照 v4 和 Finance 最佳模型 checkpoint v4
   是不同契约。旧不可变产物不原地升级。
 
-开发和最低验证要求见 [CONTRIBUTING.md](CONTRIBUTING.md)；
+开发分支、实验版本、稳定发布和验证要求见 [CONTRIBUTING.md](CONTRIBUTING.md#分支与发布)；
 coding agent 规则见 [AGENTS.md](AGENTS.md)。
