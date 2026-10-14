@@ -1,119 +1,61 @@
-# FacDiggerNN coding guide
+# FacDiggerNN agent guide
 
-本文件只保存 coding agent 每次任务都需要的仓库规则。开发、分支、发布流程和 CI 见
-[贡献指南](CONTRIBUTING.md#分支与发布)，安全与秘密处理见 `SECURITY.md`；文档职责和历史归档见
-`docs/README.md`，使用、架构和实验协议分别见 `README.md`、`docs/开发文档.md` 和
-`docs/实验设计文档.md`。
+FacDiggerNN 是面向美股日频数据的 point-in-time 因子研究 CLI，输出因子供交易系统消费。
+本文件保留任务入口和容易误改的项目边界；流程、命令和详细协议按需阅读下列权威文档。
 
-## Project context
+## 开始任务
 
-FacDiggerNN 是面向美股日频数据的 point-in-time 机器学习因子研究 CLI，不是交易系统。
+- 先检查 `git status --short --branch` 和相关 worktree，保留已有修改与成果；新任务按
+  [分支规则](CONTRIBUTING.md#分支与发布)开展，其他任务占用的 checkout 使用独立 worktree 隔离。
+- 按问题定位实现、调用方和测试；不为每次小改动通读架构、历史归档和实验日志。
 
-包入口由 `pyproject.toml` 中的 `facdigger = "facdigger.cli:app"` 定义，Typer app 位于
-`src/facdigger/cli.py`。总体数据流是：
+| 任务 | 按需阅读 |
+|---|---|
+| 安装、实现、测试、提交或发布 | [贡献指南](CONTRIBUTING.md) |
+| 数据契约、模块边界、CLI 扩展 | [开发文档](docs/开发文档.md) |
+| 训练、选择、评价或研究解释 | [共同协议](docs/实验设计文档.md)；具体实验从[研究概览](docs/因子效果诊断与实验改进方案.md)定位冻结设计 |
+| 训练恢复或学校部署 | [训练运行与恢复](docs/训练运行与恢复.md)、[ICF 操作说明](configs/deployment/icf/README.md) |
+| 推理、FactorBatch 或每日生产 | [联调契约](docs/HeyBoss因子联调交接.md)、[生产运维](docs/每日生产运维.md) |
+| 文档、结果与复盘 | [文档职责和维护规则](docs/README.md#后续维护规则) |
+| 凭据、外部文件、安全缺陷 | [安全规则](SECURITY.md) |
 
-```text
-provider -> 标准 Parquet + provenance 契约 -> 内容寻址快照
-         -> Finance Transformer（当前）/ E0–E3（保留）-> 统一评价 / walk-forward
-         -> ModelRelease -> 无标签推理 -> FactorBatch
-```
+## 不可绕过的边界
 
-本项目最重要的设计取向是：可复现、可审计、防止未来信息泄漏。数据或协议不可信时应明确
-失败，不要为了跑通流程而静默修补。
+- 特征只使用 `asof_date` 当时可知的信息。scaler、SSL、probe 和监督选择各自遵守冻结
+  协议的允许区间，outer valid/test 不参与拟合或 checkpoint 选择；各 fold 按协议分别拟合，
+  不把晚期 scaler/encoder 用于早期 fold。读取结果遵守任务与计划允许的 F/S/V/holdout 范围。
+- 正式对照复用计划约定的快照、数据可用边界、评价支持集、预测契约和 evaluator；
+  旧协议、新协议、原生 S-best 与诊断重评分的证据分开。工程通过不等于因子有效。
+- 缺失价格不前值填充，非法 OHLC 不修正为合法值；不放宽来源质量、哈希、覆盖率或
+  test/holdout 门禁来跑通流程。领域层保留明确异常及根因，CLI 转换为非零退出码。
+- 训练快照、原始实验产物、冻结配置和 manifest 不原地改写。迁移只显式重定位路径，
+  不重算哈希掩盖差异；也不切换运行中实验的 checkout/venv 或生产 release/CURRENT。
+- 最新信号路径不读 labels、target 或 test membership，不重新拟合 scaler。交付身份仅在
+  实际交付集合校验，不因未交付训练股票缺 ISIN 拒绝 release；评分仍使用完整计算横截面。
+  过期身份映射不得静默缩小覆盖率分母。
+- 联调如需 `--allow-dirty`，必须真实记录 dirty 状态；不能伪造 `git_clean=true` 或绕过
+  其他产物验证。数据、权重和秘密不进入 Git；凭据与不可信 checkpoint 按安全规则处理。
 
-## Where code belongs
+## 定位实现
 
-- `src/facdigger/data/`：标准数据契约、adapter、快照；供应商实现只放在
-  `data/providers/<provider>/`。
-- `features/`、`labels/`、`datasets/`：特征、标签、切分、索引、窗口和采样。
-- `models/`：模型结构、基线、PatchTST 迁移与预训练能力。
-- `training/`：Finance Transformer 与 E0–E3 配置、编排和 checkpoint；Finance 支持显式
-  runtime 与 update 边界恢复，E1–E3 保留各自 resume 契约。共享逻辑优先复用
-  `training/common.py` 和已有领域实现。
-- `evaluation/`：预测契约、中性化、指标、覆盖门禁、报告和比较。
-- `inference/`：checkpoint 回放和不读取标签的信号生成。
-- `research/`：walk-forward、统计、冻结和 holdout 编排；复用训练器，不复制训练逻辑。
-- `configs/`：数据、快照、实验和研究协议实例。
-- `tests/unit/`、`tests/integration/`：pytest 单元与小型端到端测试。
+包入口是 `src/facdigger/cli.py` 的 Typer app（`facdigger.cli:app`）。业务逻辑在领域模块：
 
-代码、严格配置和测试是当前可执行行为的最终依据；文档与实现冲突时不要猜测或静默兼容，
-应查明原因并同步修正。
+- `src/facdigger/data/` 管标准表、契约、provenance 和快照；EODHD API、预算、缓存及字段
+  映射只在 `data/providers/eodhd/`，下游消费通用标准表和来源证明。
+- `features/`、`labels/`、`datasets/` 管样本；`models/`、`training/` 管模型及恢复；
+  `evaluation/` 管统一评价；`research/` 复用训练器编排；`inference/`、`production/` 管交付。
+  这些目录均位于 `src/facdigger/`；共享逻辑先查 `training/common.py` 及已有领域实现。
+- `configs/` 是配置实例，`scripts/icf/` 是学校作业包装；学校路径与调度限制留在部署层。
+  通用训练可靠性改动保持本地和其他服务器兼容。测试在 `tests/unit/`、`tests/integration/`。
 
-## How to work in this repository
+代码、严格配置和测试说明当前可执行行为；与协议或文档冲突时查明原因，不以任一方为由
+静默改科学语义。修复、抽象和兼容策略见[变更原则](CONTRIBUTING.md#变更原则)。
 
-1. 修改前检查 `git status`；保留用户已有改动，不覆盖或混入无关文件。
-2. 先用 `rg` 查找实现、调用方和相似测试；沿用最近似的模式。
-3. 选择能够完整解决问题的最小改动。范围外问题可以报告，不要顺手重构。
-4. 新抽象应来自当前需求；优先扩展领域模块，谨慎新增通用 `utils/helpers`。
-5. CLI 只负责参数、调用和用户输出；业务规则进入对应领域模块。
-6. Bug 修复应定位根因并增加修复前可失败的回归测试；重构默认保持外部行为。
-7. 不通过吞异常、降低断言、跳过检查或放宽契约来解决失败。
-8. 新依赖前先确认现有能力不足；不要升级无关依赖或无理由改写 lockfile。
+## 验证与交付
 
-## Project-specific boundaries
-
-- EODHD API、缓存、预算、原始响应和字段映射只放在 `data/providers/eodhd/`。provider
-  必须生成 `data.provenance` 定义的通用标准化证明；下游只消费标准表和该通用契约。
-- 标准表通过 `data.contracts`，来源证明通过 `data.provenance`，预测通过
-  `evaluation.contracts`。契约变化必须考虑 snapshot/manifest 版本和旧产物兼容性。
-- 特征只使用 `asof_date` 当时可知的信息；scaler 只拟合 train；outer validation/test
-  不参与训练或 checkpoint 选择。
-- 缺失价格不前值填充，非法 OHLC 不“修正”为合法值；来源质量、哈希、覆盖率、
-  test/holdout 等现有门禁不要绕过。
-- 正式对照中 E0–E3 必须复用相同快照、预测契约和 evaluator；最新信号路径不能读取
-  labels、target 或 test membership。
-- CLI、配置字段、Parquet schema、manifest 和 checkpoint 布局都是需要谨慎维护的接口。
-- 跨系统身份在实际交付集合校验；不得因未交付训练股票缺 ISIN 拒绝 release，也不得为交付
-  子集提前缩小模型的完整计算横截面。目标集合与映射有效期分离，过期映射不得静默缩小覆盖率分母。
-- 本机资产路径可显式重定位，但不改原始 manifest/config/hash。联调仅可通过 `--allow-dirty`
-  放行真实记录的 dirty Git 状态，不得伪造 `git_clean=true` 或跳过其他产物验证。
-- 领域层使用明确异常并保留根因；CLI 可以转换为非零退出码。不要在输出、缓存或
-  manifest 中泄露 token。
-
-关键修复的复盘触发条件和贡献要求见 `CONTRIBUTING.md`。
-
-## Commands and validation
-
-```bash
-uv sync --frozen --all-extras
-uv lock --check
-uv run ruff check .
-uv run pytest
-uv run pytest path/to/test_file.py -q
-uv run pytest path/to/test_file.py::test_name -q
-uv run pytest --cov=facdigger --cov-report=term-missing
-uv run facdigger doctor
-```
-
-先运行最相关的测试，再按 `CONTRIBUTING.md` 的风险矩阵扩大。CI 在 Python 3.10–3.12
-运行锁定依赖、Ruff 和完整 pytest。EODHD 测试必须使用 fake transport 和临时目录；
-普通测试不得访问 live API、刷新真实缓存或下载模型。只报告实际执行过的检查，并说明未覆盖
-的网络、GPU、付费数据或正式研究环境。
-
-## Data, secrets and generated files
-
-`.env.local` 和 `EODHD_API_TOKEN` 不提交，也不写入 YAML、日志、缓存键或 manifest。
-`data/`、`artifacts/`、`.venv/`、缓存、Parquet、checkpoint、模型权重、`build/` 和
-`dist/` 是本机或生成内容，不直接编辑。内容寻址快照生成后按协议不得修改。数据采集、
-模型下载、正式训练和 holdout 解锁只在任务明确要求时执行。
-
-## Finishing a task
-
-完成前检查最终 diff，确认改动位于正确模块、测试和文档已同步、没有无关改动、生成物、
-秘密或不必要依赖。最终回复简洁说明改了什么、实际验证、未执行验证和仍存风险。
-
-## 适度设计约束
-
-- 默认采用满足当前需求的最小实现，不为假设中的未来需求提前增加版本系统、兼容层、哈希链、插件机制或通用抽象。
-- 新增机制前必须说明它解决的当前问题、真实调用方及验收方式；“以后可能需要”不能作为理由。
-- 哈希仅用于外部交付、不可变内容或明确的损坏/篡改风险；普通配置和可重建数据优先使用 schema、唯一键及业务规则校验。
-- 版本化仅在确实需要同时兼容多个格式或外部消费者无法同步升级时引入；只有一个格式时禁止增加 `v1/v2`、`schema_version` 或版本注册表。
-- 无法证明额外复杂度必要时，选择更简单的方案。
-
-## 代码修复原则
-
-- 先定位根因，再修改代码。
-- 优先修改、重构或删除错误实现，禁止叠加补丁绕过问题。
-- 新实现替代旧实现时，必须删除旧代码并迁移调用方。
-- 禁止无必要的兼容层、重复实现和特殊分支。
-- 完成后清理死代码，确保只有一条权威实现路径。
+- 按[风险矩阵](CONTRIBUTING.md#本地验证)选择检查，覆盖本次完整变更范围；纯文档不跑训练
+  测试。使用已验证的开发环境，不为阅读文档安装全部依赖或修改固定实验 venv。
+- 授权范围内的实现、临时 fixture 测试和文档检查直接推进。正式采集、模型下载、长训练、
+  holdout 解封与生产变更须在任务明确授权范围内；已有授权不逐步重复确认。
+- 完成前检查 diff，报告改动、实际验证和未覆盖范围；不把静态检查写成运行验收。
+  按[提交与评审](CONTRIBUTING.md#提交与评审)核对并说明文档影响，遵守文档中心的唯一职责划分。

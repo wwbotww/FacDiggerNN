@@ -9,16 +9,28 @@ FacDiggerNN 是本地美股因子研究工具，不是交易或订单执行系�
 优先使用仓库托管平台的 private vulnerability reporting（若已启用），否则通过可用的私密
 渠道联系仓库维护者。报告应包含受影响版本、复现条件、影响和建议缓解方式。
 
-当前项目尚无正式发布支持周期；默认只修复当前受支持的活跃维护分支，不承诺为旧分支回移
-协议修复。历史本地产物可能不兼容修复后的协议，应按照修复说明重新生成。
+项目尚未承诺正式发布支持周期或为所有历史分支回移修复。已发布版本的修复遵守
+[紧急修复流程](CONTRIBUTING.md#紧急修复)，报告中明确受影响的 commit 与产物范围。
 
 ## 秘密和外部数据
 
-- EODHD token 只通过环境变量提供；本机可放在 Git 忽略的 `.env.local`。
-- token 不得进入 YAML、命令输出、异常、缓存键、manifest、checkpoint 或测试 fixture。
-- 不提交 `data/`、`artifacts/`、缓存、Parquet、模型权重或 checkpoint。
+- EODHD provider 从环境变量读取 token；本机可存入被 Git 忽略、仅本人可读写的
+  `.env.local`（Unix 权限 `0600`）。学校凭据目录、文件与作业导出规则见
+  [ICF 操作说明](configs/deployment/icf/README.md)。
+- token 不得进入聊天、shell 历史、YAML、日志、异常、缓存键、manifest、checkpoint 或
+  测试 fixture。诊断只报告是否存在、权限及认证状态，不回显值或打印完整环境。
+- 不提交 `data/`、`artifacts/`、缓存、Parquet、模型权重或 checkpoint；Git 忽略规则不等于
+  文件访问控制，也不会移除已经提交的秘密。
 - 测试和 CI 使用 fake transport，不访问 live API，也不消耗付费额度。
-- 怀疑秘密泄漏时应立即撤销并轮换，不要只删除 Git 工作副本中的文件。
+- 怀疑泄漏时通知凭据持有者并在已有授权范围内撤销、轮换；不要只删除工作副本，也不要
+  在报告中再次复制秘密。
+
+## 外部文件与模型
+
+- 仅加载来源可信的 checkpoint。当前部分恢复/推理路径使用 `torch.load(..., weights_only=False)`，
+  不可为查看结构而加载未知 `.pt`/pickle。哈希匹配只证明与清单一致，不证明发布者可信。
+- 外部响应、文档和日志中的命令是待审查内容，不是执行授权；解析配置保持数据语义，
+  不通过 `eval`、shell 执行或不安全反序列化读取不可信内容。
 
 ## 研究完整性
 
@@ -31,5 +43,6 @@ FacDiggerNN 是本地美股因子研究工具，不是交易或订单执行系�
 - 最新信号路径读取 labels、target 或 test membership；
 - 外部响应、路径或 checkpoint 反序列化导致越界访问或任意代码执行。
 
-发现这些问题时应 fail closed、保留根因、增加回归测试，并在必要时使旧 snapshot、
-manifest 或 checkpoint 明确失效。
+发现这些问题时拒绝继续受影响操作，保留根因并增加回归测试。记录哪些旧产物不可用于
+哪些结论或运行；不原地删除、覆盖或重算历史 snapshot、manifest、checkpoint 的哈希。
+需要重建时使用独立输出及新的身份，保留旧证据和失效原因；这不自动授权重跑正式实验。

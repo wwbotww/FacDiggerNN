@@ -1,9 +1,8 @@
 # Contributing to FacDiggerNN
 
-本文面向人类贡献者，说明开发环境、变更流程、CI 和提交前检查。项目使用和研究协议分别以
-`README.md`、`docs/开发文档.md` 和 `docs/实验设计文档.md` 为准；coding agent 的持久指令
-位于 `AGENTS.md`；安全与密钥要求见 `SECURITY.md`；文档职责与历史归档见
-`docs/README.md`。
+本文是人类与 coding agent 共用的开发、验证和发布流程。项目入口见 [README](README.md)，
+agent 的项目边界见 [AGENTS.md](AGENTS.md)，秘密与外部文件处理见 [SECURITY.md](SECURITY.md)，
+文档职责和复盘触发条件见[文档中心](docs/README.md#后续维护规则)。
 
 ## 开发环境
 
@@ -14,7 +13,7 @@ uv sync --frozen --all-extras
 uv run facdigger doctor
 ```
 
-不要把 `.env.local`、数据、缓存、模型权重或训练产物加入版本控制。
+已有可用环境时直接复用；仅改文档无需安装依赖。不要对运行中实验的固定 venv 执行安装。
 
 ## 分支与发布
 
@@ -51,6 +50,9 @@ git switch -c feat/short-task
 提交已被`develop`或`main`包含，没有未处理成果、开放PR或已发现的实验、部署、其他checkout
 及协作依赖；不确定时保留并注明。普通合并或快进保留祖先关系；已用于实验的提交不做
 rebase/squash或其他历史重写，不强推共享分支。
+
+本地日常开发保留一个主目录，在其中切换短期分支。仅在并行任务确需隔离时使用临时
+worktree；集成后确认无独有文件和使用依赖再清理。固定实验 checkout 不属于待清理的开发副本。
 
 开发clone的上游使用`origin/develop`；调整跟踪关系前先核验工作区、独有提交和worktree，
 不借此移动固定版本的HEAD或更新文件。固定实验checkout不参与日常分支整理。
@@ -90,68 +92,69 @@ seed、fold、候选和作业实例由冻结计划及产物身份管理，不逐
 
 ## 变更原则
 
-1. 修改前检查 `git status`，保留现有未提交改动，不混入无关重构。
-2. 先定位现有实现、调用方和相似测试，再做能完整解决问题的最小变更。
-3. Bug 修复应覆盖根因，并增加修复前能够失败的回归测试。
-4. 配置、CLI、Parquet schema、manifest、checkpoint 或研究协议变化，应同步对应文档并
-   说明兼容策略。
-5. 影响 point-in-time、数据契约、snapshot、checkpoint、holdout 或长期架构的关键修复，
-   需要在 `docs/复盘/` 的对应主题文件记录证据、验证和仍存限制，并更新
-   `docs/项目关键问题与修复复盘.md` 索引。
-
-正式采集、模型下载、长时间训练和 final holdout 解封会消耗额度、算力或研究自由度，除非
-任务明确要求，否则不要执行。
+1. 保留已有工作；先定位实现、调用方和相似测试，做能解决根因的最小变更，不混入无关重构。
+2. CLI 只做参数、调用和输出，业务逻辑留在领域模块；复用已有实现，不复制一套训练流程。
+3. 新抽象、依赖或兼容层须有当前调用方、明确问题和验收方式；不为假设需求增加通用框架。
+   保留现有契约要求的哈希与版本；新增机制须解决实际完整性、格式兼容或迁移问题，
+   普通配置和可重建数据优先使用 schema、唯一键及业务校验，不升级无关依赖或锁文件。
+4. 替代实现应迁移调用方并清理死代码，不在错误路径上叠加绕行补丁。仍有明确消费者或
+   历史产物需要的兼容路径应保留、限定范围并测试；移除时说明迁移或明确拒绝策略。
+5. 行为修复增加修复前失败、修复后通过的回归用例；测试验证行为和边界，不复述实现。
+   不通过吞异常、降低断言、跳过测试或放宽契约消除失败。
+6. 配置、CLI、Parquet schema、manifest、checkpoint 或研究协议变化，说明兼容策略并更新
+   对应文档；长期记录和关键修复复盘遵守[文档维护规则](docs/README.md#后续维护规则)。
 
 ## 本地验证
 
-先运行最相关的测试，再按影响范围扩大：
+按相对目标分支的完整 diff 选择检查；符合多个变更范围时取并集。代码改动运行 Ruff，所有改动执行
+`git diff --check`；先运行直接相关用例，再按下表扩大范围。
 
 | 变更范围 | 最低验证 |
 |---|---|
-| 叶子模块 | 对应 unit 测试、`uv run ruff check .` |
-| 数据契约、dataset、共享训练/评价 | 相关 integration 测试、完整 pytest、Ruff |
-| 模型或 checkpoint | pipeline、resume、replay 测试；说明未覆盖的 CUDA/网络环境 |
+| 叶子模块 | 对应 unit 测试 |
+| 数据契约、dataset、共享训练/评价 | 相关 integration 测试、完整 pytest |
+| 模型或 checkpoint | 对应 pipeline、resume、replay 测试；涉及共享逻辑时还须完整 pytest |
 | EODHD | fake transport 和临时目录；不得访问 live API 或刷新真实缓存 |
-| 纯文档 | 链接和命令检查、`git diff --check` |
+| 纯文档 | `python3 scripts/check_docs.py`、内容与命令一致性；修改的 shell 示例做 `bash -n`，不执行其中的训练/部署操作 |
 
-完整本地门禁：
+需要完整代码回归时，在准备好的开发环境执行：
 
 ```bash
 uv lock --check
-uv run ruff check .
-uv run pytest
-uv run pytest --cov=facdigger --cov-report=term-missing
+uv run --frozen ruff check .
+uv run --frozen pytest
 git diff --check
 ```
 
-只报告实际运行过的命令。无法覆盖网络、GPU、付费数据或正式研究时，应明确说明。
+局部检查将 pytest 参数限定为相关测试路径。需要覆盖率分析时，以
+`uv run --frozen pytest --cov=facdigger --cov-report=term-missing` 替换 pytest 命令，
+不额外重复一遍全量测试；纯文档不运行上述代码回归。
+
+文档检查器仅依赖 Python 标准库和 Git，检查仓库内相对链接、Markdown 标题和显式锚点；
+不访问外部 URL 或服务器证据路径，不验证科学结论或实际运行状态。
+
+测试使用临时 fixture，不触碰真实缓存、秘密、生产目录或付费 API。检查通过后，只有新增
+变更、失败或未解决疑点才继续扩大/重复。只报告实际检查，说明未覆盖的 CUDA、网络、
+跨平台与正式运行环境；静态验证、CPU 测试和真实生命周期验收分别表述。
 
 ## CI
 
-`.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行，使用只读
-`GITHUB_TOKEN` 权限，并将第三方 Actions 固定到完整 commit SHA。CI 在 Python
-3.10、3.11 和 3.12 上执行：
-
-```bash
-uv lock --check
-uv sync --frozen --all-extras
-uv run --frozen ruff check .
-uv run --frozen pytest
-```
-
-CI 不读取秘密、不访问 EODHD live API、不下载模型 checkpoint，也不运行正式训练或
-holdout。合并前应确保所有矩阵任务通过；不能通过降低断言、跳过测试或放宽数据契约来修复
-CI。
+[CI workflow](.github/workflows/ci.yml) 在 push、pull request 和手动触发时运行，使用只读
+`GITHUB_TOKEN`、固定到完整 SHA 的 Actions，并关闭 checkout 凭据持久化。
+Python 3.10、3.11、3.12 均检查锁文件、安装锁定依赖、运行 Ruff 和完整 pytest；
+独立文档任务无需安装训练依赖，运行同一链接检查器；具体命令以 workflow 为准。
+CI 不使用生产秘密、EODHD live API 或模型下载，不运行正式训练
+或 holdout。合并前确认完整矩阵通过；它不替代发布范围内的真实运行验收。
 
 ## 提交与评审
 
-提交或 pull request 应保持单一目的，并说明：
+提交或 PR 保持单一目的：说明问题、结果行为、实际验证、兼容性和未解决问题；
+简单改动可用短段落，不为填模板重复内容。科学结论同时链接实验记录及其证据定位。
 
-- 问题和根因；
-- 用户可见、数据或协议语义变化；
-- 新增或更新的测试；
-- 实际执行的验证及未覆盖环境；
-- 兼容性、迁移步骤和剩余风险。
+完成前根据最终 diff，按[更新触发条件](docs/README.md#后续维护规则)核对权威文档及直接
+受影响的引用、示例。行为变化与必要说明放在同一 PR；不要求更新无关入口或重读全部历史。
+在 PR 或交付说明写一句“文档影响：已同步哪些文件/章节”，或“无需更新及具体理由”；
+修改了代码文件本身不构成必须修改文档的理由。链接检查通过不替代这项内容核对。
 
 评审重点是正确性、防泄漏、数据和产物完整性、失败模式、测试有效性及文档同步。格式问题由
 Ruff 和 CI 执行，不应占用人工评审的主要精力。
