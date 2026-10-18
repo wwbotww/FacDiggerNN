@@ -64,17 +64,37 @@ PRIMARY_PAIRS = (
     "mlp03_lr03-minus-mlp03",
     "finance_lr03-minus-finance",
 )
+ABLATION_METHOD_BINDINGS = {
+    **METHOD_BINDINGS,
+    "mlp03_no_aux": {"source": "no_aux", "candidate": "statistics_mlp_dropout03"},
+    "finance_no_aux": {"source": "no_aux", "candidate": "finance"},
+    "finance_no_stock_interaction": {"source": "no_stock", "candidate": "finance"},
+    "mlp03_epochs30": {"source": "epochs30", "candidate": "statistics_mlp_dropout03"},
+    "finance_epochs30": {"source": "epochs30", "candidate": "finance"},
+}
+ABLATION_PAIRS = PRIMARY_PAIRS + (
+    "mlp03_no_aux-minus-mlp03", "finance_no_aux-minus-finance",
+    "finance_no_stock_interaction-minus-finance",
+    "mlp03_epochs30-minus-mlp03", "finance_epochs30-minus-finance",
+)
+
+
+def comparison_methods(sources: dict) -> dict:
+    if set(sources) == {"reference", "conditional", "low_lr"}:
+        return METHOD_BINDINGS
+    if set(sources) == {"reference", "conditional", "low_lr", "no_aux", "no_stock", "epochs30"}:
+        return ABLATION_METHOD_BINDINGS
+    raise DataContractError("comparison requires a complete declared intervention batch")
 
 
 def validate_intervention_plans(plans: dict) -> None:
-    if set(plans) != {"reference", "conditional", "low_lr"}:
-        raise DataContractError("interventions require the reference and both declared plans")
+    methods = comparison_methods(plans)
     reference = plans["reference"]["identity"]
     for role, plan in plans.items():
         identity = plan["identity"]
         research = identity["research"]
         expected_candidates = [
-            v["candidate"] for v in METHOD_BINDINGS.values() if v["source"] == role
+            v["candidate"] for v in methods.values() if v["source"] == role
         ]
         if (
             research["candidates"] != expected_candidates
@@ -100,6 +120,12 @@ def validate_intervention_plans(plans: dict) -> None:
                 ):
                     raise DataContractError("low LR must be exactly the declared 0.3 strategy")
                 expected["training"][field] = identity["supervised_config"]["training"][field]
+        if role in {"no_aux", "no_stock"}:
+            expected["research_ablation"] = (
+                "no_auxiliary_rank" if role == "no_aux" else "no_stock_interaction"
+            )
+        if role == "epochs30":
+            expected["training"].update(max_epochs=30, minimum_epochs=30)
         if identity["supervised_config"] != expected:
             raise DataContractError("undeclared scientific configuration difference")
 
@@ -118,8 +144,12 @@ def freeze_intervention_comparison(
     plans = {role: read_experiment_plan(path) for role, path in sources.items()}
     validate_intervention_plans(plans)
     hashes = {}
-    for cell in plans["reference"]["identity"]["cells"]:
-        read_completed_cell(sources["reference"], plans["reference"], cell, hashes)
+    protected = ["reference"]
+    if "no_aux" in plans:
+        protected += ["conditional", "low_lr"]
+    for role in protected:
+        for cell in plans[role]["identity"]["cells"]:
+            read_completed_cell(sources[role], plans[role], cell, hashes)
     identity = {
         "analysis_commit": git["commit"],
         "sources": {
@@ -130,9 +160,9 @@ def freeze_intervention_comparison(
             }
             for role, path in sources.items()
         },
-        "methods": METHOD_BINDINGS,
+        "methods": comparison_methods(sources),
         "static_comparisons": STATIC_COMPARISONS,
-        "primary_fs_comparisons": list(PRIMARY_PAIRS),
+        "primary_fs_comparisons": list(ABLATION_PAIRS if "no_aux" in plans else PRIMARY_PAIRS),
         "reference_files": hashes,
         "validation_policy": {
             "required_methods": sorted(PACKAGE_METHODS),
@@ -166,7 +196,10 @@ def read_comparison(output: Path) -> tuple[dict, dict]:
     if (
         comparison["comparison_hash"] != sha256_json(identity)
         or identity["static_comparisons"] != STATIC_COMPARISONS
-        or identity["methods"] != METHOD_BINDINGS
+        or identity["methods"] != comparison_methods(identity["sources"])
+        or identity["primary_fs_comparisons"] != list(
+            ABLATION_PAIRS if "no_aux" in identity["sources"] else PRIMARY_PAIRS
+        )
         or comparison.get("validation_used") is not False
         or comparison.get("holdout_used") is not False
     ):
@@ -196,7 +229,7 @@ def summarize_comparison(comparison_root: Path, output: Path, *, repository_root
             **{arm: identity["methods"][row[arm]] for arm in ("candidate", "control")},
         }
         for row in STATIC_COMPARISONS
-        if row["name"] in PRIMARY_PAIRS
+        if row["name"] in identity["primary_fs_comparisons"]
     ]
     disjoint_output(output, comparison_root)
     return summarize_experiments(
@@ -208,7 +241,7 @@ def summarize_comparison(comparison_root: Path, output: Path, *, repository_root
 
 
 def seal_comparison_selections(comparison_root: Path, *, repository_root: Path) -> dict:
-    """Seal all 105 native selections in the NEW comparison directory, never in controls."""
+    """Seal native selections in the NEW comparison directory, never in controls."""
     git = clean_git(repository_root)
     comparison, plans = read_comparison(comparison_root)
     hashes, selections, environments = {}, {}, set()
@@ -249,5 +282,5 @@ def require_complete_validation_package(comparison_root: Path) -> None:
             "V remains closed; missing original package methods: " + ", ".join(missing)
         )
     # Future arms need their scientific implementation and a new frozen full-package binding.
-    # This 105-cell binding deliberately cannot be promoted into a 210-cell declaration.
+    # Neither the 105- nor 180-cell binding is a complete 210-cell declaration.
     raise DataContractError("V requires a separately frozen complete 210-cell/30-SSL package")

@@ -265,6 +265,9 @@ def summarize_experiments(
                 ),
                 "max_gradient_norm": max(row["max_pre_clip_gradient_norm"] for row in history),
             }
+            ablation = plan["identity"]["supervised_config"].get("research_ablation")
+            if ablation is not None:
+                summary["research_ablation"] = ablation
             for label, epoch in [(f"e{e}", e) for e in (0, 1, 2, 6) if e <= audit["epoch"]] + [
                 ("best", audit["best_epoch"]),
                 ("last", audit["epoch"]),
@@ -362,6 +365,8 @@ def summarize_experiments(
             "Hashes cover checkpoints, history, markers and daily tables; "
             "predictions/chunks are not fully rescanned",
             "PIT/source_research_ready limitations remain; no investable validity claim",
+            "F/S weighted_available_loss is the common original three-head objective; "
+            "no-aux training loss uses only the 5-day rank term plus all scale terms",
         ],
     }
     write_json(output / "report.json", report)

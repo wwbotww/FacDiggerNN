@@ -47,10 +47,13 @@ RUNTIME = TrainingRuntimeConfig(max_walltime_seconds=600, shutdown_margin_second
 
 def setup_cells(
     tmp_path, monkeypatch, candidate="statistics_mlp", *, seeds=(42,), epochs=3, lr_ratio=1,
+    ablation=None,
 ):
     torch.set_num_threads(1)
     train, selection = _datasets()
     raw = _config().model_dump(mode="json")
+    if ablation is not None:
+        raw["research_ablation"] = ablation
     raw["model"].update(dropout=0.1, statistics_windows=[5, 20])
     raw["training"].update(
         max_epochs=epochs, minimum_epochs=6 if epochs == 10 else epochs, patience=3,
@@ -246,9 +249,11 @@ def test_complete_cells_match_the_existing_trainer_and_seal_without_v(
     ("statistics_mlp_dropout03", 0.3), ("finance", 0.3),
 ])
 def test_complete_cell_resumes_without_changing_optimizer_clock_or_rng(
-    tmp_path, monkeypatch, phase, candidate, lr_ratio,
+    tmp_path, monkeypatch, phase, candidate, lr_ratio, ablation=None, epochs=3,
 ):
-    setup = setup_cells(tmp_path, monkeypatch, candidate, lr_ratio=lr_ratio)
+    setup = setup_cells(
+        tmp_path, monkeypatch, candidate, lr_ratio=lr_ratio, ablation=ablation, epochs=epochs,
+    )
     continuous = setup["plan"]("continuous")
     setup["run"](continuous)
     resumed = setup["plan"]("resumed")

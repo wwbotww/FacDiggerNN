@@ -55,6 +55,8 @@ def main(argv=None):
     )
     for role in ("reference", "conditional", "low-lr", "output"):
         comparison.add_argument(f"--{role}", type=Path, required=True)
+    for role in ("no-aux", "no-stock", "epochs30"):
+        comparison.add_argument(f"--{role}", type=Path, help="Second batch; supply all three")
     for name in ("compare-summary", "compare-seal", "validation-gate", "admit"):
         command = commands.add_parser(name)
         command.add_argument("--comparison", type=Path, required=True)
@@ -91,8 +93,13 @@ def main(argv=None):
     elif args.action == "compare-plan":
         from facdigger.research.finance_comparison import freeze_intervention_comparison
 
+        sources = {
+            "reference": args.reference, "conditional": args.conditional, "low_lr": args.low_lr,
+            **{key: getattr(args, key) for key in ("no_aux", "no_stock", "epochs30")
+               if getattr(args, key) is not None},
+        }
         bound = freeze_intervention_comparison(
-            {"reference": args.reference, "conditional": args.conditional, "low_lr": args.low_lr},
+            sources,
             args.output,
             repository_root=repository_root,
         )

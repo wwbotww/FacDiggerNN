@@ -94,6 +94,11 @@ def admit_interventions(
                 variants.append(("conditional", "statistics_conditional_linear"))
             elif cell["candidate"] in {"statistics_mlp_dropout03", "finance"}:
                 variants.append(("low_lr", cell["candidate"]))
+            for role in ("no_aux", "no_stock", "epochs30"):
+                if role in plans and cell["candidate"] in plans[role]["identity"]["research"][
+                    "candidates"
+                ]:
+                    variants.append((role, cell["candidate"]))
             for role, candidate in variants:
                 new_config = cell_config(plans[role]["identity"]["supervised_config"], cell["seed"])
                 seed_everything(cell["seed"])

@@ -64,6 +64,8 @@ def freeze_experiment_plan(
         raise DataContractError("runtime must bind exactly the configured fold snapshots")
     base = load_finance_transformer_config(config.supervised_config).model_dump(mode="json")
     experiment = cell_config(base, config.seeds[0])
+    if experiment.research_ablation == "no_stock_interaction" and config.candidates != ["finance"]:
+        raise DataContractError("stock interaction ablation requires only the Finance candidate")
     bindings = {}
     source_hashes = common_config = None
     for fold in config.folds:

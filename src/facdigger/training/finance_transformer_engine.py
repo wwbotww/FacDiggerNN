@@ -110,11 +110,18 @@ def _multi_horizon_loss(
     epsilon: float,
     scale_regularization: float,
     diagnostic_component: int | str | None = None,
+    rank_horizons: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if scores.shape != target_ranks.shape or scores.ndim != 2:
         raise ValueError("scores and target ranks must share [N,H] shape")
     if diagnostic_component not in (None, "scale", *horizons):
         raise ValueError("unknown diagnostic loss component")
+    if rank_horizons is not None and (
+        not rank_horizons or len(set(rank_horizons)) != len(rank_horizons)
+        or not set(rank_horizons).issubset(horizons)
+        or (isinstance(diagnostic_component, int) and diagnostic_component not in rank_horizons)
+    ):
+        raise ValueError("invalid active rank horizons")
     total = scores.new_zeros((), dtype=torch.float32)
     component = None
     audit: dict[str, float] = {}
@@ -125,7 +132,8 @@ def _multi_horizon_loss(
             scores[:, column], target_ranks[:, column], epsilon=epsilon
         )
         score_std = scores[:, column].float().std(unbiased=False)
-        total = total + weight * horizon_loss
+        if rank_horizons is None or horizon in rank_horizons:
+            total = total + weight * horizon_loss
         if diagnostic_component == horizon:
             component = weight * horizon_loss
         scale_penalty = scale_penalty + weight * torch.log(score_std + epsilon).square()
@@ -136,8 +144,8 @@ def _multi_horizon_loss(
         component = scale_regularization * scale_penalty
     audit["scale_penalty"] = float(scale_penalty.detach().cpu())
     audit["loss"] = float(total.detach().cpu())
-    # Training and evaluation retain the exact original total and arithmetic order.
-    # Research can differentiate one weighted term without changing the public config.
+    # The default retains the original arithmetic order. The no-aux research arm
+    # removes only rank terms; all scale terms and diagnostic head metrics remain.
     return total if diagnostic_component is None else component, audit
 
 
@@ -182,6 +190,7 @@ def backward_complete_date_with_embedding_replay(
     relative_tolerance: float,
     absolute_tolerance: float,
     diagnostic_component: int | str | None = None,
+    rank_horizons: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Backpropagate one exact full-date hierarchy with bounded temporal graphs."""
 
@@ -226,6 +235,7 @@ def backward_complete_date_with_embedding_replay(
         epsilon=epsilon,
         scale_regularization=scale_regularization,
         diagnostic_component=diagnostic_component,
+        rank_horizons=rank_horizons,
     )
     scaler.scale(loss / dates_in_optimizer_step).backward()
     if isinstance(model, FinanceStatisticsRanker):
@@ -513,7 +523,11 @@ def _checkpoint_payload(
             model.kind if isinstance(model, FinanceStatisticsRanker)
             else "finance_patch_transformer"
         ),
-        "objective": FINANCE_TRANSFORMER_OBJECTIVE,
+        "objective": (
+            "primary_rank_with_multihorizon_scale"
+            if config_payload.get("research_ablation") == "no_auxiliary_rank"
+            else FINANCE_TRANSFORMER_OBJECTIVE
+        ),
         "target_transform": TARGET_TRANSFORM,
         "optimization_protocol": {
             "unit": "complete_date",
@@ -562,6 +576,8 @@ def train_finance_transformer(
     statistics_dropout: float = 0.1,
     state_observer: Callable[[torch.nn.Module, int], None] | None = None,
 ) -> tuple[FinancePatchTransformer, dict[str, Any]]:
+    if config.research_ablation == "no_stock_interaction" and diagnostic_model is not None:
+        raise ValueError("stock interaction ablation requires the Finance architecture")
     dropout_identity = statistics_dropout_identity(diagnostic_model, statistics_dropout)
     if diagnostic_model == "statistics_conditional_linear" and not all(
         getattr(data, "current_market_verified", False) for data in (train_dataset, valid_dataset)
@@ -872,6 +888,7 @@ def train_finance_transformer(
                         dates_in_optimizer_step=dates_in_step,
                         relative_tolerance=config.training.replay_relative_tolerance,
                         absolute_tolerance=config.training.replay_absolute_tolerance,
+                        rank_horizons=config.training_rank_horizons,
                     )
                 )
                 should_step = (
@@ -1063,7 +1080,11 @@ def train_finance_transformer(
         "device": device,
         "amp_enabled": amp_enabled,
         "precision": "fp16" if amp_enabled else "fp32",
-        "objective": FINANCE_TRANSFORMER_OBJECTIVE,
+        "objective": (
+            "primary_rank_with_multihorizon_scale"
+            if config.research_ablation == "no_auxiliary_rank"
+            else FINANCE_TRANSFORMER_OBJECTIVE
+        ),
         "target_transform": TARGET_TRANSFORM,
         "optimization_protocol": {
             "unit": "complete_date",
@@ -1188,6 +1209,7 @@ def benchmark_finance_transformer_updates(
                 dates_in_optimizer_step=dates_in_step,
                 relative_tolerance=config.training.replay_relative_tolerance,
                 absolute_tolerance=config.training.replay_absolute_tolerance,
+                rank_horizons=config.training_rank_horizons,
             )
             dates_processed += 1
             rows_processed += int(batch["sample_index"].numel())

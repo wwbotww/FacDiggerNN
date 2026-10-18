@@ -128,7 +128,10 @@ def _batch(dataset: FinanceTransformerWindowDataset) -> dict[str, torch.Tensor]:
 
 
 @pytest.mark.parametrize("unlabelled", [0, 2])
-def test_embedding_replay_matches_single_graph_parameter_gradients(unlabelled: int) -> None:
+@pytest.mark.parametrize("ablation", [None, "no_auxiliary_rank", "no_stock_interaction"])
+def test_embedding_replay_matches_single_graph_parameter_gradients(
+    unlabelled: int, ablation,
+) -> None:
     torch.manual_seed(42)
     source = _dataset()
     dataset = FinanceTransformerInferenceWindowDataset(
@@ -144,6 +147,8 @@ def test_embedding_replay_matches_single_graph_parameter_gradients(unlabelled: i
     row_to_label = torch.arange(len(dataset))
     row_to_label[~label_mask] = -1
     reference = _model().train()
+    reference.cross_sectional_encoder.stock_interaction = ablation != "no_stock_interaction"
+    rank_horizons = (5,) if ablation == "no_auxiliary_rank" else None
     replayed = copy.deepcopy(reference).train()
     batch = _batch(dataset)
     target_ranks = torch.stack(
@@ -180,11 +185,15 @@ def test_embedding_replay_matches_single_graph_parameter_gradients(unlabelled: i
         horizon_weights={1: 0.2, 5: 0.6, 20: 0.2},
         epsilon=1e-6,
         scale_regularization=0.01,
+        rank_horizons=rank_horizons,
     )
     loss.backward()
 
     if unlabelled:
-        assert local_all.grad[~label_mask].abs().max().item() > 0
+        if ablation == "no_stock_interaction":
+            assert torch.count_nonzero(local_all.grad[~label_mask]) == 0
+        else:
+            assert local_all.grad[~label_mask].abs().max().item() > 0
 
     audit = backward_complete_date_with_embedding_replay(
         replayed,
@@ -202,6 +211,7 @@ def test_embedding_replay_matches_single_graph_parameter_gradients(unlabelled: i
         dates_in_optimizer_step=1,
         relative_tolerance=1e-5,
         absolute_tolerance=1e-6,
+        rank_horizons=rank_horizons,
     )
 
     assert audit["rows"] == len(dataset)

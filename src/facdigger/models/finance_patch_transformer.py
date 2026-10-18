@@ -383,8 +383,10 @@ class CrossSectionalEncoder(nn.Module):
         dropout: float,
         num_horizons: int,
         initial_context_gate: float = 0.1,
+        stock_interaction: bool = True,
     ) -> None:
         super().__init__()
+        self.stock_interaction = stock_interaction
         if not 0 < initial_context_gate < 1:
             raise ValueError("initial_context_gate must be inside (0, 1)")
         layer = nn.TransformerEncoderLayer(
@@ -422,9 +424,20 @@ class CrossSectionalEncoder(nn.Module):
             raise ValueError("market_embedding must be [D] or [1,D]")
         if local_embeddings.shape[1] != market_embedding.shape[0]:
             raise ValueError("local and market embedding dimensions differ")
-        tokens = torch.cat([market_embedding.unsqueeze(0), local_embeddings], dim=0)
-        contextual = self.encoder(tokens.unsqueeze(0)).squeeze(0)
-        contextual_stocks = contextual[1:]
+        if self.stock_interaction:
+            tokens = torch.cat([market_embedding.unsqueeze(0), local_embeddings], dim=0)
+            contextual = self.encoder(tokens.unsqueeze(0)).squeeze(0)
+            contextual_stocks = contextual[1:]
+            contextual_market = contextual[0]
+        else:
+            # Each stock owns a separate market token at EVERY layer; a shared
+            # intermediate market token would leak other stocks back into the score.
+            tokens = torch.stack(
+                [market_embedding.expand_as(local_embeddings), local_embeddings], dim=1,
+            )
+            contextual = self.encoder(tokens)
+            contextual_stocks = contextual[:, 1]
+            contextual_market = contextual[:, 0]  # [N,D], one market output per pair.
         local_scores = self.local_head(local_embeddings)
         contextual_scores = self.context_head(contextual_stocks)
         gate = torch.sigmoid(self.context_gate_logits)
@@ -434,7 +447,7 @@ class CrossSectionalEncoder(nn.Module):
             local_scores=local_scores,
             contextual_scores=contextual_scores,
             contextual_embeddings=contextual_stocks,
-            market_embedding=contextual[0],
+            market_embedding=contextual_market,
             context_gate=gate,
         )
 
@@ -548,13 +561,17 @@ def build_finance_transformer_model(
     *,
     context_length: int,
 ) -> FinancePatchTransformer:
-    return build_finance_transformer_architecture(
+    model = build_finance_transformer_architecture(
         config.model,
         context_length=context_length,
         num_local_channels=len(config.channels),
         num_market_channels=len(config.market_channels),
         horizons=tuple(config.horizons),
     )
+    model.cross_sectional_encoder.stock_interaction = (
+        getattr(config, "research_ablation", None) != "no_stock_interaction"
+    )
+    return model
 
 
 def build_finance_transformer_architecture(

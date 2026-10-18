@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from facdigger.data.config import (
     FINANCE_TRANSFORMER_CHANNELS,
@@ -118,6 +118,7 @@ class FinanceTransformerExperimentConfig(StrictModel):
     )
     horizons: list[int] = Field(default_factory=lambda: [1, 5, 20])
     primary_horizon: int = 5
+    research_ablation: Literal["no_auxiliary_rank", "no_stock_interaction"] | None = None
     costs_bps: list[float] = Field(default_factory=lambda: [0.0, 10.0, 20.0, 50.0])
     model: FinanceTransformerModelConfig = Field(
         default_factory=FinanceTransformerModelConfig
@@ -126,8 +127,29 @@ class FinanceTransformerExperimentConfig(StrictModel):
         default_factory=FinanceTransformerTrainingConfig
     )
 
+    @model_serializer(mode="wrap")
+    def serialize_compatible_config(self, handler):
+        payload = handler(self)
+        # Older frozen plans/checkpoints hash this exact payload. Only an explicitly
+        # enabled research intervention adds a new field to the scientific identity.
+        if self.research_ablation is None:
+            payload.pop("research_ablation", None)
+        return payload
+
+    @property
+    def training_rank_horizons(self) -> tuple[int, ...] | None:
+        return (self.primary_horizon,) if self.research_ablation == "no_auxiliary_rank" else None
+
     @model_validator(mode="after")
     def validate_protocol(self) -> FinanceTransformerExperimentConfig:
+        if self.research_ablation is not None and (
+            self.initialization != "scratch" or self.horizons != [1, 5, 20]
+            or self.primary_horizon != 5
+            or self.training.objective.horizon_weights != {1: 0.2, 5: 0.6, 20: 0.2}
+        ):
+            raise ValueError(
+                "research ablations require scratch and the original three-head weights"
+            )
         if self.evaluation_split == "test" and not self.unlock_test:
             raise ValueError("evaluation_split=test requires unlock_test=true")
         if self.channels != FINANCE_TRANSFORMER_CHANNELS:
